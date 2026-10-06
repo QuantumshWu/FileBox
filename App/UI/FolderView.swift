@@ -97,14 +97,18 @@ struct FolderView: View {
 
     // MARK: - Grid and list
 
+    /// The list is a real List so rows keep the system swipe actions; the grid scrolls itself.
     private var content: some View {
-        ScrollView {
+        Group {
             switch layout {
-            case .grid: grid
-            case .list: list
+            case .grid:
+                ScrollView { grid }
+                    .simultaneousGesture(pinch)
+            case .list:
+                List { listRows }
+                    .listStyle(.plain)
             }
         }
-        .simultaneousGesture(pinch, including: layout == .grid ? .all : .subviews)
         .overlay { overlayContent }
         .navigationTitle(selecting ? "已选择 \(selection.count) 项" : title)
         .navigationBarBackButtonHidden(selecting)
@@ -158,16 +162,34 @@ struct FolderView: View {
         }
     }
 
-    private var list: some View {
-        LazyVStack(spacing: 0) {
-            ForEach(visibleItems) { item in
-                VStack(spacing: 0) {
-                    row(item)
-                    Divider()
-                        .padding(.leading, selecting ? 120 : 84)
+    private var listRows: some View {
+        ForEach(visibleItems) { item in
+            row(item)
+                .listRowInsets(EdgeInsets())
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    if !selecting {
+                        swipeButtons(item)
+                    }
                 }
-            }
         }
+    }
+
+    /// Swipe a row left for 删除 / 重命名 / 移动. Delete still asks first, so no destructive role
+    /// (that would animate the row away before the answer).
+    @ViewBuilder
+    private func swipeButtons(_ item: FileItem) -> some View {
+        Button { pendingDelete = [item] } label: {
+            Label("删除", systemImage: "trash")
+        }
+        .tint(.red)
+        Button { startRename(item) } label: {
+            Label("重命名", systemImage: "pencil")
+        }
+        .tint(.orange)
+        Button { sheet = .move([item]) } label: {
+            Label("移动", systemImage: "folder")
+        }
+        .tint(.blue)
     }
 
     /// Pinching out shows fewer, bigger squares; pinching in shows more, like in Photos.
