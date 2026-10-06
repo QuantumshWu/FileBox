@@ -143,11 +143,16 @@ final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelega
         var first: BrowserDownload?
         for url in urls {
             let item = BrowserDownload(name: Self.provisionalName(for: url), source: url)
+            let id = item.id
             let task = session.downloadTask(with: context.request(for: url)) { [weak self] location, response, error in
                 // The system deletes `location` as soon as this returns.
                 let file = location.flatMap { Self.keepDownloadedFile($0) }
                 Task { @MainActor in
-                    self?.sessionTaskEnded(item, file: file, response: response, error: error)
+                    guard let self else {
+                        if let file { Self.removeFolder(of: file) }
+                        return
+                    }
+                    self.sessionTaskEnded(id, file: file, response: response, error: error)
                 }
             }
             item.task = task
@@ -241,8 +246,8 @@ final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelega
         }
     }
 
-    private func sessionTaskEnded(_ item: BrowserDownload, file: URL?, response: URLResponse?, error: Error?) {
-        guard item.isRunning else {
+    private func sessionTaskEnded(_ id: UUID, file: URL?, response: URLResponse?, error: Error?) {
+        guard let item = items.first(where: { $0.id == id }), item.isRunning else {
             if let file { Self.removeFolder(of: file) }
             return
         }
