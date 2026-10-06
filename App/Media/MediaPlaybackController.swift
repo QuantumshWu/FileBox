@@ -84,6 +84,8 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         player.actionAtItemEnd = .none
         playerViewController.player = player
         playerViewController.delegate = self
+        // The viewer draws its own controls in its bar, so there is one set that shows and hides together.
+        playerViewController.showsPlaybackControls = false
         playerViewController.allowsPictureInPicturePlayback = true
         playerViewController.canStartPictureInPictureAutomaticallyFromInline = true
         playerViewController.updatesNowPlayingInfoCenter = false

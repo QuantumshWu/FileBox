@@ -67,6 +67,10 @@ struct MediaViewer: View {
                 VStack(spacing: 0) {
                     topBar
                     Spacer(minLength: 0)
+                    if let kind = currentItem?.kind, kind == .video || kind == .audio {
+                        MediaVideoControls(onInteraction: { scheduleChromeHide() })
+                            .padding(.bottom, 8)
+                    }
                 }
                 .transition(.opacity)
             }
