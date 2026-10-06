@@ -85,6 +85,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     /// The viewer moved to a video, audio or other file: a floating image gives way to it.
     func leaveImagePage() {
         onImagePage = false
+        startWhenPossible = false
         if isActive || isStarting { controller?.stopPictureInPicture() }
         updateArming()
     }
@@ -166,10 +167,14 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         renderedURL = url
         renderTask?.cancel()
         renderTask = Task { [weak self] in
-            let made = await Task.detached(priority: .userInitiated) { MediaPiPFrame.make(from: url) }.value
+            let made: MediaPiPFrame? = await MediaImageLoader.limited { MediaPiPFrame.make(from: url) }
             guard let self, !Task.isCancelled, self.renderedURL == url else { return }
             guard let made else {
+                // Never float the previous picture under this one's name.
+                self.frame = nil
+                self.layerView.displayLayer.flushAndRemoveImage()
                 if self.isActive { MediaViewerHub.shared.show("这张图片无法在小窗里显示") }
+                self.updateArming()
                 return
             }
             self.frame = made

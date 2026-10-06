@@ -149,7 +149,7 @@ struct MediaPlayerHost: UIViewControllerRepresentable {
 
     func updateUIViewController(_ controller: MediaPlayerHostController, context: Context) {
         controller.onTap = onTap
-        controller.attachPlayer()
+        controller.attachPlayer(force: false)
     }
 
     static func dismantleUIViewController(_ controller: MediaPlayerHostController, coordinator: Coordinator) {
@@ -164,7 +164,7 @@ final class MediaPlayerHostController: UIViewController, UIGestureRecognizerDele
         let host = MediaWindowObservingView()
         host.backgroundColor = .black
         host.onWindowChange = { [weak self] inWindow in
-            if inWindow { self?.attachPlayer() }
+            if inWindow { self?.attachPlayer(force: true) }
         }
         view = host
     }
@@ -191,8 +191,13 @@ final class MediaPlayerHostController: UIViewController, UIGestureRecognizerDele
         for child in children { child.view.frame = view.bounds }
     }
 
-    func attachPlayer() {
+    /// Takes the shared player view. `force` is for a host that just came on screen; otherwise it
+    /// only takes a player no other on-screen host holds, so a viewer that is being dismissed
+    /// while the next one appears doesn't pull the player back on every update.
+    func attachPlayer(force: Bool) {
         let playerController = MediaPlaybackController.shared.playerViewController
+        let heldElsewhere = playerController.parent.map { $0 !== self && $0.viewIfLoaded?.window != nil } ?? false
+        if heldElsewhere && !force { return }
         if playerController.parent !== self {
             if playerController.parent != nil {
                 playerController.willMove(toParent: nil)

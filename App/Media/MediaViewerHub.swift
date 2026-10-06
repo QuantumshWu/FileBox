@@ -208,8 +208,14 @@ final class MediaViewerHub: ObservableObject {
     }
 
     func releaseAudioSession(for use: AudioUse) {
-        guard audioHolders.remove(use) != nil, audioHolders.isEmpty else { return }
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        guard audioHolders.remove(use) != nil else { return }
+        let session = AVAudioSession.sharedInstance()
+        if audioHolders.isEmpty {
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        } else if use == .video {
+            // Only the image is left; it plays along with other apps' music again.
+            try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        }
     }
 }
 
@@ -222,16 +228,33 @@ enum MediaImageLoader {
         return cache
     }()
 
+    private static let gate = MediaDecodeGate()
+
     static func load(_ url: URL, maxPixel: CGFloat) async -> UIImage? {
         let key = "\(Int(maxPixel))|\(url.path)" as NSString
         if let hit = cache.object(forKey: key) { return hit }
-        let image = await Task.detached(priority: .userInitiated) {
+        let image: UIImage? = await limited {
             MediaImageLoader.decode(url, maxPixel: maxPixel).map { UIImage(cgImage: $0) }
-        }.value
+        }
         if let image, let cgImage = image.cgImage {
             cache.setObject(image, forKey: key, cost: cgImage.bytesPerRow * cgImage.height)
         }
         return image
+    }
+
+    /// Runs `work` off the main thread, at most two at a time: decoding a big HEIC can take a few
+    /// hundred MB, and flicking through a folder must not start one per page. Returns nil without
+    /// running `work` if the calling task was cancelled while it waited (its page went away).
+    static func limited<T: Sendable>(_ work: @escaping @Sendable () -> T?) async -> T? {
+        await gate.enter()
+        let result: T?
+        if Task.isCancelled {
+            result = nil
+        } else {
+            result = await Task.detached(priority: .userInitiated) { work() }.value
+        }
+        await gate.leave()
+        return result
     }
 
     /// The image (orientation applied) with its longer side at most `maxPixel` pixels.
@@ -247,5 +270,31 @@ enum MediaImageLoader {
             kCGImageSourceThumbnailMaxPixelSize: Int(maxPixel),
         ]
         return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    }
+}
+
+/// A two-slot queue (first come, first served) for `MediaImageLoader.limited`.
+private actor MediaDecodeGate {
+    private let slots = 2
+    private var running = 0
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func enter() async {
+        if running < slots {
+            running += 1
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiting.append(continuation)
+        }
+    }
+
+    /// Hands the slot straight to the next waiter, if any.
+    func leave() {
+        if waiting.isEmpty {
+            running -= 1
+        } else {
+            waiting.removeFirst().resume()
+        }
     }
 }

@@ -223,7 +223,11 @@ final class MediaPlaybackController: NSObject, ObservableObject {
             updateNowPlaying()
         case .failed:
             if let url = currentURL { failedURLs.insert(url) }
-            if automaticAdvance { skipFailedItem() }
+            // A failed item can leave the player "waiting" forever, which would count as playing.
+            if !(automaticAdvance && skipFailedItem()) {
+                player.pause()
+                playbackStatusChanged()
+            }
         default:
             break
         }
@@ -255,13 +259,14 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     /// A file that failed while playing through the folder is skipped like one that ended.
-    private func skipFailedItem() {
+    /// Returns false when playback stops there.
+    private func skipFailedItem() -> Bool {
         failuresInARow += 1
-        guard failuresInARow < sessionItems.count else { return }
+        guard failuresInARow < sessionItems.count else { return false }
         switch MediaPlaybackMode.current {
-        case .sequential: advance(by: 1, wrap: false, automatic: true)
-        case .loopAll: advance(by: 1, wrap: true, automatic: true)
-        case .repeatOne, .stopAfter: break
+        case .sequential: return advance(by: 1, wrap: false, automatic: true)
+        case .loopAll: return advance(by: 1, wrap: true, automatic: true)
+        case .repeatOne, .stopAfter: return false
         }
     }
 
@@ -344,7 +349,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     private func playbackStatusChanged() {
-        let playing = player.currentItem != nil && player.timeControlStatus != .paused
+        let playing = player.currentItem.map { $0.status != .failed } == true && player.timeControlStatus != .paused
         if isPlaying != playing { isPlaying = playing }
         updateNowPlaying()
         publishState()
@@ -516,6 +521,11 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         isPictureInPictureActive = false
         publishState()
         MediaViewerHub.shared.show("小窗暂时无法开启")
+        // Nothing would be left to show or stop the video.
+        guard MediaViewerHub.shared.isViewerPresented else {
+            stop()
+            return
+        }
         // Keep the sound going if the app already left the screen.
         if wasPlayingWhenResigning, UIApplication.shared.applicationState == .background {
             keepPlayingInBackgroundIfNeeded()
