@@ -4,9 +4,9 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-/// One folder of the vault as a plain list. Rows can be dragged onto a folder (move) or onto
-/// another video (merge), have a context menu, and can be multi-selected. The root folder also
-/// carries the app's navigation (lock, browser, capture, Wi-Fi transfer, settings).
+/// One folder of the vault as a Photos-like grid or a plain list. Items can be dragged onto a
+/// folder (move) or onto another video (merge), have a context menu, and can be multi-selected.
+/// The root folder also carries the app's navigation (lock, capture, Wi-Fi transfer, settings).
 struct FolderView: View {
     let folder: URL
 
@@ -14,6 +14,11 @@ struct FolderView: View {
     @EnvironmentObject private var lock: LockManager
     @EnvironmentObject private var viewer: ViewerCoordinator
     @AppStorage("sortOrder") private var sort: SortOrder = .date
+    @AppStorage("folderLayout") private var layout: ItemLayout = .grid
+    /// Grid columns, changed by pinching (3...6).
+    @AppStorage("folderGridColumns") private var gridColumns = 4
+    /// Magnification at the last column change of the current pinch.
+    @State private var pinchBase: CGFloat = 1
 
     @State private var items: [FileItem] = []
     @State private var loaded = false
@@ -44,6 +49,10 @@ struct FolderView: View {
     /// Photos library identifiers of just-imported items, while asking whether to delete them there.
     @State private var pendingPhotoDeletion: [String]?
     @State private var progress: String?
+
+    private enum ItemLayout: String {
+        case grid, list
+    }
 
     private enum FolderSheet: Identifiable {
         case move([FileItem])
@@ -82,23 +91,19 @@ struct FolderView: View {
     }
 
     var body: some View {
-        dialogs(presentations(list))
+        dialogs(presentations(content))
     }
 
-    // MARK: - List
+    // MARK: - Grid and list
 
-    private var list: some View {
+    private var content: some View {
         ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(visibleItems) { item in
-                    VStack(spacing: 0) {
-                        row(item)
-                        Divider()
-                            .padding(.leading, selecting ? 108 : 72)
-                    }
-                }
+            switch layout {
+            case .grid: grid
+            case .list: list
             }
         }
+        .simultaneousGesture(pinch, including: layout == .grid ? .all : .subviews)
         .overlay { overlayContent }
         .navigationTitle(selecting ? "已选择 \(selection.count) 项" : title)
         .navigationBarBackButtonHidden(selecting)
@@ -139,6 +144,73 @@ struct FolderView: View {
         }
     }
 
+    private var columnCount: Int { min(max(gridColumns, 3), 6) }
+
+    private var grid: some View {
+        LazyVGrid(
+            columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columnCount),
+            spacing: 2
+        ) {
+            ForEach(visibleItems) { item in
+                cell(item)
+            }
+        }
+    }
+
+    private var list: some View {
+        LazyVStack(spacing: 0) {
+            ForEach(visibleItems) { item in
+                VStack(spacing: 0) {
+                    row(item)
+                    Divider()
+                        .padding(.leading, selecting ? 120 : 84)
+                }
+            }
+        }
+    }
+
+    /// Pinching out shows fewer, bigger squares; pinching in shows more, like in Photos.
+    private var pinch: some Gesture {
+        MagnifyGesture()
+            .onChanged { value in
+                let ratio = value.magnification / pinchBase
+                if ratio > 1.25, columnCount > 3 {
+                    pinchBase = value.magnification
+                    withAnimation(.snappy) { gridColumns = columnCount - 1 }
+                } else if ratio < 0.8, columnCount < 6 {
+                    pinchBase = value.magnification
+                    withAnimation(.snappy) { gridColumns = columnCount + 1 }
+                }
+            }
+            .onEnded { _ in
+                pinchBase = 1
+            }
+    }
+
+    @ViewBuilder
+    private func cell(_ item: FileItem) -> some View {
+        if selecting {
+            Button {
+                toggle(item)
+            } label: {
+                FolderGridCell(item: item, isSelected: selection.contains(item.url))
+            }
+            .buttonStyle(FolderGridButtonStyle())
+        } else {
+            acceptingDrops(
+                link(item, style: FolderGridButtonStyle()) {
+                    FolderGridCell(item: item, isDropTarget: dropTarget == item.url)
+                }
+                .contentShape(.contextMenuPreview, FolderGridCell.shape(for: item))
+                .contextMenu { menu(for: item) }
+                .draggable(FolderDragRegistry.shared.token(for: item.url)) {
+                    FolderDragPreview(item: item)
+                },
+                on: item
+            )
+        }
+    }
+
     @ViewBuilder
     private func row(_ item: FileItem) -> some View {
         if selecting {
@@ -152,13 +224,15 @@ struct FolderView: View {
             .background(isSelected ? Color.accentColor.opacity(0.1) : Color.clear)
         } else {
             acceptingDrops(
-                link(item)
-                    .background(rowBackground(item))
-                    .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 12))
-                    .contextMenu { menu(for: item) }
-                    .draggable(FolderDragRegistry.shared.token(for: item.url)) {
-                        FolderDragPreview(item: item)
-                    },
+                link(item, style: FolderRowButtonStyle()) {
+                    rowLabel(item, isSelected: nil)
+                }
+                .background(rowBackground(item))
+                .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 12))
+                .contextMenu { menu(for: item) }
+                .draggable(FolderDragRegistry.shared.token(for: item.url)) {
+                    FolderDragPreview(item: item)
+                },
                 on: item
             )
         }
@@ -170,21 +244,26 @@ struct FolderView: View {
             .padding(.vertical, 8)
     }
 
-    /// Folders push their own list; files open in the media viewer or Quick Look.
+    /// Folders push their own view; files open in the media viewer or Quick Look.
     @ViewBuilder
-    private func link(_ item: FileItem) -> some View {
+    private func link<Content: View, Style: ButtonStyle>(
+        _ item: FileItem,
+        style: Style,
+        @ViewBuilder label: () -> Content
+    ) -> some View {
+        let face = label()
         if item.isDirectory {
             NavigationLink(value: Route.folder(item.url)) {
-                rowLabel(item, isSelected: nil)
+                face
             }
-            .buttonStyle(FolderRowButtonStyle())
+            .buttonStyle(style)
         } else {
             Button {
                 open(item)
             } label: {
-                rowLabel(item, isSelected: nil)
+                face
             }
-            .buttonStyle(FolderRowButtonStyle())
+            .buttonStyle(style)
         }
     }
 
@@ -222,7 +301,7 @@ struct FolderView: View {
 
     private func open(_ item: FileItem) {
         if item.isMedia {
-            let media = items.filter(\.isMedia)
+            let media = visibleItems.filter(\.isMedia)
             if let index = media.firstIndex(where: { $0.url == item.url }) {
                 viewer.open(media, at: index)
             }
@@ -372,20 +451,31 @@ struct FolderView: View {
             }
         } else {
             if isRoot {
-                ToolbarItemGroup(placement: .topBarLeading) {
+                ToolbarItem(placement: .topBarLeading) {
                     Button { lock.lock() } label: {
                         Label("锁定", systemImage: "lock")
-                    }
-                    Button { menuRoute = .browser } label: {
-                        Label("浏览器", systemImage: "globe")
                     }
                 }
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button("选择") { selecting = true }
                     .disabled(items.isEmpty)
+                layoutButton
                 addMenu
                 moreMenu
+            }
+        }
+    }
+
+    /// Switches between the grid and the list; the icon shows what a tap switches to.
+    private var layoutButton: some View {
+        Button {
+            layout = layout == .grid ? .list : .grid
+        } label: {
+            if layout == .grid {
+                Label("列表", systemImage: "list.bullet")
+            } else {
+                Label("网格", systemImage: "square.grid.2x2")
             }
         }
     }
@@ -449,10 +539,10 @@ struct FolderView: View {
     private func routeDestination(_ route: Route) -> some View {
         switch route {
         case .folder(let url): FolderView(folder: url)
-        case .browser: BrowserView()
         case .capture: CaptureView()
         case .transfer: TransferView()
         case .settings: SettingsView()
+        default: EmptyView()
         }
     }
 
@@ -703,7 +793,7 @@ struct FileRow: View {
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                     .frame(width: 24)
             }
-            ThumbnailView(item: item)
+            FolderThumbnail(item: item, side: 56)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.name)
                     .lineLimit(2)

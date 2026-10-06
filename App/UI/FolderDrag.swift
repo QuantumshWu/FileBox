@@ -40,7 +40,7 @@ struct FolderDragPreview: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            ThumbnailView(item: item, side: 36)
+            FolderThumbnail(item: item, side: 36)
             Text(item.name)
                 .font(.subheadline)
                 .lineLimit(1)
