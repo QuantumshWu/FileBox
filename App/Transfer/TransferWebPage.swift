@@ -533,7 +533,6 @@ button{font:inherit;margin-top:16px;border:none;border-radius:8px;padding:8px 20
 <div class="big">📱</div>
 <h1>请在 iPhone 上点「允许」</h1>
 <p>FileBox 正在 iPhone 上询问是否允许这台电脑访问文件<span class="dots"></span></p>
-<p>选「允许并记住这台电脑」，以后打开就不用再确认。</p>
 </section>
 <section id="denied" class="denied" hidden>
 <div class="big">🚫</div>

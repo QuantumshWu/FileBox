@@ -94,7 +94,6 @@ final class TransferController: ObservableObject {
     @Published private(set) var isLocalNetworkDenied = false
     /// The access request shown as an alert; others wait in `accessQueue`.
     @Published private(set) var accessPrompt: TransferAccessRequest?
-    @Published private(set) var rememberedDevices = TransferGate.shared.rememberedDevices
 
     private var server: TransferServer?
     private weak var store: FileStore?
@@ -129,11 +128,14 @@ final class TransferController: ObservableObject {
         update()
     }
 
+    /// Leaving the screen (which also happens when the app locks) ends the transfer session: every
+    /// computer has to be allowed again next time.
     func disappear() {
         isVisible = false
         pathMonitor?.cancel()
         pathMonitor = nil
         update()
+        TransferGate.shared.revokeAll()
     }
 
     func sceneChanged(active: Bool) {
@@ -244,15 +246,14 @@ final class TransferController: ObservableObject {
     // MARK: - Access
 
     /// The user's answer to the shown prompt.
-    func answer(_ request: TransferAccessRequest, allow: Bool, remember: Bool) {
-        TransferGate.shared.decide(request.id, allow: allow, remember: remember)
+    func answer(_ request: TransferAccessRequest, allow: Bool) {
+        TransferGate.shared.decide(request.id, allow: allow)
         accessQueue.removeAll { $0.id == request.id }
         if accessPrompt?.id == request.id { accessPrompt = nil }
-        if remember { rememberedDevices = TransferGate.shared.rememberedDevices }
         appendLog(
             symbol: allow ? "checkmark.shield.fill" : "xmark.shield.fill",
             title: "\(allow ? "已允许" : "已拒绝")「\(request.label)」",
-            detail: remember ? "已记住这台电脑，下次不用再确认" : nil,
+            detail: nil,
             isError: !allow
         )
         // An alert presented while the last one is still going away would not show.
@@ -262,11 +263,6 @@ final class TransferController: ObservableObject {
             self?.isPromptScheduled = false
             self?.showNextPrompt()
         }
-    }
-
-    func forget(_ device: TransferRememberedDevice) {
-        TransferGate.shared.forget(device.token)
-        rememberedDevices = TransferGate.shared.rememberedDevices
     }
 
     private func showNextPrompt() {
