@@ -51,6 +51,11 @@ targets:
         NSPhotoLibraryUsageDescription: 用于在导入后从「照片」删除原件
         NSMicrophoneUsageDescription: 录屏时可以同时录下麦克风的声音
         NSLocalNetworkUsageDescription: Wi-Fi 传输需要让同一网络里的电脑访问 FileBox
+        # A web page's file-upload field offers "Take Photo"; without this key iOS kills the app.
+        NSCameraUsageDescription: 网页上传文件时可以拍照
+        # The built-in browser and its media downloads must also work with plain-HTTP sites.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
     entitlements:
       path: Support/FileBox.entitlements
       properties:
