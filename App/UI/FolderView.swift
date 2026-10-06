@@ -48,7 +48,8 @@ struct FolderView: View {
         case move([FileItem])
         case mergePicker(FileItem)
         case merge(first: FileItem, second: FileItem)
-        case documents(showsHint: Bool)
+        /// `directory` is resolved once when the sheet opens; resolving a bookmark can be slow.
+        case documents(showsHint: Bool, directory: URL?)
 
         var id: String {
             switch self {
@@ -99,6 +100,7 @@ struct FolderView: View {
         }
         .overlay { overlayContent }
         .navigationTitle(selecting ? "已选择 \(selection.count) 项" : title)
+        .navigationBarBackButtonHidden(selecting)
         .searchable(text: $query, prompt: "搜索文件名")
         .toolbar { toolbarContent }
         .refreshable {
@@ -125,7 +127,9 @@ struct FolderView: View {
             ContentUnavailableView(
                 "这里还没有文件",
                 systemImage: "tray",
-                description: Text("在其他 App 里点「分享」→ FileBox，\n或者点右上角的 + 导入")
+                description: Text(isRoot
+                    ? "在其他 App 里点「分享」→ FileBox，\n或者点右上角的 + 导入"
+                    : "点右上角的 + 导入，\n或者在上一层把文件拖到这个文件夹上")
             )
             .allowsHitTesting(false)
         } else if !query.isEmpty && visibleItems.isEmpty {
@@ -393,15 +397,24 @@ struct FolderView: View {
             } label: {
                 Label("新建文件夹", systemImage: "folder.badge.plus")
             }
-            Button { showPhotoPicker = true } label: {
-                Label("从相册导入", systemImage: "photo.on.rectangle")
+            // One import at a time, so the progress overlay always belongs to the running one.
+            Group {
+                Button { showPhotoPicker = true } label: {
+                    Label("从相册导入", systemImage: "photo.on.rectangle")
+                }
+                Button { showFileImporter = true } label: {
+                    Label("从「文件」导入", systemImage: "doc.badge.plus")
+                }
+                Button {
+                    sheet = .documents(
+                        showsHint: !FolderDocumentsLocation.isRemembered,
+                        directory: FolderDocumentsLocation.directory
+                    )
+                } label: {
+                    Label("从 Documents 导入", systemImage: "tray.and.arrow.down")
+                }
             }
-            Button { showFileImporter = true } label: {
-                Label("从「文件」导入", systemImage: "doc.badge.plus")
-            }
-            Button { sheet = .documents(showsHint: !FolderDocumentsLocation.isRemembered) } label: {
-                Label("从 Documents 导入", systemImage: "tray.and.arrow.down")
-            }
+            .disabled(progress != nil)
         } label: {
             Label("添加", systemImage: "plus")
         }
@@ -501,8 +514,8 @@ struct FolderView: View {
             }
         case .merge(let first, let second):
             VideoMergeView(first: first, second: second)
-        case .documents(let showsHint):
-            FolderDocumentsSheet(showsHint: showsHint) { urls in
+        case .documents(let showsHint, let directory):
+            FolderDocumentsSheet(showsHint: showsHint, directory: directory) { urls in
                 sheet = nil
                 importFromDocuments(urls)
             } onCancel: {
@@ -545,8 +558,8 @@ struct FolderView: View {
                     if selecting { endSelecting() }
                 }
                 Button("取消", role: .cancel) {}
-            } message: { _ in
-                Text("删除后无法恢复。")
+            } message: { targets in
+                Text(targets.contains(where: \.isDirectory) ? "文件夹里的文件也会一起删除，删除后无法恢复。" : "删除后无法恢复。")
             }
             .confirmationDialog(photoDeletionTitle, isPresented: photoDeletionBinding, titleVisibility: .visible, presenting: pendingPhotoDeletion) { identifiers in
                 Button("删除原件", role: .destructive) {
@@ -625,7 +638,10 @@ struct FolderView: View {
         }
         progress = nil
         if failed > 0 {
-            store.show("有 \(failed) 个项目没能导入")
+            // Replaces FileStore's "导入了 N 个文件" banner, so it carries both counts.
+            store.show(imported.isEmpty
+                ? "所选的 \(failed) 个项目没能导入"
+                : "导入了 \(imported.count) 个，另有 \(failed) 个没能导入")
         }
         let originals = imported.compactMap { identifiers[$0] }
         if !originals.isEmpty {

@@ -126,6 +126,8 @@ struct FolderMergePicker: View {
 /// way, with a one-line hint until something has been imported.
 struct FolderDocumentsSheet: View {
     let showsHint: Bool
+    /// Where the picker starts (`FolderDocumentsLocation.directory`), nil for the system default.
+    let directory: URL?
     let onPick: ([URL]) -> Void
     let onCancel: () -> Void
 
@@ -143,7 +145,7 @@ struct FolderDocumentsSheet: View {
                     .frame(maxWidth: .infinity)
                     .background(.bar)
             }
-            FolderDocumentPicker(directory: FolderDocumentsLocation.directory, onPick: onPick, onCancel: onCancel)
+            FolderDocumentPicker(directory: directory, onPick: onPick, onCancel: onCancel)
                 .ignoresSafeArea(edges: .bottom)
         }
     }
@@ -211,6 +213,13 @@ enum FolderDocumentsLocation {
         if let data = defaults.data(forKey: bookmarkKey) {
             var isStale = false
             if let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &isStale) {
+                if isStale {
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    if let fresh = try? url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil) {
+                        defaults.set(fresh, forKey: bookmarkKey)
+                    }
+                    if scoped { url.stopAccessingSecurityScopedResource() }
+                }
                 return defaults.bool(forKey: bookmarkIsFileKey) ? url.deletingLastPathComponent() : url
             }
         }
