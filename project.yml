@@ -1,0 +1,91 @@
+# XcodeGen spec. CI runs `xcodegen generate` to create FileBox.xcodeproj, so no Mac is needed locally.
+# Never change the bundle IDs: every new ID costs one of the free Apple ID's 10 App IDs per week.
+name: FileBox
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  developmentLanguage: zh-Hans
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1"
+targets:
+  FileBox:
+    type: application
+    platform: iOS
+    sources: [App, Shared]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.quantumshwu.filebox
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    info:
+      path: Support/App-Info.plist
+      properties:
+        CFBundleDisplayName: FileBox
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleLocalizations: [zh-Hans, en]
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Show the app's Documents folder in the Files app ("On My iPhone › FileBox").
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        # List FileBox under "Open in / Copy to" for any file, even without the share extension.
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Any File
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.data, public.content]
+        # The share sheet's "Save Image / Save Video" crashes the app without this key.
+        NSPhotoLibraryAddUsageDescription: 用于把文件保存到「照片」
+    entitlements:
+      path: Support/App.entitlements
+      properties:
+        com.apple.security.application-groups: [group.io.github.quantumshwu.filebox]
+    dependencies:
+      - target: FileBoxShare
+  FileBoxShare:
+    type: app-extension
+    platform: iOS
+    sources: [ShareExtension, Shared]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.quantumshwu.filebox.share
+        APPLICATION_EXTENSION_API_ONLY: YES
+    info:
+      path: Support/Share-Info.plist
+      properties:
+        CFBundleDisplayName: FileBox
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleLocalizations: [zh-Hans, en]
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsImageWithMaxCount: 100
+              NSExtensionActivationSupportsMovieWithMaxCount: 100
+              NSExtensionActivationSupportsFileWithMaxCount: 100
+              NSExtensionActivationSupportsAttachmentsWithMaxCount: 100
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsText: true
+    entitlements:
+      path: Support/Share.entitlements
+      properties:
+        com.apple.security.application-groups: [group.io.github.quantumshwu.filebox]
+schemes:
+  FileBox:
+    build:
+      targets:
+        FileBox: all
+        FileBoxShare: all
+    archive:
+      config: Release

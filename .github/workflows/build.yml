@@ -1,0 +1,97 @@
+# Builds FileBox.ipa on GitHub's free macOS runner (public repo), then publishes it with a
+# SideStore source.json as a GitHub Release. The IPA is unsigned; SideStore signs it on the phone.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      # A new version every build, so SideStore offers it as an update.
+      VERSION: 0.1.${{ github.run_number }}
+      BUILD: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install tools
+        run: |
+          brew install xcodegen ldid
+          xcodebuild -version
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build for iPhone (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project FileBox.xcodeproj \
+            -scheme FileBox \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/FileBox.xcarchive" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build.log | xcbeautify --renderer github-actions
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Embed entitlements and package IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/FileBox.xcarchive/Products/Applications/FileBox.app"
+          EXT="$APP/PlugIns/FileBoxShare.appex"
+          test -d "$EXT"
+          # SideStore reads the App Group to register from the binaries' signatures, and an
+          # unsigned build has none, so fake-sign with the entitlements (extension first).
+          ldid -SSupport/Share.entitlements "$EXT/FileBoxShare"
+          ldid -SSupport/App.entitlements "$APP/FileBox"
+          ldid -e "$EXT/FileBoxShare"
+          ldid -e "$APP/FileBox"
+          xcrun vtool -show-build "$APP/FileBox" | grep -i platform
+          mkdir -p "$RUNNER_TEMP/pkg/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/pkg/Payload/"
+          (cd "$RUNNER_TEMP/pkg" && zip -qry "$GITHUB_WORKSPACE/FileBox.ipa" Payload -x '*/.DS_Store' -x '._*')
+          ls -l FileBox.ipa
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+
+      - name: Make SideStore source
+        run: python3 scripts/make_source.py "$APP_PATH" FileBox.ipa
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: FileBox-ipa
+          path: FileBox.ipa
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: FileBox ${{ env.VERSION }}
+          make_latest: true
+          files: |
+            FileBox.ipa
+            source.json
