@@ -6,6 +6,10 @@ import Foundation
 /// Only a salted hash of the passcode is stored, on the phone.
 @MainActor
 final class LockManager: ObservableObject {
+    /// The app's one lock, also read by the media engines (closing Picture in Picture while locked
+    /// must leave nothing of the viewer behind).
+    static let shared = LockManager()
+
     @Published private(set) var isUnlocked = false
 
     static let defaultPasscode = "pi"

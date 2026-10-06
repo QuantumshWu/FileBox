@@ -401,8 +401,8 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         setSlideshow(false)
         finishRestore(false)
         let hub = MediaViewerHub.shared
-        if !restoring && UIApplication.shared.applicationState != .active {
-            // Closed with its X while FileBox is away: nothing of it may be left on return.
+        if !restoring && !LockManager.shared.isUnlocked {
+            // Closed with its X while locked: nothing of it may be left on return.
             teardown()
             hub.closeViewerAfterPictureInPicture()
             return

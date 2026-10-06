@@ -156,13 +156,16 @@ final class MediaViewerHub: ObservableObject {
         }
     }
 
-    /// PiP was closed with its X while FileBox was away: close the viewer so the next visit shows
-    /// the locked screen instead of what was playing.
+    /// PiP was closed with its X while the app is locked (it locks whenever it leaves the screen;
+    /// iOS may deliver this only once the user is back): close the viewer at once, without the
+    /// closing animation, so only the locked screen is ever seen.
     func closeViewerAfterPictureInPicture() {
-        guard UIApplication.shared.applicationState != .active, isViewerPresented else { return }
+        guard isViewerPresented else { return }
         backgroundCheckID = UUID()
-        coordinator?.close()
-        PrivacyShield.shared.show()
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { coordinator?.close() }
+        if UIApplication.shared.applicationState != .active { PrivacyShield.shared.show() }
     }
 
     private func closeIfIdleInBackground() {

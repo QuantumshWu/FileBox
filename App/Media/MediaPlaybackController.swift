@@ -36,7 +36,7 @@ enum MediaPlaybackMode: String, CaseIterable, Identifiable {
     }
 }
 
-/// Owns the app's one AVPlayer and AVPlayerViewController, so Picture in Picture and background
+/// Owns the app's one AVPlayer and its video surface, so Picture in Picture and background
 /// playback survive SwiftUI rebuilding (or closing) the viewer. Plays through the files of one folder
 /// according to `MediaPlaybackMode`, also while in PiP or in the background.
 @MainActor
@@ -44,7 +44,10 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     static let shared = MediaPlaybackController()
 
     let player = AVPlayer()
-    let playerViewController = AVPlayerViewController()
+    /// The video surface the viewer's pages borrow. A plain AVPlayerLayer with our own controls:
+    /// AVPlayerViewController's Picture in Picture stops working once its controls are turned off.
+    let playerViewController = MediaPlayerSurfaceController()
+    private var pictureInPicture: AVPictureInPictureController?
 
     /// Index (in `sessionItems`) of the file in the player.
     @Published private(set) var currentIndex: Int?
@@ -82,22 +85,17 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     private override init() {
         super.init()
         player.actionAtItemEnd = .none
-        playerViewController.player = player
-        playerViewController.delegate = self
-        // The viewer draws its own controls in its bar, so there is one set that shows and hides together.
-        playerViewController.showsPlaybackControls = false
-        playerViewController.allowsPictureInPicturePlayback = true
-        playerViewController.canStartPictureInPictureAutomaticallyFromInline = true
-        playerViewController.updatesNowPlayingInfoCenter = false
-        playerViewController.entersFullScreenWhenPlaybackBegins = false
-        playerViewController.exitsFullScreenWhenPlaybackEnds = false
         playerViewController.loadViewIfNeeded()
-        playerViewController.view.backgroundColor = .black
-        if let overlay = playerViewController.contentOverlayView {
-            audioOverlay.frame = overlay.bounds
-            audioOverlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-            audioOverlay.isHidden = true
-            overlay.addSubview(audioOverlay)
+        playerViewController.player = player
+        audioOverlay.frame = playerViewController.view.bounds
+        audioOverlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        audioOverlay.isHidden = true
+        playerViewController.view.addSubview(audioOverlay)
+        if AVPictureInPictureController.isPictureInPictureSupported(),
+           let controller = AVPictureInPictureController(playerLayer: playerViewController.playerLayer) {
+            controller.delegate = self
+            controller.canStartPictureInPictureAutomaticallyFromInline = true
+            pictureInPicture = controller
         }
         observeAppAndPlayer()
     }
@@ -131,7 +129,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     func setAutomaticPictureInPicture(_ enabled: Bool) {
-        playerViewController.canStartPictureInPictureAutomaticallyFromInline = enabled
+        pictureInPicture?.canStartPictureInPictureAutomaticallyFromInline = enabled
     }
 
     func play() {
@@ -144,16 +142,20 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         player.pause()
     }
 
-    /// The manual PiP button. AVPlayerViewController has no public call for this, so use its own
-    /// action when it is there.
+    /// The manual PiP button.
     func togglePictureInPicture() {
         guard player.currentItem != nil else { return }
-        let selector = NSSelectorFromString(isPictureInPictureActive ? "stopPictureInPicture" : "startPictureInPicture")
-        guard playerViewController.responds(to: selector) else {
-            MediaViewerHub.shared.show("请点视频画面上的小窗按钮")
+        guard let controller = pictureInPicture else {
+            MediaViewerHub.shared.show("这台设备不支持小窗")
             return
         }
-        _ = playerViewController.perform(selector)
+        if controller.isPictureInPictureActive {
+            controller.stopPictureInPicture()
+        } else if controller.isPictureInPicturePossible {
+            controller.startPictureInPicture()
+        } else {
+            MediaViewerHub.shared.show("小窗暂时无法开启")
+        }
     }
 
     /// Stops playback and forgets the folder.
@@ -544,8 +546,8 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         finishRestore(false)
         publishState()
         let hub = MediaViewerHub.shared
-        if !restoring && UIApplication.shared.applicationState != .active {
-            // Closed with its X while FileBox is away: nothing of it may be left on return.
+        if !restoring && !LockManager.shared.isUnlocked {
+            // Closed with its X while locked: nothing of it may be left on return.
             stop()
             hub.closeViewerAfterPictureInPicture()
             return
@@ -603,28 +605,58 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 }
 
-extension MediaPlaybackController: AVPlayerViewControllerDelegate {
-    nonisolated func playerViewControllerWillStartPictureInPicture(_ playerViewController: AVPlayerViewController) {
+extension MediaPlaybackController: AVPictureInPictureControllerDelegate {
+    nonisolated func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         Task { @MainActor in self.pictureInPictureWillStart() }
     }
 
-    nonisolated func playerViewControllerDidStartPictureInPicture(_ playerViewController: AVPlayerViewController) {
+    nonisolated func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         Task { @MainActor in self.pictureInPictureDidStart() }
     }
 
-    nonisolated func playerViewController(_ playerViewController: AVPlayerViewController, failedToStartPictureInPictureWithError error: Error) {
+    nonisolated func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        failedToStartPictureInPictureWithError error: Error
+    ) {
         Task { @MainActor in self.pictureInPictureFailed() }
     }
 
-    nonisolated func playerViewControllerDidStopPictureInPicture(_ playerViewController: AVPlayerViewController) {
+    nonisolated func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         Task { @MainActor in self.pictureInPictureDidStop() }
     }
 
-    nonisolated func playerViewController(
-        _ playerViewController: AVPlayerViewController,
+    nonisolated func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
         restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
     ) {
         Task { @MainActor in self.restoreUserInterface(completionHandler) }
+    }
+}
+
+/// The video picture: a view backed by an AVPlayerLayer, black around the video.
+final class MediaPlayerSurfaceController: UIViewController {
+    var playerLayer: AVPlayerLayer { surface.playerLayer }
+
+    var player: AVPlayer? {
+        get { surface.playerLayer.player }
+        set { surface.playerLayer.player = newValue }
+    }
+
+    private let surface = MediaPlayerLayerView()
+
+    override func loadView() {
+        surface.backgroundColor = .black
+        surface.playerLayer.videoGravity = .resizeAspect
+        view = surface
+    }
+}
+
+final class MediaPlayerLayerView: UIView {
+    override class var layerClass: AnyClass { AVPlayerLayer.self }
+
+    var playerLayer: AVPlayerLayer {
+        // layerClass guarantees the type.
+        layer as! AVPlayerLayer
     }
 }
 
