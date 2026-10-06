@@ -72,7 +72,8 @@ struct TransferHost: Equatable {
 }
 
 /// Drives TransferServer for TransferView: the server runs only while the screen is visible, its
-/// switch is on and the app is active, and its events become progress rows and a log.
+/// switch is on and the app is active, and its events become progress rows, access prompts and a
+/// log.
 @MainActor
 final class TransferController: ObservableObject {
     enum Status: Equatable {
@@ -87,29 +88,34 @@ final class TransferController: ObservableObject {
     @Published private(set) var isEnabled = true
     @Published private(set) var port: UInt16?
     @Published private(set) var host: TransferHost?
-    @Published private(set) var token = ""
     @Published private(set) var transfers: [TransferProgress] = []
     @Published private(set) var log: [TransferLogEntry] = []
     /// iOS reports that FileBox's local network access is turned off, so no computer can connect.
     @Published private(set) var isLocalNetworkDenied = false
+    /// The access request shown as an alert; others wait in `accessQueue`.
+    @Published private(set) var accessPrompt: TransferAccessRequest?
+    @Published private(set) var rememberedDevices = TransferGate.shared.rememberedDevices
 
     private var server: TransferServer?
     private weak var store: FileStore?
     private var isVisible = false
     private var isSceneActive = false
-    /// A fresh token for every start the user asks for; an automatic restart after the app was
-    /// briefly inactive keeps the address, so an open browser tab keeps working.
-    private var needsNewToken = true
+    /// Kept for an automatic restart after the app was briefly inactive, so an open browser tab
+    /// keeps working even when neither preferred port was free.
     private var lastPort: UInt16?
+    private var accessQueue: [TransferAccessRequest] = []
+    /// The next prompt is shown a moment after the last alert went away.
+    private var isPromptScheduled = false
     private var pathMonitor: NWPathMonitor?
     /// Only the latest local network probe may update `isLocalNetworkDenied`.
     private var probeGeneration = 0
     private var isRefreshPending = false
 
-    /// What the computer's browser opens, e.g. "http://192.168.1.5:8080/k3mx9q/".
+    /// What the computer's browser opens, e.g. "http://192.168.1.5", or "http://192.168.1.5:8080"
+    /// when iOS does not allow port 80.
     var address: String? {
         guard status == .running, let host, let port else { return nil }
-        return "http://\(host.ip):\(port)/\(token)/"
+        return port == 80 ? "http://\(host.ip)" : "http://\(host.ip):\(port)"
     }
 
     // MARK: - Lifecycle
@@ -139,10 +145,7 @@ final class TransferController: ObservableObject {
     func setEnabled(_ enabled: Bool) {
         guard enabled != isEnabled else { return }
         isEnabled = enabled
-        if enabled {
-            needsNewToken = true
-            if case .failed = status { status = .off }
-        }
+        if enabled, case .failed = status { status = .off }
         update()
     }
 
@@ -156,11 +159,7 @@ final class TransferController: ObservableObject {
     }
 
     private func startServer() {
-        if needsNewToken || token.isEmpty {
-            token = Self.makeToken()
-            needsNewToken = false
-        }
-        let server = TransferServer(token: token, root: Vault.root)
+        let server = TransferServer(root: Vault.root)
         server.onEvent = { [weak self, weak server] event in
             guard let self, let server, server === self.server else { return }
             self.handle(event)
@@ -168,7 +167,9 @@ final class TransferController: ObservableObject {
         self.server = server
         status = .starting
         port = nil
-        server.start(port: lastPort ?? TransferServer.preferredPort)
+        var ports = TransferServer.preferredPorts
+        if let lastPort, !ports.contains(lastPort) { ports.append(lastPort) }
+        server.start(ports: ports)
         UIApplication.shared.isIdleTimerDisabled = true
     }
 
@@ -185,6 +186,9 @@ final class TransferController: ObservableObject {
             )
         }
         transfers.removeAll()
+        TransferGate.shared.dropPending()
+        accessQueue.removeAll()
+        accessPrompt = nil
         port = nil
         if case .failed = status {} else { status = .off }
         UIApplication.shared.isIdleTimerDisabled = false
@@ -231,7 +235,43 @@ final class TransferController: ObservableObject {
         case .folderCreated(let name, let folder):
             appendLog(symbol: "folder.fill.badge.plus", title: "新建文件夹「\(name)」", detail: "在「\(folderLabel(folder))」里", isError: false)
             scheduleRefresh()
+        case .accessRequested(let request):
+            accessQueue.append(request)
+            showNextPrompt()
         }
+    }
+
+    // MARK: - Access
+
+    /// The user's answer to the shown prompt.
+    func answer(_ request: TransferAccessRequest, allow: Bool, remember: Bool) {
+        TransferGate.shared.decide(request.id, allow: allow, remember: remember)
+        accessQueue.removeAll { $0.id == request.id }
+        if accessPrompt?.id == request.id { accessPrompt = nil }
+        if remember { rememberedDevices = TransferGate.shared.rememberedDevices }
+        appendLog(
+            symbol: allow ? "checkmark.shield.fill" : "xmark.shield.fill",
+            title: "\(allow ? "已允许" : "已拒绝")「\(request.label)」",
+            detail: remember ? "已记住这台电脑，下次不用再确认" : nil,
+            isError: !allow
+        )
+        // An alert presented while the last one is still going away would not show.
+        isPromptScheduled = true
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            self?.isPromptScheduled = false
+            self?.showNextPrompt()
+        }
+    }
+
+    func forget(_ device: TransferRememberedDevice) {
+        TransferGate.shared.forget(device.token)
+        rememberedDevices = TransferGate.shared.rememberedDevices
+    }
+
+    private func showNextPrompt() {
+        guard accessPrompt == nil, !isPromptScheduled, let next = accessQueue.first else { return }
+        accessPrompt = next
     }
 
     /// A folder upload can finish hundreds of files a minute; the open folders reload at most
@@ -284,12 +324,6 @@ final class TransferController: ObservableObject {
         }
         monitor.start(queue: DispatchQueue(label: "FileBox.Transfer.path"))
         pathMonitor = monitor
-    }
-
-    /// Six characters that are easy to read and type (no 0/o, 1/l/i).
-    private static func makeToken() -> String {
-        let alphabet = Array("abcdefghjkmnpqrstuvwxyz23456789")
-        return String((0..<6).map { _ in alphabet.randomElement()! })
     }
 }
 

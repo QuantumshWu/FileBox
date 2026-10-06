@@ -1,10 +1,12 @@
 import Foundation
 
-/// The single self-contained page (inline CSS and JS) that a computer's browser loads from
-/// `/<token>/`. It talks to TransferServer's endpoints relative to that prefix:
-/// `api/list?dir=`, `file/<path>[?dl=1]`, `PUT upload?dir=&name=[&sub=]` and `POST mkdir?dir=&name=`.
+/// The self-contained pages (inline CSS and JS) that a computer's browser loads from `/`. An
+/// allowed browser gets the file page, which uses `/api/list?dir=`, `/file/<path>[?dl=1]`,
+/// `PUT /upload?dir=&name=[&sub=]` and `POST /mkdir?dir=&name=`. Any other browser gets the waiting
+/// page, which polls `/api/access` (`POST` asks again after a denial) until the phone answers.
 enum TransferWebPage {
     static let data = Data(html.utf8)
+    static let waitingData = Data(waitingHTML.utf8)
 
     static let contentSecurityPolicy = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
@@ -109,7 +111,7 @@ footer{color:var(--muted);font-size:12px;text-align:center;padding:0 16px 24px}
 <script>
 (() => {
 'use strict';
-const base = '/' + location.pathname.split('/')[1] + '/';
+const base = '/';
 const $ = id => document.getElementById(id);
 const collator = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
 const PARALLEL = 2;
@@ -201,9 +203,14 @@ async function load() {
     return;
   }
   if (wanted !== dir) return;
+  // No longer allowed (removed on the phone): the start page asks again.
+  if (res.status === 403) {
+    location.reload();
+    return;
+  }
   if (!res.ok || !data) {
     entries = [];
-    showMessage(data && data.error ? data.error : '这个地址已经失效。FileBox 每次开启 Wi-Fi 传输都会生成新地址，请按手机上显示的地址重新打开。');
+    showMessage(data && data.error ? data.error : '读取文件夹失败（错误 ' + res.status + '），请刷新页面。');
     render();
     return;
   }
@@ -488,6 +495,106 @@ async function walk(entry, sub, found) {
 
 dir = dirFromHash();
 load();
+})();
+</script>
+</body>
+</html>
+"""#
+
+    private static let waitingHTML = #"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>FileBox · 等待允许</title>
+<style>
+:root{--bg:#f2f2f7;--card:#fff;--text:#1c1c1e;--muted:#8a8a8e;--line:#e5e5ea;--accent:#007aff;--danger:#e5352b}
+@media (prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;--text:#f2f2f7;--muted:#98989f;--line:#38383a;--accent:#0a84ff;--danger:#ff453a}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;background:var(--bg);color:var(--text)}
+body{font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;padding:12vh 16px 24px}
+.card{max-width:460px;margin:0 auto;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:32px 24px;text-align:center}
+.big{font-size:44px;line-height:1}
+h1{font-size:21px;margin:16px 0 8px}
+p{margin:6px 0;color:var(--muted)}
+#who{color:var(--text);font-weight:600}
+.denied h1{color:var(--danger)}
+button{font:inherit;margin-top:16px;border:none;border-radius:8px;padding:8px 20px;background:var(--accent);color:#fff;cursor:pointer}
+.dots::after{content:"";animation:dots 1.5s steps(4) infinite}
+@keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+</style>
+</head>
+<body>
+<div class="card">
+<section id="pending">
+<div class="big">📱</div>
+<h1>请在 iPhone 上点「允许」</h1>
+<p>FileBox 正在 iPhone 上询问是否允许这台电脑访问文件<span class="dots"></span></p>
+<p>选「允许并记住这台电脑」，以后打开就不用再确认。</p>
+</section>
+<section id="denied" class="denied" hidden>
+<div class="big">🚫</div>
+<h1>已被拒绝</h1>
+<p>iPhone 上拒绝了这台电脑的访问。</p>
+<button id="retry">重新请求</button>
+</section>
+<section id="offline" hidden>
+<div class="big">📶</div>
+<h1>连接不上手机</h1>
+<p>请确认 iPhone 上的 FileBox 停在「Wi-Fi 传输」页面、屏幕亮着<span class="dots"></span></p>
+</section>
+<section id="nocookie" hidden>
+<div class="big">🍪</div>
+<h1>浏览器禁用了 Cookie</h1>
+<p>FileBox 用 Cookie 认出已经允许的电脑。请允许这个网站使用 Cookie，然后刷新页面。</p>
+</section>
+<p id="whoLine" hidden>这台电脑：<span id="who"></span></p>
+</div>
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+let timer = 0;
+
+function show(name) {
+  for (const id of ['pending', 'denied', 'offline', 'nocookie']) $(id).hidden = id !== name;
+}
+
+async function poll(method) {
+  clearTimeout(timer);
+  let data;
+  try {
+    const res = await fetch('/api/access', { method: method || 'GET', cache: 'no-store' });
+    data = await res.json();
+  } catch (e) {
+    show('offline');
+    timer = setTimeout(() => poll(), 3000);
+    return;
+  }
+  if (data.ip) {
+    $('who').textContent = data.ip + (data.client ? '（' + data.client + '）' : '');
+    $('whoLine').hidden = false;
+  }
+  if (data.state === 'allowed') {
+    location.reload();
+  } else if (data.state === 'denied') {
+    show('denied');
+  } else {
+    show('pending');
+    timer = setTimeout(() => poll(), 1500);
+  }
+}
+
+$('retry').addEventListener('click', () => {
+  show('pending');
+  poll('POST');
+});
+
+if (navigator.cookieEnabled === false) show('nocookie');
+else poll();
 })();
 </script>
 </body>

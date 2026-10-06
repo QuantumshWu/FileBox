@@ -16,16 +16,19 @@ enum TransferServerEvent {
     case transferFinished(id: UUID, name: String, isUpload: Bool, folder: String)
     case transferFailed(id: UUID, name: String, isUpload: Bool, reason: String)
     case folderCreated(name: String, folder: String)
+    /// A computer waits for the user to allow it.
+    case accessRequested(TransferAccessRequest)
 }
 
-/// A small HTTP/1.1 server on Network.framework for the Wi-Fi transfer page. Every path must start
-/// with `/<token>/`; anything else gets a 404. Requests are handled on background queues (one
-/// serial queue per connection), never on the main thread; `onEvent` is called on the main queue.
+/// A small HTTP/1.1 server on Network.framework for the Wi-Fi transfer page. Only browsers that
+/// TransferGate allows reach the files; others get a page that waits for the phone's answer.
+/// Requests are handled on background queues (one serial queue per connection), never on the main
+/// thread; `onEvent` is called on the main queue.
 final class TransferServer: @unchecked Sendable {
-    static let preferredPort: UInt16 = 8080
+    /// Tried in order before any free port: port 80 needs no port in the address.
+    static let preferredPorts: [UInt16] = [80, 8080]
     private static let maxConnections = 48
 
-    let token: String
     /// Set on the main thread before `start`.
     var onEvent: ((TransferServerEvent) -> Void)?
 
@@ -37,9 +40,10 @@ final class TransferServer: @unchecked Sendable {
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: TransferConnection] = [:]
     private var isStopped = false
+    /// Ports still to try after the current one.
+    private var candidates: [NWEndpoint.Port] = []
 
-    init(token: String, root: URL) {
-        self.token = token
+    init(root: URL) {
         self.root = root
         rootPath = TransferHTTP.normalizedPath(root)
     }
@@ -49,11 +53,12 @@ final class TransferServer: @unchecked Sendable {
         connections.values.forEach { $0.cancel() }
     }
 
-    /// Listens on `port`, or on any free port if that one stays taken.
-    func start(port: UInt16) {
+    /// Listens on the first of `ports` that iOS allows and is free, else on any free port.
+    func start(ports: [UInt16]) {
         queue.async {
             TransferConnection.removeStaleUploads()
-            self.listen(on: NWEndpoint.Port(rawValue: port) ?? .any, retries: 3)
+            self.candidates = ports.compactMap { NWEndpoint.Port(rawValue: $0) }
+            self.listenNext()
         }
     }
 
@@ -65,6 +70,11 @@ final class TransferServer: @unchecked Sendable {
             self.connections.values.forEach { $0.cancel() }
             self.connections.removeAll()
         }
+    }
+
+    private func listenNext() {
+        let port = candidates.isEmpty ? NWEndpoint.Port.any : candidates.removeFirst()
+        listen(on: port, retries: 3)
     }
 
     private func listen(on port: NWEndpoint.Port, retries: Int) {
@@ -84,7 +94,7 @@ final class TransferServer: @unchecked Sendable {
             case .ready:
                 self.emit(.ready(port: listener.port?.rawValue ?? port.rawValue))
             case .waiting(let error):
-                if Self.isAddressInUse(error) {
+                if Self.isPortRefused(error) {
                     self.discard(listener)
                     self.retry(port: port, retries: retries, after: error)
                 } else {
@@ -104,8 +114,8 @@ final class TransferServer: @unchecked Sendable {
         listener.start(queue: queue)
     }
 
-    /// The preferred port can still be held by a listener that is shutting down, so it is retried a
-    /// few times before falling back to any free port.
+    /// A preferred port can still be held by a listener that is shutting down, so it is retried a
+    /// few times before moving on to the next port.
     private func retry(port: NWEndpoint.Port, retries: Int, after error: Error) {
         guard !isStopped else { return }
         if port == .any {
@@ -115,7 +125,7 @@ final class TransferServer: @unchecked Sendable {
                 self.listen(on: port, retries: retries - 1)
             }
         } else {
-            listen(on: .any, retries: 0)
+            listenNext()
         }
     }
 
@@ -131,13 +141,19 @@ final class TransferServer: @unchecked Sendable {
         return false
     }
 
+    /// The port is taken or not allowed (a low port such as 80), as opposed to no network yet.
+    private static func isPortRefused(_ error: NWError) -> Bool {
+        if case .posix(let code) = error { return code == .EADDRINUSE || code == .EACCES || code == .EPERM }
+        return false
+    }
+
     private func accept(_ nwConnection: NWConnection) {
         guard !isStopped, connections.count < Self.maxConnections else {
             nwConnection.cancel()
             return
         }
         let context = TransferConnection.Context(
-            token: token,
+            gate: .shared,
             root: root,
             rootPath: rootPath,
             fileLock: fileLock,
@@ -164,7 +180,7 @@ final class TransferServer: @unchecked Sendable {
 /// Everything runs on the connection's own serial queue.
 private final class TransferConnection: @unchecked Sendable {
     struct Context {
-        let token: String
+        let gate: TransferGate
         let root: URL
         /// `root` normalized with TransferHTTP.normalizedPath.
         let rootPath: String
@@ -212,6 +228,12 @@ private final class TransferConnection: @unchecked Sendable {
         let items: [Entry]
     }
 
+    private struct AccessStatus: Encodable {
+        let state: String
+        let ip: String
+        let client: String
+    }
+
     private static let maxHeaderSize = 64 * 1024
     private static let chunkSize = 1 << 20
     /// Download chunks queued on the network at once.
@@ -247,6 +269,8 @@ private final class TransferConnection: @unchecked Sendable {
 
     private let connection: NWConnection
     private let context: Context
+    /// The computer's address, e.g. "192.168.1.5".
+    private let remoteIP: String
     private let queue = DispatchQueue(label: "FileBox.Transfer.connection")
     private let fm = FileManager.default
     private var buffer = Data()
@@ -265,6 +289,7 @@ private final class TransferConnection: @unchecked Sendable {
     init(_ connection: NWConnection, context: Context) {
         self.connection = connection
         self.context = context
+        remoteIP = Self.address(of: connection.endpoint)
     }
 
     func start() {
@@ -366,26 +391,41 @@ private final class TransferConnection: @unchecked Sendable {
             respondError(400, "请求格式不对")
             return
         }
-        guard request.segments.first == context.token else {
-            respond(404, type: "text/plain; charset=utf-8", body: Data("Not Found".utf8))
+        // A body the server will not read is drained after the answer (see `lingers`).
+        if let length = request.headers["content-length"].flatMap({ Int64($0) }), length > Int64(body.count) {
+            lingers = true
+        }
+        // A web site whose name was pointed at the phone (DNS rebinding) must not get a prompt.
+        guard TransferHTTP.isDirectHost(request.headers["host"]) else {
+            respondError(403, "请用 iPhone 上显示的地址打开")
             return
         }
-        let route = Array(request.segments.dropFirst())
+        let route = request.segments
         let headOnly = request.method == "HEAD"
+        let cookies = request.cookies
+        let allowed = context.gate.isAllowed(
+            session: cookies[TransferGate.sessionCookie],
+            device: cookies[TransferGate.deviceCookie]
+        )
+        let wantsPage = request.headers["accept"]?.contains("text/html") == true
         switch (request.method, route.first ?? "") {
         case ("GET", ""), ("HEAD", ""):
-            if request.path.hasSuffix("/") {
-                respond(
-                    200,
-                    type: "text/html; charset=utf-8",
-                    body: TransferWebPage.data,
-                    headers: [("Content-Security-Policy", TransferWebPage.contentSecurityPolicy)],
-                    headOnly: headOnly
-                )
-            } else {
-                respond(301, type: "text/plain; charset=utf-8", body: Data(), headers: [("Location", "/\(context.token)/")])
-            }
-        case ("GET", "api") where route.count == 2 && route[1] == "list":
+            respond(
+                200,
+                type: "text/html; charset=utf-8",
+                body: allowed ? TransferWebPage.data : TransferWebPage.waitingData,
+                headers: [("Content-Security-Policy", TransferWebPage.contentSecurityPolicy)],
+                headOnly: headOnly
+            )
+        case ("GET", "api") where route == ["api", "access"]:
+            access(request, retry: false)
+        case ("POST", "api") where route == ["api", "access"]:
+            access(request, retry: true)
+        case ("GET", _) where !allowed && wantsPage:
+            redirectHome()
+        case _ where !allowed:
+            respondError(403, "这台电脑还没有获得允许，请刷新页面，然后在 iPhone 上点「允许」")
+        case ("GET", "api") where route == ["api", "list"]:
             list(request)
         case ("GET", "file"), ("HEAD", "file"):
             serveFile(Array(route.dropFirst()), request: request, headOnly: headOnly)
@@ -393,9 +433,56 @@ private final class TransferConnection: @unchecked Sendable {
             beginUpload(request, body: body)
         case ("POST", "mkdir"):
             makeFolder(request)
+        case ("GET", _) where wantsPage:
+            redirectHome()
         default:
             respondError(404, "找不到这个地址")
         }
+    }
+
+    /// The waiting page's status poll; `retry` (a POST) asks again after a denial.
+    private func access(_ request: TransferRequest, retry: Bool) {
+        let cookies = request.cookies
+        let client = TransferHTTP.clientName(userAgent: request.headers["user-agent"])
+        let result = context.gate.poll(
+            session: cookies[TransferGate.sessionCookie],
+            device: cookies[TransferGate.deviceCookie],
+            ip: remoteIP,
+            client: client,
+            retry: retry
+        )
+        if let prompt = result.request {
+            context.emit(.accessRequested(prompt))
+        }
+        var headers: [(String, String)] = []
+        if let session = result.newSession {
+            headers.append(("Set-Cookie", TransferHTTP.cookie(TransferGate.sessionCookie, session)))
+        }
+        if let device = result.device {
+            headers.append(("Set-Cookie", TransferHTTP.cookie(TransferGate.deviceCookie, device, maxAge: 400 * 24 * 3600)))
+        }
+        respondJSON(200, AccessStatus(state: result.state.rawValue, ip: remoteIP, client: client), headers: headers)
+    }
+
+    /// Sends a browser that opened some other page (an old link, a file it may not see yet) to the
+    /// start page.
+    private func redirectHome() {
+        respond(302, type: "text/plain; charset=utf-8", body: Data(), headers: [("Location", "/")])
+    }
+
+    /// "192.168.1.5" for the remote end of a connection.
+    private static func address(of endpoint: NWEndpoint) -> String {
+        guard case .hostPort(let host, _) = endpoint else { return "未知地址" }
+        var text: String
+        switch host {
+        case .ipv4(let address): text = address.debugDescription
+        case .ipv6(let address): text = address.debugDescription
+        case .name(let name, _): text = name
+        @unknown default: text = host.debugDescription
+        }
+        if let scope = text.firstIndex(of: "%") { text = String(text[..<scope]) }
+        if text.lowercased().hasPrefix("::ffff:") { text.removeFirst("::ffff:".count) }
+        return text
     }
 
     // MARK: - Paths
@@ -775,9 +862,9 @@ private final class TransferConnection: @unchecked Sendable {
         send(data) { [weak self] in self?.endResponse() }
     }
 
-    private func respondJSON<T: Encodable>(_ status: Int, _ value: T) {
+    private func respondJSON<T: Encodable>(_ status: Int, _ value: T, headers: [(String, String)] = []) {
         let body = (try? JSONEncoder().encode(value)) ?? Data("{}".utf8)
-        respond(status, type: "application/json; charset=utf-8", body: body)
+        respond(status, type: "application/json; charset=utf-8", body: body, headers: headers)
     }
 
     /// A JSON `{"error": message}` the page shows to the user.
