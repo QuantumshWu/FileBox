@@ -116,7 +116,8 @@ final class FileStore: ObservableObject {
         changed()
     }
 
-    /// Moves items into `folder`, skipping a folder moved into itself or its own subfolder.
+    /// Moves items into `folder` (nesting them), skipping a folder moved into itself or its own
+    /// subfolder. A folder whose name is already taken there is merged with the existing one.
     func move(_ items: [FileItem], into folder: URL) {
         let target = normalizedPath(folder)
         var count = 0
@@ -125,7 +126,7 @@ final class FileStore: ObservableObject {
             if target == source || target.hasPrefix(source + "/") { continue }
             if normalizedPath(item.url.deletingLastPathComponent()) == target { continue }
             do {
-                try fm.moveItem(at: item.url, to: fm.uniqueURL(for: item.name, in: folder))
+                try Vault.merge(item.url, into: folder, move: true)
                 count += 1
             } catch {
                 report(error)
@@ -133,8 +134,31 @@ final class FileStore: ObservableObject {
         }
         if count > 0 {
             changed()
-            show("已移动 \(count) 项到「\(folder.lastPathComponent)」")
+            show("已移动 \(count) 项到「\(displayName(of: folder))」")
         }
+    }
+
+    /// Moves everything inside `source` into `target` (merging same-named subfolders, renaming
+    /// clashing files) and then removes the emptied `source`.
+    func mergeFolder(_ source: FileItem, into target: URL) {
+        let sourcePath = normalizedPath(source.url)
+        let targetPath = normalizedPath(target)
+        guard source.isDirectory, targetPath != sourcePath, !targetPath.hasPrefix(sourcePath + "/") else { return }
+        do {
+            for child in try fm.contentsOfDirectory(at: source.url, includingPropertiesForKeys: nil) {
+                try Vault.merge(child, into: target, move: true)
+            }
+            try fm.removeItem(at: source.url)
+            changed()
+            show("已把「\(source.name)」合并到「\(displayName(of: target))」")
+        } catch {
+            changed()
+            report(error)
+        }
+    }
+
+    private func displayName(of folder: URL) -> String {
+        isRoot(folder) ? "FileBox" : folder.lastPathComponent
     }
 
     /// Adds a file produced inside the app (edited copy, download, recording...) to `folder`.
@@ -153,18 +177,21 @@ final class FileStore: ObservableObject {
 
     // MARK: - Importing
 
-    /// Files picked in the app (Photos or a document picker). Security-scoped URLs are handled here.
+    /// Files and folders picked in the app (Photos or a document picker). Security-scoped URLs are
+    /// handled here. Picked folders keep their subfolders; a folder whose name is already taken is
+    /// merged with the existing one.
     func importFiles(_ urls: [URL], into folder: URL, moving: Bool = false) async {
         var count = 0
         for url in urls {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            let dest = fm.uniqueURL(for: safeName(url.lastPathComponent), in: folder)
             do {
                 if moving {
-                    try fm.moveItem(at: url, to: dest)
+                    try Vault.merge(url, into: folder, move: true)
                 } else {
-                    try await coordinatedCopy(url, to: dest)
+                    try await Task.detached(priority: .userInitiated) {
+                        try FileStore.importTree(url, into: folder)
+                    }.value
                 }
                 count += 1
             } catch {
@@ -173,8 +200,42 @@ final class FileStore: ObservableObject {
         }
         if count > 0 {
             changed()
-            show("导入了 \(count) 个文件")
+            show("导入了 \(count) 项")
         }
+    }
+
+    /// Copies a picked file, or a picked folder with everything in it, into `folder`. Each file is
+    /// read through a file coordinator, so iCloud and other providers (Readdle Documents) deliver
+    /// files that are not downloaded yet.
+    nonisolated private static func importTree(_ source: URL, into folder: URL) throws {
+        let fm = FileManager.default
+        var name = sanitizedFileName(source.lastPathComponent)
+        if name.isEmpty { name = "文件" }
+        let isFolder = (try? source.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        if isFolder {
+            var target = folder.appendingPathComponent(name, isDirectory: true)
+            var existing: ObjCBool = false
+            if !(fm.fileExists(atPath: target.path, isDirectory: &existing) && existing.boolValue) {
+                if fm.fileExists(atPath: target.path) { target = fm.uniqueURL(for: name, in: folder) }
+                try fm.createDirectory(at: target, withIntermediateDirectories: true)
+            }
+            let children = try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
+            for child in children {
+                try importTree(child, into: target)
+            }
+            return
+        }
+        var coordinationError: NSError?
+        var copyError: Error?
+        NSFileCoordinator().coordinate(readingItemAt: source, options: [.withoutChanges], error: &coordinationError) { readURL in
+            do {
+                try fm.copyItem(at: readURL, to: fm.uniqueURL(for: name, in: folder))
+            } catch {
+                copyError = error
+            }
+        }
+        if let coordinationError { throw coordinationError }
+        if let copyError { throw copyError }
     }
 
     /// A file handed over with "Open in / Copy to FileBox".

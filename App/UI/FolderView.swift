@@ -57,6 +57,7 @@ struct FolderView: View {
 
     private enum FolderSheet: Identifiable {
         case move([FileItem])
+        case mergeFolder(FileItem)
         case mergePicker(FileItem)
         case merge(first: FileItem, second: FileItem)
         /// `directory` is resolved once when the sheet opens; resolving a bookmark can be slow.
@@ -65,6 +66,7 @@ struct FolderView: View {
         var id: String {
             switch self {
             case .move(let items): return "move:" + items.map(\.url.path).joined(separator: "|")
+            case .mergeFolder(let item): return "mergeFolder:" + item.url.path
             case .mergePicker(let item): return "pick:" + item.url.path
             case .merge(let first, let second): return "merge:" + first.url.path + "|" + second.url.path
             case .documents: return "documents"
@@ -386,6 +388,11 @@ struct FolderView: View {
         Button { sheet = .move([item]) } label: {
             Label("移动到…", systemImage: "folder")
         }
+        if item.isDirectory {
+            Button { sheet = .mergeFolder(item) } label: {
+                Label("合并到…", systemImage: "arrow.triangle.merge")
+            }
+        }
         Button { startRename(item) } label: {
             Label("重命名", systemImage: "pencil")
         }
@@ -517,7 +524,7 @@ struct FolderView: View {
                     Label("从相册导入", systemImage: "photo.on.rectangle")
                 }
                 Button { showFileImporter = true } label: {
-                    Label("从「文件」导入", systemImage: "doc.badge.plus")
+                    Label("从「文件」导入（可选文件夹）", systemImage: "doc.badge.plus")
                 }
                 Button {
                     sheet = .documents(
@@ -587,7 +594,7 @@ struct FolderView: View {
                     .environmentObject(viewer)
                     .environmentObject(PlaybackState.shared)
             }
-            .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
+            .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.folder, .item], allowsMultipleSelection: true) { result in
                 switch result {
                 case .success(let urls):
                     Task { await importPicked(urls) }
@@ -620,6 +627,11 @@ struct FolderView: View {
                 store.move(targets, into: destination)
                 sheet = nil
                 if selecting { endSelecting() }
+            }
+        case .mergeFolder(let source):
+            FolderMovePicker(items: [source], merging: true) { destination in
+                store.mergeFolder(source, into: destination)
+                sheet = nil
             }
         case .mergePicker(let video):
             FolderMergePicker(video: video, candidates: items.filter { $0.kind == .video && $0.url != video.url }) { picked in

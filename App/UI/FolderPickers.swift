@@ -3,9 +3,11 @@ import UIKit
 import UniformTypeIdentifiers
 
 /// 「移动到…」: every vault folder, indented by depth. Folders that cannot take the items (where they
-/// already are, or inside a folder that is being moved) are disabled.
+/// already are, or inside a folder that is being moved) are disabled. With `merging`, it is
+/// 「合并到…」 for one folder: its contents go into the chosen folder and it disappears.
 struct FolderMovePicker: View {
     let items: [FileItem]
+    var merging = false
     let onMove: (URL) -> Void
 
     @EnvironmentObject private var store: FileStore
@@ -22,7 +24,8 @@ struct FolderMovePicker: View {
     }
 
     private var title: String {
-        items.count == 1 ? "移动「\(items[0].name)」" : "移动 \(items.count) 项"
+        if merging, let item = items.first { return "合并「\(item.name)」到…" }
+        return items.count == 1 ? "移动「\(items[0].name)」" : "移动 \(items.count) 项"
     }
 
     var body: some View {
@@ -45,6 +48,17 @@ struct FolderMovePicker: View {
                 .disabled(!target.isAllowed)
             }
             .listStyle(.plain)
+            .safeAreaInset(edge: .top) {
+                if merging, let item = items.first {
+                    Text("「\(item.name)」里的所有内容会放进你选的文件夹：同名文件夹会合并，同名文件会自动改名，不会覆盖。之后「\(item.name)」会被删除。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.bar)
+                }
+            }
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -70,7 +84,7 @@ struct FolderMovePicker: View {
                 url: entry.url,
                 depth: entry.depth,
                 name: store.isRoot(entry.url) ? "FileBox" : entry.url.lastPathComponent,
-                isAllowed: !insideMoved && !alreadyThere
+                isAllowed: !insideMoved && (merging || !alreadyThere)
             )
         }
     }
@@ -163,7 +177,8 @@ struct FolderDocumentPicker: UIViewControllerRepresentable {
     }
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item])
+        // .folder makes whole folders selectable, not just the files inside them.
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder, .item])
         picker.allowsMultipleSelection = true
         picker.shouldShowFileExtensions = true
         picker.directoryURL = directory

@@ -100,6 +100,31 @@ enum Vault {
         return dest
     }
 
+    /// Moves or copies `source` into `folder`. A folder whose name is already taken there by another
+    /// folder is merged into it, recursively; a clashing file gets a numbered name, so nothing is
+    /// ever overwritten. `folder` must not be `source` or inside it.
+    static func merge(_ source: URL, into folder: URL, move: Bool) throws {
+        let fm = FileManager.default
+        var clean = sanitizedFileName(source.lastPathComponent)
+        if clean.isEmpty { clean = "文件" }
+        let target = folder.appendingPathComponent(clean, isDirectory: true)
+        let sourceIsFolder = (try? source.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        var targetIsFolder: ObjCBool = false
+        if sourceIsFolder, fm.fileExists(atPath: target.path, isDirectory: &targetIsFolder), targetIsFolder.boolValue {
+            for child in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: [.isDirectoryKey]) {
+                try merge(child, into: target, move: move)
+            }
+            if move { try fm.removeItem(at: source) }
+        } else {
+            let dest = fm.uniqueURL(for: clean, in: folder)
+            if move {
+                try fm.moveItem(at: source, to: dest)
+            } else {
+                try fm.copyItem(at: source, to: dest)
+            }
+        }
+    }
+
     /// Bytes used by everything in the vault.
     static func totalSize() -> Int64 {
         guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey])
