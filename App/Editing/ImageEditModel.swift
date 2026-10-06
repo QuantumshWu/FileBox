@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// The tools in the image editor's bottom bar.
 enum ImageEditTool: Hashable {
@@ -91,6 +92,7 @@ final class ImageEditModel: ObservableObject {
 
     @Published var state = ImageEditState() {
         didSet {
+            trackPreviewCrop(from: oldValue)
             if !state.rendersSame(as: oldValue) { scheduleRender() }
         }
     }
@@ -112,6 +114,11 @@ final class ImageEditModel: ObservableObject {
     private var autoFilters: [ImageEditAutoFilter]?
     private var needsRender = false
     private var isRendering = false
+    /// Orientation `preview` was rendered with and the crop in that orientation, so the cropped
+    /// preview stays right while a rotated or flipped one is still rendering.
+    private var previewTurns = 0
+    private var previewFlipped = false
+    private var previewCrop = ImageEditState.fullCrop
 
     init(item: FileItem) {
         self.item = item
@@ -145,9 +152,23 @@ final class ImageEditModel: ObservableObject {
 
     /// The preview cut down to the crop, for the tools that show the result.
     func croppedPreview(_ image: CGImage) -> CGImage {
-        guard state.isCropped else { return image }
-        let rect = ImageEditRenderer.pixelRect(state.crop, width: CGFloat(image.width), height: CGFloat(image.height))
+        guard previewCrop != ImageEditState.fullCrop else { return image }
+        let rect = ImageEditRenderer.pixelRect(previewCrop, width: CGFloat(image.width), height: CGFloat(image.height))
         return image.cropping(to: rect) ?? image
+    }
+
+    private func matchesPreview(_ other: ImageEditState) -> Bool {
+        other.quarterTurns == previewTurns && other.flipped == previewFlipped
+    }
+
+    /// Keeps `previewCrop` in the preview's orientation: the current crop while they match,
+    /// otherwise the last crop that was made in it.
+    private func trackPreviewCrop(from old: ImageEditState) {
+        if matchesPreview(state) {
+            previewCrop = state.crop
+        } else if matchesPreview(old) {
+            previewCrop = old.crop
+        }
     }
 
     // MARK: - Editing
@@ -251,7 +272,12 @@ final class ImageEditModel: ObservableObject {
             let image = await Task.detached(priority: .userInitiated) {
                 ImageEditRenderer.renderPreview(base, state: state, auto: filters)
             }.value
-            if let image { preview = image }
+            if let image {
+                previewTurns = state.quarterTurns
+                previewFlipped = state.flipped
+                previewCrop = matchesPreview(self.state) ? self.state.crop : state.crop
+                preview = image
+            }
         }
         isRendering = false
     }
@@ -271,29 +297,55 @@ final class ImageEditModel: ObservableObject {
     func save(into store: FileStore) async -> Bool {
         guard !isSaving, let base else { return false }
         isSaving = true
-        defer { isSaving = false }
+        // Leaving the app locks it and closes the editor, but the save carries on.
+        let background = ImageEditBackgroundWatch()
+        defer {
+            background.end()
+            isSaving = false
+        }
         let source = item.url
         let state = self.state
         let filters = state.autoEnhance ? (autoFilters ?? []) : []
         let previewWidth = CGFloat(base.width)
-        let output: ImageEditRenderer.Output
+        var output: ImageEditRenderer.Output
         do {
-            output = try await Task.detached(priority: .userInitiated) {
-                try ImageEditRenderer.export(source, state: state, auto: filters, previewWidth: previewWidth)
-            }.value
+            let software = background.enteredBackground
+            output = try await Self.export(source, state: state, auto: filters, previewWidth: previewWidth,
+                                           software: software)
+            if background.enteredBackground && !software {
+                // iOS refuses GPU work in the background, so that render may be broken: redo it on the CPU.
+                try? FileManager.default.removeItem(at: output.url)
+                output = try await Self.export(source, state: state, auto: filters, previewWidth: previewWidth,
+                                               software: true)
+            }
         } catch {
-            saveError = error.localizedDescription
+            let reason = (error as? ImageEditError)?.errorDescription ?? "生成图片时出错：\(error.localizedDescription)"
+            saveError = reason
+            if background.enteredBackground { store.show("图片没有保存。\(reason)") }
             return false
         }
         let name = Self.editedName(for: item.name, pathExtension: output.pathExtension)
         guard let dest = store.add(fileAt: output.url, named: name, into: source.deletingLastPathComponent(), moving: true)
         else {
+            // add() has already shown the reason in the banner.
             try? FileManager.default.removeItem(at: output.url)
             saveError = "无法把编辑后的图片存进文件夹。"
             return false
         }
-        store.show("已另存为「\(dest.lastPathComponent)」")
+        if let size = output.reducedSize {
+            store.show("已另存为「\(dest.lastPathComponent)」（原图太大，已缩小为 \(Int(size.width))×\(Int(size.height))）")
+        } else {
+            store.show("已另存为「\(dest.lastPathComponent)」")
+        }
         return true
+    }
+
+    /// One export off the main thread.
+    private static func export(_ source: URL, state: ImageEditState, auto: [ImageEditAutoFilter],
+                               previewWidth: CGFloat, software: Bool) async throws -> ImageEditRenderer.Output {
+        try await Task.detached(priority: .userInitiated) {
+            try ImageEditRenderer.export(source, state: state, auto: auto, previewWidth: previewWidth, software: software)
+        }.value
     }
 
     /// "<原名> 编辑.<ext>"; editing an edited copy again gets a number instead of a second suffix.
@@ -303,5 +355,45 @@ final class ImageEditModel: ObservableObject {
         if base.hasSuffix(suffix) { base.removeLast(suffix.count) }
         if base.isEmpty { base = "图片" }
         return "\(base)\(suffix).\(pathExtension)"
+    }
+}
+
+/// Keeps a save running for a while after the app leaves the foreground, and notes whether it did,
+/// because iOS refuses GPU work from apps in the background.
+@MainActor
+private final class ImageEditBackgroundWatch {
+    private(set) var enteredBackground: Bool
+    private var task: UIBackgroundTaskIdentifier = .invalid
+    private var observer: NSObjectProtocol?
+
+    init() {
+        enteredBackground = UIApplication.shared.applicationState == .background
+        task = UIApplication.shared.beginBackgroundTask(withName: "ImageEditSave") { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.endTask()
+            }
+        }
+        observer = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.enteredBackground = true
+            }
+        }
+    }
+
+    /// Call once the save is over.
+    func end() {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
+        endTask()
+    }
+
+    private func endTask() {
+        guard task != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(task)
+        task = .invalid
     }
 }

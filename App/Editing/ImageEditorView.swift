@@ -8,6 +8,7 @@ struct ImageEditorView: View {
 
     @EnvironmentObject private var store: FileStore
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @StateObject private var model: ImageEditModel
     @State private var confirmDiscard = false
     @State private var confirmReset = false
@@ -18,16 +19,25 @@ struct ImageEditorView: View {
     }
 
     var body: some View {
+        // In landscape the tools sit beside the image, which would otherwise be a thin strip.
+        let isLandscape = verticalSizeClass == .compact
+        let layout = isLandscape ? AnyLayout(HStackLayout(spacing: 0)) : AnyLayout(VStackLayout(spacing: 0))
         NavigationStack {
-            VStack(spacing: 0) {
+            layout {
                 ImageEditCanvas(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .clipped()
                 if model.preview != nil {
-                    toolPanel
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 142)
-                    tabBar
+                    VStack(spacing: 0) {
+                        toolPanel
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 142)
+                        tabBar
+                    }
+                    .frame(width: isLandscape ? CGFloat(340) : nil)
+                    .frame(maxHeight: isLandscape ? CGFloat.infinity : nil, alignment: .bottom)
+                    // The panels have fixed heights.
+                    .dynamicTypeSize(...DynamicTypeSize.xLarge)
                 }
             }
             .background(Color.black.ignoresSafeArea())

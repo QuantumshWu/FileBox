@@ -50,8 +50,17 @@ struct ImageEditAutoFilter: @unchecked Sendable {
 enum ImageEditRenderer {
     /// Reused for every render: contexts are expensive to create and safe to share between threads.
     static let context = CIContext(options: [.cacheIntermediates: false])
+    /// CPU renderer for exports that ran while the app was in the background, where iOS refuses GPU work.
+    private static let softwareContext = CIContext(options: [.useSoftwareRenderer: true, .cacheIntermediates: false])
     /// Longest side of the preview the editor works on.
     static let previewMaxPixels = 2048
+
+    /// Most pixels a full-size export may have. Core Image holds the decoded original and the
+    /// rendered copy at once (about 12 bytes per pixel), and an app only gets part of the phone's memory.
+    private static let exportPixelBudget: CGFloat = {
+        let memory = CGFloat(ProcessInfo.processInfo.physicalMemory)
+        return max(memory * 0.35 / 12, 50_000_000)
+    }()
 
     private static let previewSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
     private static let sRGB = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
@@ -66,6 +75,8 @@ enum ImageEditRenderer {
     struct Output: Sendable {
         let url: URL
         let pathExtension: String
+        /// Upright size the original was read at when it was too big to edit at full size.
+        let reducedSize: CGSize?
     }
 
     private enum Format {
@@ -76,30 +87,42 @@ enum ImageEditRenderer {
 
     /// Reads a downsampled copy with ImageIO, with the EXIF orientation applied.
     static func loadPreview(_ url: URL) -> Preview? {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let image = uprightImage(from: source, maxPixels: previewMaxPixels)
         else { return nil }
-        let index = CGImageSourceGetPrimaryImageIndex(source)
+        let fullSize = uprightSize(of: source) ?? CGSize(width: image.width, height: image.height)
+        return Preview(image: image, fullSize: fullSize)
+    }
+
+    /// The primary image with its EXIF orientation applied, at most `maxPixels` on the longest side.
+    /// ImageIO decodes JPEG and HEIC straight at the reduced size, so this stays cheap for big files.
+    private static func uprightImage(from source: CGImageSource, maxPixels: Int) -> CGImage? {
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: previewMaxPixels,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixels,
         ]
+        let index = CGImageSourceGetPrimaryImageIndex(source)
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, index, options as CFDictionary),
               image.width > 0, image.height > 0
         else { return nil }
-        var fullSize = CGSize(width: image.width, height: image.height)
-        if let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [String: Any],
-           let width = (properties[kCGImagePropertyPixelWidth as String] as? NSNumber)?.doubleValue,
-           let height = (properties[kCGImagePropertyPixelHeight as String] as? NSNumber)?.doubleValue,
-           width > 0, height > 0 {
-            // Orientations 5...8 turn the stored pixels by 90°.
-            let orientation = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.intValue ?? 1
-            fullSize = (5...8).contains(orientation)
-                ? CGSize(width: height, height: width)
-                : CGSize(width: width, height: height)
-        }
-        return Preview(image: image, fullSize: fullSize)
+        return image
+    }
+
+    /// Pixel size of the primary image once its EXIF orientation is applied.
+    private static func uprightSize(of source: CGImageSource) -> CGSize? {
+        let index = CGImageSourceGetPrimaryImageIndex(source)
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [String: Any],
+              let width = (properties[kCGImagePropertyPixelWidth as String] as? NSNumber)?.doubleValue,
+              let height = (properties[kCGImagePropertyPixelHeight as String] as? NSNumber)?.doubleValue,
+              width > 0, height > 0
+        else { return nil }
+        // Orientations 5...8 turn the stored pixels by 90°.
+        let orientation = (properties[kCGImagePropertyOrientation as String] as? NSNumber)?.intValue ?? 1
+        return (5...8).contains(orientation)
+            ? CGSize(width: height, height: width)
+            : CGSize(width: width, height: height)
     }
 
     /// Core Image's suggested auto-enhance filters for the preview (red-eye removal left out).
@@ -196,12 +219,11 @@ enum ImageEditRenderer {
 
     /// Renders the edit at full resolution straight into a temporary file, in the original's
     /// format when it is JPEG, HEIC or PNG and as JPEG otherwise (or if that encoder fails).
+    /// `software` renders on the CPU, for when the app may be in the background.
     static func export(_ source: URL, state: ImageEditState, auto: [ImageEditAutoFilter],
-                       previewWidth: CGFloat) throws -> Output {
+                       previewWidth: CGFloat, software: Bool) throws -> Output {
         try autoreleasepool { () throws -> Output in
-            guard let original = CIImage(contentsOf: source, options: [.applyOrientationProperty: true]),
-                  !original.extent.isInfinite, original.extent.width >= 1, original.extent.height >= 1
-            else { throw ImageEditError.unreadable }
+            let (original, reducedSize) = try readForExport(source)
             var edited = original.transformed(
                 by: CGAffineTransform(translationX: -original.extent.minX, y: -original.extent.minY)
             )
@@ -227,8 +249,9 @@ enum ImageEditRenderer {
                 }
                 image = image.settingProperties(properties)
                 do {
-                    try write(image, as: format, to: url, colorSpace: colorSpace)
-                    return Output(url: url, pathExtension: pathExtension)
+                    try write(image, as: format, to: url, colorSpace: colorSpace,
+                              context: software ? softwareContext : context)
+                    return Output(url: url, pathExtension: pathExtension, reducedSize: reducedSize)
                 } catch {
                     try? FileManager.default.removeItem(at: url)
                     lastError = error
@@ -238,7 +261,24 @@ enum ImageEditRenderer {
         }
     }
 
-    private static func write(_ image: CIImage, as format: Format, to url: URL, colorSpace: CGColorSpace) throws {
+    /// The upright original, at full size unless that would not fit in memory. Then it is read at
+    /// the largest size that does, and the second value is that size.
+    private static func readForExport(_ url: URL) throws -> (CIImage, CGSize?) {
+        if let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+           let size = uprightSize(of: source), size.width * size.height > exportPixelBudget {
+            let scale = (exportPixelBudget / (size.width * size.height)).squareRoot()
+            let longest = Int((max(size.width, size.height) * scale).rounded(.down))
+            guard let image = uprightImage(from: source, maxPixels: longest) else { throw ImageEditError.unreadable }
+            return (CIImage(cgImage: image), CGSize(width: image.width, height: image.height))
+        }
+        guard let original = CIImage(contentsOf: url, options: [.applyOrientationProperty: true]),
+              !original.extent.isInfinite, original.extent.width >= 1, original.extent.height >= 1
+        else { throw ImageEditError.unreadable }
+        return (original, nil)
+    }
+
+    private static func write(_ image: CIImage, as format: Format, to url: URL, colorSpace: CGColorSpace,
+                              context: CIContext) throws {
         let quality: [CIImageRepresentationOption: Any] = [
             CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.92,
         ]
