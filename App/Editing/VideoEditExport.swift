@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import SwiftUI
 import UIKit
 
@@ -48,10 +49,13 @@ enum VideoEditError: LocalizedError, Equatable {
 /// Shared export plumbing of the video editors: temporary files, a free-space check, progress,
 /// cancellation, and a background task so a short trip out of the app does not kill the export.
 enum VideoEditExport {
+    private static let temporaryPrefix = "VideoEdit-"
+
     /// A fresh temporary file for one export, in its own folder so nothing else is ever overwritten.
     static func makeTemporaryURL() throws -> URL {
+        removeAbandonedExports()
         let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("VideoEdit-" + UUID().uuidString, isDirectory: true)
+            .appendingPathComponent(temporaryPrefix + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         return folder.appendingPathComponent("video.mov")
     }
@@ -59,6 +63,26 @@ enum VideoEditExport {
     /// Deletes a temporary export file together with its folder.
     static func discard(_ url: URL) {
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+    }
+
+    /// Deletes half-written exports left behind when the app was killed mid-export, which can be
+    /// gigabytes. A running export keeps writing, so only folders untouched for an hour go.
+    private static func removeAbandonedExports() {
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.contentModificationDateKey]
+        guard let folders = try? fm.contentsOfDirectory(
+            at: fm.temporaryDirectory, includingPropertiesForKeys: keys
+        ) else { return }
+        let cutoff = Date().addingTimeInterval(-3600)
+        for folder in folders where folder.lastPathComponent.hasPrefix(temporaryPrefix) {
+            let contents = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys)) ?? []
+            let dates = ([folder] + contents).compactMap {
+                (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            }
+            if let latest = dates.max(), latest < cutoff {
+                try? fm.removeItem(at: folder)
+            }
+        }
     }
 
     /// Refuses to start when `bytes` (plus some headroom) clearly do not fit on the phone.
@@ -113,6 +137,12 @@ enum VideoEditExport {
             }
         } catch {
             if background.expired { throw VideoEditError.interrupted }
+            // iOS takes the video encoder away from apps in the background, which surfaces as
+            // assorted export errors; name the real cause instead.
+            if !(error is CancellationError), !Task.isCancelled,
+               UIApplication.shared.applicationState == .background, !isDiskFull(error as NSError) {
+                throw VideoEditError.interrupted
+            }
             throw error
         }
     }
@@ -123,6 +153,7 @@ enum VideoEditExport {
         to url: URL,
         progress: @escaping @MainActor (Double) -> Void
     ) async throws {
+        try Task.checkCancellation()
         progress(0)
         if #available(iOS 18.0, *) {
             let monitor = Task { @MainActor in
@@ -206,6 +237,25 @@ enum VideoEditExport {
     static func loadMessage(for error: Error) -> String {
         if let error = error as? VideoEditError, let text = error.errorDescription { return text }
         return "无法读取这个视频：\(error.localizedDescription)"
+    }
+
+    /// Shows the result of an export whose editor has already closed. That happens when the app
+    /// locked itself in the background, and banners are hidden while locked, so the banner waits
+    /// until the vault is unlocked again.
+    @MainActor
+    static func announce(_ message: String, store: FileStore, lock: LockManager) {
+        guard !lock.isUnlocked else {
+            store.show(message)
+            return
+        }
+        Task { @MainActor in
+            for await unlocked in lock.$isUnlocked.values where unlocked {
+                // Let the folder screen appear first.
+                try? await Task.sleep(nanoseconds: 800_000_000)
+                store.show(message)
+                break
+            }
+        }
     }
 
     /// File name without its extension, cut to at most `maxBytes` of UTF-8 so names built from it

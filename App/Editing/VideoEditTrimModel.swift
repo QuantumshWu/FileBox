@@ -34,8 +34,7 @@ final class VideoEditTrimModel: ObservableObject {
     private var asset: AVURLAsset?
     private var assetDuration = CMTime.zero
     private var timeObserver: Any?
-    private var endObserver: NSObjectProtocol?
-    private var interruptionObserver: NSObjectProtocol?
+    private var observers: [NSObjectProtocol] = []
     /// False once the editor has gone, e.g. because the app locked itself in the background while
     /// an export kept running; results are then reported with a banner instead of an alert.
     private var isOnScreen = false
@@ -71,6 +70,8 @@ final class VideoEditTrimModel: ObservableObject {
             guard !tracks.isEmpty else { throw VideoEditError.noVideoTrack }
             let seconds = time.seconds
             guard seconds.isFinite, seconds > 0 else { throw VideoEditError.unreadableDuration }
+            // Closed while loading: attaching now would leave the observers registered.
+            guard isOnScreen, !Task.isCancelled else { return }
             self.asset = asset
             assetDuration = time
             duration = seconds
@@ -119,7 +120,8 @@ final class VideoEditTrimModel: ObservableObject {
                 self?.tick(time.seconds)
             }
         }
-        endObserver = NotificationCenter.default.addObserver(
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(
             forName: AVPlayerItem.didPlayToEndTimeNotification,
             object: playerItem,
             queue: .main
@@ -127,9 +129,9 @@ final class VideoEditTrimModel: ObservableObject {
             MainActor.assumeIsolated {
                 self?.reachedEnd()
             }
-        }
+        })
         // A phone call or another app's audio pauses the player; keep the play button in step.
-        interruptionObserver = NotificationCenter.default.addObserver(
+        observers.append(center.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: nil,
             queue: .main
@@ -139,7 +141,19 @@ final class VideoEditTrimModel: ObservableObject {
             MainActor.assumeIsolated {
                 self?.pause()
             }
-        }
+        })
+        // So does unplugging headphones.
+        observers.append(center.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            guard let raw, AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable else { return }
+            MainActor.assumeIsolated {
+                self?.pause()
+            }
+        })
         if current > 0 { seek(to: current) }
     }
 
@@ -149,10 +163,8 @@ final class VideoEditTrimModel: ObservableObject {
         pause()
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         timeObserver = nil
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-        endObserver = nil
-        if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
-        interruptionObserver = nil
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers = []
         player.replaceCurrentItem(with: nil)
     }
 
@@ -254,7 +266,8 @@ final class VideoEditTrimModel: ObservableObject {
 
     /// Exports the selection and saves it as "<name> 剪辑.mov" next to the original.
     /// `precise` re-encodes for frame-exact cuts; otherwise samples are copied (cuts snap to keyframes).
-    func save(precise: Bool, to store: FileStore, onSaved: @escaping () -> Void) {
+    /// `onSaved` closes the editor; it is skipped when the editor has already gone.
+    func save(precise: Bool, store: FileStore, lock: LockManager, onSaved: @escaping () -> Void) {
         guard canSave, let asset else { return }
         pause()
         let range = selectedRange
@@ -295,8 +308,13 @@ final class VideoEditTrimModel: ObservableObject {
                 VideoEditExport.discard(url)
                 exportTask = nil
                 exportProgress = nil
-                store.show("已保存「\(saved.lastPathComponent)」")
-                onSaved()
+                let done = "已保存「\(saved.lastPathComponent)」"
+                if isOnScreen {
+                    store.show(done)
+                    onSaved()
+                } else {
+                    VideoEditExport.announce(done, store: store, lock: lock)
+                }
             } catch {
                 if let output { VideoEditExport.discard(output) }
                 exportTask = nil
@@ -311,7 +329,7 @@ final class VideoEditTrimModel: ObservableObject {
                 if isOnScreen {
                     errorMessage = message
                 } else {
-                    store.show("「\(source.name)」的剪辑没有保存：\(message)")
+                    VideoEditExport.announce("「\(source.name)」的剪辑没有保存：\(message)", store: store, lock: lock)
                 }
             }
         }

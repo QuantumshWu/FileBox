@@ -7,9 +7,14 @@ struct VideoTrimView: View {
     let item: FileItem
 
     @EnvironmentObject private var store: FileStore
+    @EnvironmentObject private var lock: LockManager
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @StateObject private var model: VideoEditTrimModel
     @State private var precise = false
+
+    /// Landscape on iPhone: tighter layout so the preview keeps some height.
+    private var isCompactHeight: Bool { verticalSizeClass == .compact }
 
     init(item: FileItem) {
         self.item = item
@@ -47,7 +52,7 @@ struct VideoTrimView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") {
-                        model.save(precise: precise, to: store) { dismiss() }
+                        model.save(precise: precise, store: store, lock: lock) { dismiss() }
                     }
                     .bold()
                     .disabled(!model.canSave)
@@ -72,7 +77,7 @@ struct VideoTrimView: View {
     }
 
     private var editor: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: isCompactHeight ? 8 : 14) {
             VideoEditPlayerView(player: model.player)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .contentShape(Rectangle())
@@ -122,16 +127,18 @@ struct VideoTrimView: View {
             .pickerStyle(.segmented)
             .disabled(model.isExporting)
 
-            Text(precise ? Self.preciseNote : Self.fastNote)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .fixedSize(horizontal: false, vertical: true)
+            if !isCompactHeight {
+                Text(precise ? Self.preciseNote : Self.fastNote)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
-        .padding()
+        .padding(isCompactHeight ? 8 : 16)
     }
 
-    private static let fastNote = "直接复制原视频的数据，速度快，画质和 HDR 完全不变。剪切点会对齐到附近的关键帧，实际的开头和结尾可能和所选位置差零点几秒。原视频会保留。"
+    private static let fastNote = "直接复制原视频的数据，速度快，画质和 HDR 完全不变。剪切点会对齐到附近的关键帧，实际的开头和结尾可能和所选位置略有出入（通常在一两秒内）。原视频会保留。"
     private static let preciseNote = "重新编码（HEVC），剪切点精确到帧，但速度较慢，画质会有轻微损失。原视频会保留。"
 
     private var errorBinding: Binding<Bool> {
@@ -230,7 +237,8 @@ private struct VideoEditTimeline: View {
                     .font(.title3.weight(.bold))
                     .foregroundStyle(.black)
             }
-            .contentShape(Rectangle())
+            // Wider than drawn, so the narrow handle is easy to grab.
+            .contentShape(Rectangle().inset(by: -10))
     }
 
     // Handles use global coordinates: they move while being dragged, which would distort local ones.

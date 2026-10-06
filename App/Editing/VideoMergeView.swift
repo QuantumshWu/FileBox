@@ -8,6 +8,7 @@ struct VideoMergeView: View {
     let second: FileItem
 
     @EnvironmentObject private var store: FileStore
+    @EnvironmentObject private var lock: LockManager
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model: VideoEditMergeModel
 
@@ -63,7 +64,7 @@ struct VideoMergeView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("合并") {
-                        model.merge(into: store) { dismiss() }
+                        model.merge(store: store, lock: lock) { dismiss() }
                     }
                     .bold()
                     .disabled(!model.canMerge)
@@ -195,7 +196,8 @@ final class VideoEditMergeModel: ObservableObject {
 
     /// Exports A followed by B and saves it as "<A> + <B>.mov" in `destination`. Lossless when the
     /// clips allow it; if that fails, it automatically tries again with re-encoding.
-    func merge(into store: FileStore, onSaved: @escaping () -> Void) {
+    /// `onSaved` closes the sheet; it is skipped when the sheet has already gone.
+    func merge(store: FileStore, lock: LockManager, onSaved: @escaping () -> Void) {
         guard canMerge, let sources = loadedClips else { return }
         let name = outputName
         let folder = destination
@@ -210,16 +212,16 @@ final class VideoEditMergeModel: ObservableObject {
                 if VideoEditMerger.canPassthrough(sources) {
                     status = "正在无损合并…"
                     do {
-                        try await export(sources, reencode: false, to: url)
+                        try await export(sources, reencode: false, keepsHDR: false, to: url)
                     } catch {
                         guard !Task.isCancelled, VideoEditExport.shouldRetryWithReencode(error) else { throw error }
                         try? FileManager.default.removeItem(at: url)
                         status = "无损合并没有成功，正在重新编码…"
-                        try await export(sources, reencode: true, to: url)
+                        try await exportReencoded(sources, to: url)
                     }
                 } else {
                     status = "正在重新编码合并…"
-                    try await export(sources, reencode: true, to: url)
+                    try await exportReencoded(sources, to: url)
                 }
                 try Task.checkCancellation()
                 guard let saved = store.add(fileAt: url, named: name, into: folder, moving: true) else {
@@ -228,8 +230,13 @@ final class VideoEditMergeModel: ObservableObject {
                 VideoEditExport.discard(url)
                 task = nil
                 progress = nil
-                store.show("已合并为「\(saved.lastPathComponent)」")
-                onSaved()
+                let done = "已合并为「\(saved.lastPathComponent)」"
+                if isOnScreen {
+                    store.show(done)
+                    onSaved()
+                } else {
+                    VideoEditExport.announce(done, store: store, lock: lock)
+                }
             } catch {
                 if let output { VideoEditExport.discard(output) }
                 task = nil
@@ -239,9 +246,23 @@ final class VideoEditMergeModel: ObservableObject {
                 if isOnScreen {
                     errorMessage = message
                 } else {
-                    store.show("视频合并没有完成：\(message)")
+                    VideoEditExport.announce("视频合并没有完成：\(message)", store: store, lock: lock)
                 }
             }
+        }
+    }
+
+    /// Re-encodes, keeping HDR when a clip has it. If the HDR export fails, tries once more in SDR,
+    /// which every device can encode.
+    private func exportReencoded(_ sources: [VideoEditClip], to url: URL) async throws {
+        let hasHDR = sources.contains { $0.hdrTransferFunction != nil }
+        do {
+            try await export(sources, reencode: true, keepsHDR: hasHDR, to: url)
+        } catch {
+            guard hasHDR, !Task.isCancelled, VideoEditExport.shouldRetryWithReencode(error) else { throw error }
+            try? FileManager.default.removeItem(at: url)
+            status = "HDR 导出没有成功，正在改用 SDR 重新编码…"
+            try await export(sources, reencode: true, keepsHDR: false, to: url)
         }
     }
 
@@ -254,7 +275,7 @@ final class VideoEditMergeModel: ObservableObject {
         isOnScreen = false
     }
 
-    private func export(_ sources: [VideoEditClip], reencode: Bool, to url: URL) async throws {
+    private func export(_ sources: [VideoEditClip], reencode: Bool, keepsHDR: Bool, to url: URL) async throws {
         let (composition, track) = try VideoEditMerger.composition(of: sources, passthrough: !reencode)
         let preset: String
         if reencode {
@@ -275,7 +296,7 @@ final class VideoEditMergeModel: ObservableObject {
                 for: sources,
                 in: composition,
                 track: track,
-                keepsHDR: preset == AVAssetExportPresetHEVCHighestQuality
+                keepsHDR: keepsHDR && preset == AVAssetExportPresetHEVCHighestQuality
             )
         }
         progress = 0
