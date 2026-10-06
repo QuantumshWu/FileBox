@@ -18,11 +18,12 @@ struct CaptureSaveScreenshotIntent: AppIntent {
         Summary("保存\(\.$screenshot)到 FileBox")
     }
 
-    func perform() async throws -> some IntentResult & ProvidesDialog {
+    /// Silent on success: a confirmation would show up in the next screenshot.
+    func perform() async throws -> some IntentResult {
         let ext = CaptureIntentFiles.fileExtension(of: screenshot, fallback: "png")
         let name = "截图 \(CaptureIntentFiles.timestamp()).\(ext)"
         try CaptureIntentFiles.save(screenshot, named: name, in: Vault.folder(Vault.screenshotsName))
-        return .result(dialog: "已保存")
+        return .result()
     }
 }
 
