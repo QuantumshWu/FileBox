@@ -1,6 +1,6 @@
 import Foundation
 
-/// Settings shared by the app and the share extension.
+/// Settings shared by the app and its extensions.
 enum SharedConfig {
     /// App Group declared in the entitlements. Free-account sideloading tools re-sign the app and
     /// usually rename the group (for example by appending the team ID), so the real ID is looked up
@@ -24,43 +24,54 @@ enum SharedConfig {
         return ids.filter { !$0.contains("*") && seen.insert($0).inserted }
     }
 
-    /// Drop-box folder the share extension writes into and the app empties on launch.
-    static var sharedInboxURL: URL? {
+    /// Container shared by the app and its extensions.
+    static var groupContainerURL: URL? {
         let fm = FileManager.default
         for id in appGroupCandidates {
-            guard let container = fm.containerURL(forSecurityApplicationGroupIdentifier: id) else { continue }
-            let inbox = container.appendingPathComponent("Inbox", isDirectory: true)
-            do {
-                try fm.createDirectory(at: inbox, withIntermediateDirectories: true)
-                return inbox
-            } catch {
-                continue
-            }
+            if let container = fm.containerURL(forSecurityApplicationGroupIdentifier: id) { return container }
         }
         return nil
     }
 
-    /// Human-readable summary for the About screen, to debug sideloading issues on the phone.
-    static var diagnostics: String {
-        let resolved = sharedInboxURL != nil ? "可用" : "不可用"
-        return "共享文件夹：\(resolved)\n候选 App Group：\n" + appGroupCandidates.joined(separator: "\n")
+    /// A drop-box folder in the shared container, created if needed.
+    static func sharedFolder(_ name: String) -> URL? {
+        guard let container = groupContainerURL else { return nil }
+        let folder = container.appendingPathComponent(name, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            return folder
+        } catch {
+            return nil
+        }
     }
 
-    /// Inside the share extension (FileBox.app/PlugIns/X.appex) this is the containing app bundle.
-    private static var hostAppBundleURL: URL? {
-        let url = Bundle.main.bundleURL
-        guard url.pathExtension == "appex" else { return nil }
-        return url.deletingLastPathComponent().deletingLastPathComponent()
-    }
+    /// Where the share extension drops shared files; the app empties it on launch.
+    static var sharedInboxURL: URL? { sharedFolder("Inbox") }
 
-    /// The installed main app's bundle ID; the extension's ID is that plus ".share".
-    private static var runtimeAppBundleID: String? {
+    /// Where the screen-recording extension writes finished recordings; the app empties it on launch.
+    static var sharedRecordingsURL: URL? { sharedFolder("Recordings") }
+
+    /// The installed main app's bundle ID as re-signed (extensions drop their last component).
+    static var runtimeAppBundleID: String? {
         guard let id = Bundle.main.bundleIdentifier else { return nil }
         guard hostAppBundleURL != nil else { return id }
         var parts = id.split(separator: ".")
         guard parts.count > 1 else { return nil }
         parts.removeLast()
         return parts.joined(separator: ".")
+    }
+
+    /// Human-readable summary for the settings screen, to debug sideloading issues on the phone.
+    static var diagnostics: String {
+        let resolved = sharedInboxURL != nil ? "可用" : "不可用"
+        return "共享文件夹：\(resolved)\n候选 App Group：\n" + appGroupCandidates.joined(separator: "\n")
+    }
+
+    /// Inside an extension (FileBox.app/PlugIns/X.appex) this is the containing app bundle.
+    private static var hostAppBundleURL: URL? {
+        let url = Bundle.main.bundleURL
+        guard url.pathExtension == "appex" else { return nil }
+        return url.deletingLastPathComponent().deletingLastPathComponent()
     }
 
     /// AltStore and SideStore record the renamed groups under this Info.plist key.

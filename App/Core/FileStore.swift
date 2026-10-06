@@ -1,16 +1,6 @@
 import Foundation
 import SwiftUI
 
-struct FileItem: Identifiable, Hashable {
-    let url: URL
-    let name: String
-    let isDirectory: Bool
-    let size: Int64
-    let modified: Date
-
-    var id: URL { url }
-}
-
 enum SortOrder: String, CaseIterable, Identifiable {
     case date, name, size
 
@@ -25,25 +15,29 @@ enum SortOrder: String, CaseIterable, Identifiable {
     }
 }
 
-/// All file operations. Files live in the app's Documents folder, which the Files app also shows
-/// under "On My iPhone › FileBox".
+/// All file operations on the vault (see `Vault`). Views observe `revision` to reload.
 @MainActor
 final class FileStore: ObservableObject {
     /// Bumped after every change so open folders reload.
     @Published private(set) var revision = 0
+    /// Short message shown at the bottom of the screen (only while unlocked).
     @Published var banner: String?
 
+    /// Root of the private library.
     let rootURL: URL
     /// Where everything shared from other apps lands.
     let receivedURL: URL
 
     private let fm = FileManager.default
-    /// Folder the system itself drops "Copy to FileBox" files into; the app may only read and delete there.
-    private var systemInboxURL: URL { rootURL.appendingPathComponent("Inbox", isDirectory: true) }
+    /// Folder the system drops "Copy to FileBox" files into; the app may only read and delete there.
+    private let systemInboxURL: URL
 
     init() {
-        rootURL = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        receivedURL = rootURL.appendingPathComponent("收件箱", isDirectory: true)
+        Vault.prepare()
+        rootURL = Vault.root
+        receivedURL = Vault.folder(Vault.receivedName)
+        systemInboxURL = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Inbox", isDirectory: true)
         collectIncoming()
     }
 
@@ -51,22 +45,16 @@ final class FileStore: ObservableObject {
         normalizedPath(folder) == normalizedPath(rootURL)
     }
 
+    /// A top-level vault folder such as `Vault.downloadsName`, created if needed.
+    func folder(named name: String) -> URL {
+        Vault.folder(name)
+    }
+
     func items(in folder: URL, sort: SortOrder) -> [FileItem] {
         let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
         guard let urls = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
         else { return [] }
-        let hideSystemInbox = isRoot(folder)
-        var result = urls.compactMap { url -> FileItem? in
-            if hideSystemInbox && url.lastPathComponent == "Inbox" { return nil }
-            let values = try? url.resourceValues(forKeys: Set(keys))
-            return FileItem(
-                url: url,
-                name: url.lastPathComponent,
-                isDirectory: values?.isDirectory ?? false,
-                size: Int64(values?.fileSize ?? 0),
-                modified: values?.contentModificationDate ?? .distantPast
-            )
-        }
+        var result = urls.map { FileItem(url: $0) }
         result.sort { a, b in
             if a.isDirectory != b.isDirectory { return a.isDirectory }
             switch sort {
@@ -78,7 +66,20 @@ final class FileStore: ObservableObject {
         return result
     }
 
-    /// Reloads open folders, e.g. after files were changed from the Files app.
+    /// Every folder in the vault (root first, depth-first), e.g. for a "move to" picker.
+    func allFolders() -> [(url: URL, depth: Int)] {
+        var result: [(url: URL, depth: Int)] = [(rootURL, 0)]
+        func walk(_ folder: URL, depth: Int) {
+            for item in items(in: folder, sort: .name) where item.isDirectory {
+                result.append((item.url, depth))
+                walk(item.url, depth: depth + 1)
+            }
+        }
+        walk(rootURL, depth: 1)
+        return result
+    }
+
+    /// Reloads open folders, e.g. after returning to the app.
     func refresh() {
         changed()
     }
@@ -86,7 +87,7 @@ final class FileStore: ObservableObject {
     // MARK: - Editing
 
     func createFolder(named name: String, in folder: URL) {
-        let clean = allowedName(sanitizedFileName(name), in: folder)
+        let clean = sanitizedFileName(name)
         let url = fm.uniqueURL(for: clean.isEmpty ? "新建文件夹" : clean, in: folder)
         do {
             try fm.createDirectory(at: url, withIntermediateDirectories: false)
@@ -97,10 +98,9 @@ final class FileStore: ObservableObject {
     }
 
     func rename(_ item: FileItem, to newName: String) {
-        let folder = item.url.deletingLastPathComponent()
-        let clean = allowedName(sanitizedFileName(newName), in: folder)
+        let clean = sanitizedFileName(newName)
         guard !clean.isEmpty, clean != item.name else { return }
-        let dest = fm.uniqueURL(for: clean, in: folder)
+        let dest = fm.uniqueURL(for: clean, in: item.url.deletingLastPathComponent())
         do {
             try fm.moveItem(at: item.url, to: dest)
             changed()
@@ -116,9 +116,44 @@ final class FileStore: ObservableObject {
         changed()
     }
 
+    /// Moves items into `folder`, skipping a folder moved into itself or its own subfolder.
+    func move(_ items: [FileItem], into folder: URL) {
+        let target = normalizedPath(folder)
+        var count = 0
+        for item in items {
+            let source = normalizedPath(item.url)
+            if target == source || target.hasPrefix(source + "/") { continue }
+            if normalizedPath(item.url.deletingLastPathComponent()) == target { continue }
+            do {
+                try fm.moveItem(at: item.url, to: fm.uniqueURL(for: item.name, in: folder))
+                count += 1
+            } catch {
+                report(error)
+            }
+        }
+        if count > 0 {
+            changed()
+            show("已移动 \(count) 项到「\(folder.lastPathComponent)」")
+        }
+    }
+
+    /// Adds a file produced inside the app (edited copy, download, recording...) to `folder`.
+    /// Returns the final URL, or nil after showing the error.
+    @discardableResult
+    func add(fileAt source: URL, named name: String? = nil, into folder: URL, moving: Bool) -> URL? {
+        do {
+            let dest = try Vault.place(source, named: name, in: folder, move: moving)
+            changed()
+            return dest
+        } catch {
+            report(error)
+            return nil
+        }
+    }
+
     // MARK: - Importing
 
-    /// Files picked in the app (Photos or the Files picker).
+    /// Files picked in the app (Photos or a document picker). Security-scoped URLs are handled here.
     func importFiles(_ urls: [URL], into folder: URL, moving: Bool = false) async {
         var count = 0
         for url in urls {
@@ -145,19 +180,19 @@ final class FileStore: ObservableObject {
     /// A file handed over with "Open in / Copy to FileBox".
     func importIncoming(_ url: URL) async {
         guard url.isFileURL else { return }
-        // Files copied from another app's sandbox arrive in Documents/Inbox, which collectIncoming()
-        // empties; it may already have done so while the app was launching.
+        // Files from another app arrive in Documents/Inbox, which collectIncoming() empties; it may
+        // already have done so while the app was launching.
         if normalizedPath(url.deletingLastPathComponent()) == normalizedPath(systemInboxURL) {
             collectIncoming()
             return
         }
-        // Opening one of our own files from the Files app: nothing to import.
+        // One of our own files: nothing to import.
         if normalizedPath(url).hasPrefix(normalizedPath(rootURL) + "/") { return }
 
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        ensureReceivedFolder()
-        let dest = fm.uniqueURL(for: safeName(url.lastPathComponent), in: receivedURL)
+        let received = Vault.folder(Vault.receivedName)
+        let dest = fm.uniqueURL(for: safeName(url.lastPathComponent), in: received)
         do {
             try await coordinatedCopy(url, to: dest)
             changed()
@@ -167,29 +202,37 @@ final class FileStore: ObservableObject {
         }
     }
 
-    /// Moves files dropped off by the share extension (and the system Inbox) into 收件箱.
+    /// Moves files dropped off by the extensions (and the system Inbox) into the vault.
     func collectIncoming() {
-        ensureReceivedFolder()
         var count = 0
-        if let shared = SharedConfig.sharedInboxURL { count += drain(shared) }
-        count += drain(systemInboxURL)
-        if count > 0 {
+        let received = Vault.folder(Vault.receivedName)
+        if let shared = SharedConfig.sharedInboxURL { count += drain(shared, into: received) }
+        count += drain(systemInboxURL, into: received)
+        var recordings = 0
+        if let shared = SharedConfig.sharedRecordingsURL {
+            recordings = drain(shared, into: Vault.folder(Vault.recordingsName))
+        }
+        if count > 0 || recordings > 0 {
             changed()
-            show("收到 \(count) 个文件，已放进「收件箱」")
+            if recordings > 0 && count == 0 {
+                show("新增 \(recordings) 个录屏，在「录屏」里")
+            } else {
+                show("收到 \(count + recordings) 个文件")
+            }
         }
     }
 
-    private func drain(_ folder: URL) -> Int {
+    private func drain(_ folder: URL, into destination: URL) -> Int {
         guard let urls = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else { return 0 }
         var count = 0
         for url in urls {
-            // Files the share extension is still writing; delete leftovers from a killed extension.
+            // Files an extension is still writing; delete leftovers from a killed extension.
             if url.lastPathComponent.hasPrefix(".partial-") {
                 let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
                 if let modified, modified < Date().addingTimeInterval(-3600) { try? fm.removeItem(at: url) }
                 continue
             }
-            let dest = fm.uniqueURL(for: safeName(url.lastPathComponent), in: receivedURL)
+            let dest = fm.uniqueURL(for: safeName(url.lastPathComponent), in: destination)
             do {
                 try fm.moveItem(at: url, to: dest)
                 count += 1
@@ -222,23 +265,13 @@ final class FileStore: ObservableObject {
         }.value
     }
 
-    /// 收件箱 can be deleted by the user (here or in the Files app); bring it back when needed.
-    private func ensureReceivedFolder() {
-        try? fm.createDirectory(at: receivedURL, withIntermediateDirectories: true)
-    }
-
-    /// "Inbox" at the root belongs to the system.
-    private func allowedName(_ name: String, in folder: URL) -> String {
-        isRoot(folder) && name == "Inbox" ? "Inbox 2" : name
-    }
-
     private func safeName(_ name: String) -> String {
         let clean = sanitizedFileName(name)
         return clean.isEmpty ? "文件" : clean
     }
 
     /// Path without the /private prefix, which iOS adds to some URLs but not others.
-    private func normalizedPath(_ url: URL) -> String {
+    func normalizedPath(_ url: URL) -> String {
         var path = url.standardizedFileURL.resolvingSymlinksInPath().path
         if path.hasPrefix("/private/") { path.removeFirst("/private".count) }
         while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
@@ -259,7 +292,7 @@ final class FileStore: ObservableObject {
         }
     }
 
-    private func report(_ error: Error) {
+    func report(_ error: Error) {
         show("出错了：\(error.localizedDescription)")
     }
 }

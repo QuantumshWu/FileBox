@@ -7,11 +7,13 @@ struct FolderView: View {
     let folder: URL
 
     @EnvironmentObject private var store: FileStore
+    @EnvironmentObject private var lock: LockManager
+    @EnvironmentObject private var viewer: ViewerCoordinator
     @AppStorage("sortOrder") private var sort: SortOrder = .date
 
     @State private var items: [FileItem] = []
     @State private var query = ""
-    @State private var previewURL: URL?
+    @State private var quickLookURL: URL?
 
     @State private var showNewFolder = false
     @State private var newFolderName = ""
@@ -22,17 +24,15 @@ struct FolderView: View {
     @State private var showPhotoPicker = false
     @State private var photoItems: [PhotosPickerItem] = []
     @State private var importingPhotos = false
-    @State private var showAbout = false
 
-    private var title: String { store.isRoot(folder) ? "FileBox" : folder.lastPathComponent }
+    @State private var editingImage: FileItem?
+    @State private var trimmingVideo: FileItem?
+
+    private var isRoot: Bool { store.isRoot(folder) }
+    private var title: String { isRoot ? "FileBox" : folder.lastPathComponent }
 
     private var visibleItems: [FileItem] {
         query.isEmpty ? items : items.filter { $0.name.localizedCaseInsensitiveContains(query) }
-    }
-
-    /// Swiping in the preview moves through the files of this folder.
-    private var previewableURLs: [URL] {
-        visibleItems.filter { !$0.isDirectory }.map(\.url)
     }
 
     var body: some View {
@@ -72,7 +72,7 @@ struct FolderView: View {
             store.collectIncoming()
             reload()
         }
-        .quickLookPreview($previewURL, in: previewableURLs)
+        .quickLookPreview($quickLookURL, in: visibleItems.filter { !$0.isDirectory && !$0.isMedia }.map(\.url))
         .onAppear(perform: reload)
         .onChange(of: store.revision) { reload() }
         .onChange(of: sort) { reload() }
@@ -102,16 +102,30 @@ struct FolderView: View {
         .onChange(of: photoItems) {
             Task { await importPhotos() }
         }
-        .sheet(isPresented: $showAbout) { AboutView() }
+        .fullScreenCover(item: $editingImage) { item in
+            ImageEditorView(item: item)
+        }
+        .fullScreenCover(item: $trimmingVideo) { item in
+            VideoTrimView(item: item)
+        }
     }
 
     @ViewBuilder
     private func row(_ item: FileItem) -> some View {
         if item.isDirectory {
-            NavigationLink(value: item.url) { FileRow(item: item) }
+            NavigationLink(value: Route.folder(item.url)) { FileRow(item: item) }
         } else {
-            Button { previewURL = item.url } label: { FileRow(item: item) }
+            Button { open(item) } label: { FileRow(item: item) }
                 .buttonStyle(.plain)
+        }
+    }
+
+    private func open(_ item: FileItem) {
+        if item.isMedia {
+            let media = visibleItems.filter(\.isMedia)
+            viewer.open(media, at: media.firstIndex(of: item) ?? 0)
+        } else {
+            quickLookURL = item.url
         }
     }
 
@@ -120,12 +134,24 @@ struct FolderView: View {
         if !item.isDirectory {
             ShareLink(item: item.url) { Label("分享", systemImage: "square.and.arrow.up") }
         }
+        if item.kind == .image {
+            Button { editingImage = item } label: { Label("编辑图片", systemImage: "crop.rotate") }
+        }
+        if item.kind == .video {
+            Button { trimmingVideo = item } label: { Label("剪辑视频", systemImage: "scissors") }
+        }
         Button { startRename(item) } label: { Label("重命名", systemImage: "pencil") }
         Button(role: .destructive) { store.delete([item]) } label: { Label("删除", systemImage: "trash") }
     }
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+        if isRoot {
+            ToolbarItemGroup(placement: .topBarLeading) {
+                Button { lock.lock() } label: { Image(systemName: "lock") }
+                NavigationLink(value: Route.browser) { Image(systemName: "globe") }
+            }
+        }
         ToolbarItem(placement: .topBarTrailing) {
             Menu {
                 Button {
@@ -151,9 +177,11 @@ struct FolderView: View {
                         Text(order.title).tag(order)
                     }
                 }
-                if store.isRoot(folder) {
+                if isRoot {
                     Divider()
-                    Button { showAbout = true } label: { Label("关于", systemImage: "info.circle") }
+                    NavigationLink(value: Route.capture) { Label("截图与录屏", systemImage: "record.circle") }
+                    NavigationLink(value: Route.transfer) { Label("Wi-Fi 传输", systemImage: "wifi") }
+                    NavigationLink(value: Route.settings) { Label("设置", systemImage: "gearshape") }
                 }
             } label: {
                 Image(systemName: "ellipsis.circle")
@@ -235,95 +263,5 @@ struct FileRow: View {
         let date = item.modified.formatted(date: .abbreviated, time: .shortened)
         if item.isDirectory { return date }
         return "\(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)) · \(date)"
-    }
-}
-
-struct ThumbnailView: View {
-    let item: FileItem
-
-    @Environment(\.displayScale) private var displayScale
-    @State private var image: UIImage?
-
-    var body: some View {
-        Group {
-            if item.isDirectory {
-                Image(systemName: "folder.fill")
-                    .resizable()
-                    .scaledToFit()
-                    .foregroundStyle(.blue)
-                    .padding(4)
-            } else if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                Image(systemName: "doc")
-                    .resizable()
-                    .scaledToFit()
-                    .foregroundStyle(.secondary)
-                    .padding(8)
-            }
-        }
-        .frame(width: 44, height: 44)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .task(id: item) {
-            guard !item.isDirectory else { return }
-            image = await Thumbnails.image(for: item, scale: displayScale)
-        }
-    }
-}
-
-enum Thumbnails {
-    private static let cache = NSCache<NSString, UIImage>()
-
-    static func image(for item: FileItem, scale: CGFloat) async -> UIImage? {
-        let key = "\(item.url.path)|\(item.modified.timeIntervalSince1970)" as NSString
-        if let hit = cache.object(forKey: key) { return hit }
-        let request = QLThumbnailGenerator.Request(
-            fileAt: item.url,
-            size: CGSize(width: 44, height: 44),
-            scale: scale,
-            representationTypes: .all
-        )
-        guard let representation = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request)
-        else { return nil }
-        cache.setObject(representation.uiImage, forKey: key)
-        return representation.uiImage
-    }
-}
-
-struct AboutView: View {
-    @Environment(\.dismiss) private var dismiss
-
-    private var version: String {
-        let info = Bundle.main.infoDictionary
-        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
-        let build = info?["CFBundleVersion"] as? String ?? "?"
-        return "\(short) (\(build))"
-    }
-
-    var body: some View {
-        NavigationStack {
-            List {
-                Section("版本") {
-                    Text(version)
-                    Text(Bundle.main.bundleIdentifier ?? "")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Section("诊断") {
-                    Text(SharedConfig.diagnostics)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                }
-            }
-            .navigationTitle("关于 FileBox")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { dismiss() }
-                }
-            }
-        }
     }
 }

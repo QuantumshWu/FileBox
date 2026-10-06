@@ -1,18 +1,19 @@
-# Builds FileBox.ipa on GitHub's free macOS runner (public repo), then publishes it with a
-# SideStore source.json as a GitHub Release. The IPA is unsigned; SideStore signs it on the phone.
+# Builds FileBox.ipa on GitHub's free macOS runner (public repo). Every branch is built so work in
+# progress gets compile-checked; only main publishes a GitHub Release with the SideStore source.json.
+# The IPA is unsigned; SideStore signs it on the phone.
 name: Build
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: build
-  cancel-in-progress: false
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -52,6 +53,11 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             2>&1 | tee build.log | xcbeautify --renderer github-actions
 
+      - name: Show compile errors
+        if: failure()
+        run: |
+          grep -E "error:|fatal error" build.log | sort -u | head -80 || true
+
       - name: Upload build log
         if: failure()
         uses: actions/upload-artifact@v7
@@ -63,13 +69,16 @@ jobs:
         run: |
           set -euo pipefail
           APP="$RUNNER_TEMP/FileBox.xcarchive/Products/Applications/FileBox.app"
-          EXT="$APP/PlugIns/FileBoxShare.appex"
-          test -d "$EXT"
+          test -d "$APP/PlugIns/FileBoxShare.appex"
+          test -d "$APP/PlugIns/FileBoxRecord.appex"
           # SideStore reads the App Group to register from the binaries' signatures, and an
-          # unsigned build has none, so fake-sign with the entitlements (extension first).
-          ldid -SSupport/Share.entitlements "$EXT/FileBoxShare"
-          ldid -SSupport/App.entitlements "$APP/FileBox"
-          ldid -e "$EXT/FileBoxShare"
+          # unsigned build has none, so fake-sign with the entitlements (extensions first).
+          for EXT in "$APP"/PlugIns/*.appex; do
+            NAME=$(basename "$EXT" .appex)
+            ldid -S"Support/$NAME.entitlements" "$EXT/$NAME"
+            ldid -e "$EXT/$NAME"
+          done
+          ldid -SSupport/FileBox.entitlements "$APP/FileBox"
           ldid -e "$APP/FileBox"
           xcrun vtool -show-build "$APP/FileBox" | grep -i platform
           mkdir -p "$RUNNER_TEMP/pkg/Payload"
@@ -87,6 +96,7 @@ jobs:
           path: FileBox.ipa
 
       - name: Publish release
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: build-${{ github.run_number }}
