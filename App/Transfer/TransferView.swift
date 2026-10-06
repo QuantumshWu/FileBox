@@ -2,8 +2,9 @@ import CoreImage.CIFilterBuiltins
 import SwiftUI
 import UIKit
 
-/// Serves the vault over HTTP on the local Wi-Fi so a computer's browser can download and upload.
-/// The server runs only while this screen is visible and the app is in the foreground.
+/// Serves the vault over HTTP on the local Wi-Fi so a computer's browser can download and upload,
+/// after the user allows that computer here. The server runs only while this screen is visible and
+/// the app is in the foreground.
 struct TransferView: View {
     @EnvironmentObject private var store: FileStore
     @Environment(\.scenePhase) private var scenePhase
@@ -21,10 +22,30 @@ struct TransferView: View {
                 activeSection
             }
             howToSection
+            if !controller.rememberedDevices.isEmpty {
+                devicesSection
+            }
             logSection
         }
         .navigationTitle("Wi-Fi 传输")
         .navigationBarTitleDisplayMode(.inline)
+        .alert(
+            "有电脑请求访问",
+            isPresented: Binding(get: { controller.accessPrompt != nil }, set: { _ in }),
+            presenting: controller.accessPrompt
+        ) { request in
+            Button("允许") {
+                controller.answer(request, allow: true, remember: false)
+            }
+            Button("允许并记住这台电脑") {
+                controller.answer(request, allow: true, remember: true)
+            }
+            Button("拒绝", role: .cancel) {
+                controller.answer(request, allow: false, remember: false)
+            }
+        } message: { request in
+            Text("「\(request.label)」想访问 FileBox 的文件。允许后，它可以查看、下载和上传文件。")
+        }
         .onAppear {
             controller.appear(store: store, sceneActive: scenePhase == .active)
         }
@@ -134,12 +155,42 @@ struct TransferView: View {
         Section {
             TransferStepRow(number: 1, text: "电脑和手机连同一个 Wi-Fi")
             TransferStepRow(number: 2, text: "用电脑浏览器打开上面的地址")
-            TransferStepRow(number: 3, text: "在网页里下载文件，或者把文件拖进网页上传到 FileBox")
-            TransferStepRow(number: 4, text: "传输时请保持 FileBox 在前台、屏幕常亮")
+            TransferStepRow(number: 3, text: "在 iPhone 上点「允许」；选「允许并记住这台电脑」，以后就不用再点")
+            TransferStepRow(number: 4, text: "在网页里下载文件，或者把文件拖进网页上传到 FileBox")
+            TransferStepRow(number: 5, text: "传输时请保持 FileBox 在前台、屏幕常亮")
         } header: {
             Text("使用方法")
         } footer: {
-            Text("地址里的随机码每次开启都会更换，只有看到这个地址的人才能访问。离开这个页面或切到后台，传输会自动停止。如果电脑打不开网页：确认两台设备连的是同一个 Wi-Fi（访客网络通常互相隔离），并在「设置 → 隐私与安全性 → 本地网络」里允许 FileBox。")
+            Text("每台电脑第一次打开网页时，iPhone 上都会询问，允许后才能看到和传输文件。离开这个页面或切到后台，传输会自动停止。如果电脑打不开网页：确认两台设备连的是同一个 Wi-Fi（访客网络通常互相隔离），并在「设置 → 隐私与安全性 → 本地网络」里允许 FileBox。")
+        }
+    }
+
+    private var devicesSection: some View {
+        Section {
+            ForEach(controller.rememberedDevices) { device in
+                HStack(spacing: 12) {
+                    Image(systemName: "desktopcomputer")
+                        .font(.title3)
+                        .foregroundStyle(Color.accentColor)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(device.client.isEmpty ? "电脑" : device.client)
+                            .lineLimit(1)
+                        Text("\(device.ip) · 记住于 \(device.added.formatted(date: .abbreviated, time: .omitted))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    Button("移除", role: .destructive) {
+                        controller.forget(device)
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+        } header: {
+            Text("已记住的电脑")
+        } footer: {
+            Text("这些电脑打开网页时不用再在 iPhone 上确认。移除后，它们需要重新获得允许。")
         }
     }
 

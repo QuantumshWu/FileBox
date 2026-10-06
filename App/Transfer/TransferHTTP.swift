@@ -13,6 +13,18 @@ struct TransferRequest {
     /// Header values by lowercased name.
     let headers: [String: String]
 
+    /// Cookie values by name.
+    var cookies: [String: String] {
+        var cookies: [String: String] = [:]
+        for pair in (headers["cookie"] ?? "").split(separator: ";") {
+            let field = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard field.count == 2 else { continue }
+            let name = field[0].trimmingCharacters(in: .whitespaces)
+            if cookies[name] == nil { cookies[name] = field[1].trimmingCharacters(in: .whitespaces) }
+        }
+        return cookies
+    }
+
     /// Returns nil for anything that is not a well-formed origin-form HTTP/1.x request.
     init?(head: Data) {
         guard let text = String(data: head, encoding: .utf8) ?? String(data: head, encoding: .isoLatin1) else { return nil }
@@ -103,8 +115,9 @@ enum TransferHTTP {
         case 200: return "OK"
         case 201: return "Created"
         case 206: return "Partial Content"
-        case 301: return "Moved Permanently"
+        case 302: return "Found"
         case 400: return "Bad Request"
+        case 403: return "Forbidden"
         case 404: return "Not Found"
         case 405: return "Method Not Allowed"
         case 409: return "Conflict"
@@ -137,6 +150,44 @@ enum TransferHTTP {
         if bounds[1].isEmpty { return .partial(first, size - 1) }
         guard let last = Int64(bounds[1]), last >= first else { return .whole }
         return .partial(first, min(last, size - 1))
+    }
+
+    /// A Set-Cookie value: a session cookie without `maxAge`, else one kept for `maxAge` seconds.
+    static func cookie(_ name: String, _ value: String, maxAge: Int? = nil) -> String {
+        var text = "\(name)=\(value); Path=/; HttpOnly; SameSite=Lax"
+        if let maxAge { text += "; Max-Age=\(maxAge)" }
+        return text
+    }
+
+    /// The Host header names the phone by its address (or a ".local" name), not by some web site's
+    /// domain. A request without one passes.
+    static func isDirectHost(_ header: String?) -> Bool {
+        guard var host = header?.lowercased(), !host.isEmpty else { return true }
+        if host.hasPrefix("[") { return true }
+        if let colon = host.lastIndex(of: ":") { host = String(host[..<colon]) }
+        if host == "localhost" || host.hasSuffix(".local") { return true }
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count == 4 && parts.allSatisfy { part in
+            !part.isEmpty && part.count <= 3 && part.allSatisfy { $0.isASCII && $0.isNumber }
+        }
+    }
+
+    /// "Windows · Chrome" from a User-Agent header, "" when nothing is recognized.
+    static func clientName(userAgent: String?) -> String {
+        guard let agent = userAgent, !agent.isEmpty else { return "" }
+        let systems: [(String, String)] = [
+            ("Windows", "Windows"), ("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"),
+            ("CrOS", "ChromeOS"), ("Macintosh", "Mac"), ("Linux", "Linux"),
+        ]
+        // Most specific first: almost every browser also claims to be Safari or Chrome.
+        let browsers: [(String, String)] = [
+            ("MicroMessenger", "微信"), ("QQBrowser", "QQ 浏览器"), ("UCBrowser", "UC 浏览器"),
+            ("Quark", "夸克"), ("Edg", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"),
+            ("FxiOS", "Firefox"), ("CriOS", "Chrome"), ("Chrome/", "Chrome"), ("Safari/", "Safari"),
+        ]
+        let system = systems.first(where: { agent.contains($0.0) })?.1
+        let browser = browsers.first(where: { agent.contains($0.0) })?.1
+        return [system, browser].compactMap { $0 }.joined(separator: " · ")
     }
 
     static func mimeType(for url: URL) -> String {
