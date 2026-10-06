@@ -563,6 +563,9 @@ struct FolderView: View {
                 Button { menuRoute = .transfer } label: {
                     Label("Wi-Fi 传输", systemImage: "wifi")
                 }
+                Button { menuRoute = .trash } label: {
+                    Label("回收站", systemImage: "trash")
+                }
                 Button { menuRoute = .settings } label: {
                     Label("设置", systemImage: "gearshape")
                 }
@@ -579,6 +582,7 @@ struct FolderView: View {
         case .capture: CaptureView()
         case .transfer: TransferView()
         case .settings: SettingsView()
+        case .trash: TrashView()
         default: EmptyView()
         }
     }
@@ -711,7 +715,7 @@ struct FolderView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text(targets.contains(where: \.isDirectory) ? "文件夹里的文件也会一起删除，删除后无法恢复。" : "删除后无法恢复。")
+            Text(targets.contains(where: \.isDirectory) ? "连同文件夹里的文件一起移到回收站，\(Vault.trashDays) 天内可以恢复。" : "会移到回收站，\(Vault.trashDays) 天内可以恢复。")
         }
     }
 

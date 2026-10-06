@@ -109,10 +109,42 @@ final class FileStore: ObservableObject {
         }
     }
 
+    /// Moves items to the trash; they are removed for good after `Vault.trashDays` days.
     func delete(_ items: [FileItem]) {
+        var count = 0
         for item in items {
-            do { try fm.removeItem(at: item.url) } catch { report(error) }
+            do {
+                try Vault.moveToTrash(item.url)
+                count += 1
+            } catch {
+                report(error)
+            }
         }
+        changed()
+        if count > 0 { show("已移到回收站，\(Vault.trashDays) 天后自动删除") }
+    }
+
+    func trashEntries() -> [Vault.TrashEntry] {
+        Vault.trashEntries()
+    }
+
+    func restore(_ entries: [Vault.TrashEntry]) {
+        var count = 0
+        for entry in entries {
+            do {
+                try Vault.restoreFromTrash(entry)
+                count += 1
+            } catch {
+                report(error)
+            }
+        }
+        changed()
+        if count > 0 { show("已恢复 \(count) 项") }
+    }
+
+    /// Removes items from the trash for good.
+    func deleteForever(_ entries: [Vault.TrashEntry]) {
+        entries.forEach(Vault.removeFromTrash)
         changed()
     }
 
@@ -265,6 +297,7 @@ final class FileStore: ObservableObject {
 
     /// Moves files dropped off by the extensions (and the system Inbox) into the vault.
     func collectIncoming() {
+        Vault.purgeTrash()
         var count = 0
         let received = Vault.folder(Vault.receivedName)
         if let shared = SharedConfig.sharedInboxURL { count += drain(shared, into: received) }

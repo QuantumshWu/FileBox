@@ -23,6 +23,10 @@ struct FileBoxApp: App {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
+                if PlaybackState.shared.isPictureInPictureActive {
+                    // Back in FileBox: the floating window goes back into the viewer.
+                    MediaViewerHub.shared.endPictureInPictureForReturn()
+                }
                 if !lock.isUnlocked && viewer.request != nil && !PlaybackState.shared.isPictureInPictureActive {
                     // The viewer outlived a Picture in Picture that has since been closed: come
                     // back to the locked screen at once, with no closing animation to see.

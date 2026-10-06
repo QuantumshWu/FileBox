@@ -156,6 +156,13 @@ final class MediaViewerHub: ObservableObject {
         }
     }
 
+    /// FileBox came back to the screen while something floats: end the floating window and show
+    /// it in the viewer again.
+    func endPictureInPictureForReturn() {
+        MediaPlaybackController.shared.endPictureInPictureForReturn()
+        MediaImagePiPController.shared.endPictureInPictureForReturn()
+    }
+
     /// PiP was closed with its X while the app is locked (it locks whenever it leaves the screen;
     /// iOS may deliver this only once the user is back): close the viewer at once, without the
     /// closing animation, so only the locked screen is ever seen.

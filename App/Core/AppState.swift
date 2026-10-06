@@ -7,6 +7,7 @@ enum Route: Hashable {
     case capture
     case transfer
     case settings
+    case trash
 }
 
 /// The two tabs shown while unlocked. Both keep their state when switching; everything is torn

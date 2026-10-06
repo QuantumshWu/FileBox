@@ -64,6 +64,7 @@ struct RootView: View {
         case .capture: CaptureView()
         case .transfer: TransferView()
         case .settings: SettingsView()
+        case .trash: TrashView()
         }
     }
 }

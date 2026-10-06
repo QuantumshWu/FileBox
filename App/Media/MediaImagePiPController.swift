@@ -108,6 +108,13 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         updateArming()
     }
 
+    /// FileBox is back on screen while the image floats: it goes back into the viewer.
+    func endPictureInPictureForReturn() {
+        guard isActive, let controller else { return }
+        isRestoringFromPictureInPicture = true
+        controller.stopPictureInPicture()
+    }
+
     /// The manual PiP button.
     func toggle() {
         if isActive || isStarting {

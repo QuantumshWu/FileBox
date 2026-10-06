@@ -152,6 +152,14 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         player.pause()
     }
 
+    /// FileBox is back on screen while the video floats: it goes back into the viewer and keeps
+    /// playing there, so there is never a floating window and a full one at the same time.
+    func endPictureInPictureForReturn() {
+        guard let controller = pictureInPicture, controller.isPictureInPictureActive else { return }
+        isRestoringFromPictureInPicture = true
+        controller.stopPictureInPicture()
+    }
+
     /// The manual PiP button.
     func togglePictureInPicture() {
         guard player.currentItem != nil else { return }
