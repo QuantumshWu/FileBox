@@ -90,6 +90,8 @@ final class TransferController: ObservableObject {
     @Published private(set) var token = ""
     @Published private(set) var transfers: [TransferProgress] = []
     @Published private(set) var log: [TransferLogEntry] = []
+    /// iOS reports that FileBox's local network access is turned off, so no computer can connect.
+    @Published private(set) var isLocalNetworkDenied = false
 
     private var server: TransferServer?
     private weak var store: FileStore?
@@ -100,6 +102,9 @@ final class TransferController: ObservableObject {
     private var needsNewToken = true
     private var lastPort: UInt16?
     private var pathMonitor: NWPathMonitor?
+    /// Only the latest local network probe may update `isLocalNetworkDenied`.
+    private var probeGeneration = 0
+    private var isRefreshPending = false
 
     /// What the computer's browser opens, e.g. "http://192.168.1.5:8080/k3mx9q/".
     var address: String? {
@@ -193,8 +198,8 @@ final class TransferController: ObservableObject {
             self.port = port
             lastPort = port
             status = .running
-            refreshHost()
-            if let host { TransferLocalNetwork.requestAccess(near: host.ip) }
+            host = TransferHost.current()
+            probeLocalNetwork()
         case .waiting(let message):
             status = .waiting(message)
         case .failed(let message):
@@ -211,7 +216,7 @@ final class TransferController: ObservableObject {
             transfers.removeAll { $0.id == id }
             if isUpload {
                 appendLog(symbol: "arrow.down.circle.fill", title: "收到「\(name)」", detail: "保存在「\(folderLabel(folder))」", isError: false)
-                store?.refresh()
+                scheduleRefresh()
             } else {
                 appendLog(symbol: "arrow.up.circle.fill", title: "发送「\(name)」", detail: "来自「\(folderLabel(folder))」", isError: false)
             }
@@ -225,7 +230,19 @@ final class TransferController: ObservableObject {
             )
         case .folderCreated(let name, let folder):
             appendLog(symbol: "folder.fill.badge.plus", title: "新建文件夹「\(name)」", detail: "在「\(folderLabel(folder))」里", isError: false)
-            store?.refresh()
+            scheduleRefresh()
+        }
+    }
+
+    /// A folder upload can finish hundreds of files a minute; the open folders reload at most
+    /// twice a second instead of once per file.
+    private func scheduleRefresh() {
+        guard !isRefreshPending, let store else { return }
+        isRefreshPending = true
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            self?.isRefreshPending = false
+            store.refresh()
         }
     }
 
@@ -242,7 +259,20 @@ final class TransferController: ObservableObject {
 
     private func refreshHost() {
         let current = TransferHost.current()
-        if current != host { host = current }
+        guard current != host else { return }
+        host = current
+        probeLocalNetwork()
+    }
+
+    /// Asks for local network access (the first time) and finds out whether it is turned off.
+    private func probeLocalNetwork() {
+        guard status == .running, let host else { return }
+        probeGeneration += 1
+        let generation = probeGeneration
+        TransferLocalNetwork.probe(near: host.ip) { [weak self] denied in
+            guard let self, generation == self.probeGeneration else { return }
+            self.isLocalNetworkDenied = denied
+        }
     }
 
     /// Keeps the shown address right when Wi-Fi connects, drops or changes.
@@ -263,26 +293,34 @@ final class TransferController: ObservableObject {
     }
 }
 
-/// Makes iOS ask for local network access as soon as the server runs, instead of silently dropping
-/// the computer's first connection: one UDP datagram to a neighbor address (discard port).
+/// One UDP datagram to a neighbor address (discard port). The first one makes iOS ask for local
+/// network access as soon as the server runs, instead of silently dropping the computer's first
+/// connection; later ones tell whether the user turned that access off.
 private enum TransferLocalNetwork {
-    @MainActor private static var didRequest = false
-
-    @MainActor static func requestAccess(near ip: String) {
-        guard !didRequest else { return }
+    /// Calls `result` on the main queue with true when local network access is denied, false once
+    /// the datagram can be sent. It may not be called at all (no answer within five seconds).
+    static func probe(near ip: String, result: @escaping (Bool) -> Void) {
         var octets = ip.split(separator: ".").compactMap { UInt8($0) }
         guard octets.count == 4 else { return }
-        didRequest = true
         octets[3] = octets[3] == 1 ? 2 : 1
         let neighbor = octets.map(String.init).joined(separator: ".")
+        let queue = DispatchQueue(label: "FileBox.Transfer.probe")
         let connection = NWConnection(host: NWEndpoint.Host(neighbor), port: 9, using: .udp)
         connection.stateUpdateHandler = { state in
-            if case .ready = state {
+            switch state {
+            case .ready:
                 connection.send(content: Data([0]), completion: .idempotent)
+                DispatchQueue.main.async { result(false) }
+            case .waiting:
+                if connection.currentPath?.unsatisfiedReason == .localNetworkDenied {
+                    DispatchQueue.main.async { result(true) }
+                }
+            default:
+                break
             }
         }
-        connection.start(queue: .global(qos: .utility))
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) {
+        connection.start(queue: queue)
+        queue.asyncAfter(deadline: .now() + 5) {
             connection.stateUpdateHandler = nil
             connection.cancel()
         }

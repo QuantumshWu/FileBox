@@ -471,8 +471,7 @@ private final class TransferConnection: @unchecked Sendable {
             respondError(404, "所在的文件夹已经不存在了，请刷新页面")
             return
         }
-        var name = sanitizedFileName(request.query["name"] ?? "")
-        if name.isEmpty { name = "新建文件夹" }
+        let name = TransferHTTP.fileName(request.query["name"] ?? "", fallback: "新建文件夹")
         do {
             let created = try locked { () throws -> URL in
                 let url = fm.uniqueURL(for: name, in: parent)
@@ -491,7 +490,7 @@ private final class TransferConnection: @unchecked Sendable {
         var current = folder
         try locked {
             for raw in relativePath.split(separator: "/") {
-                let name = sanitizedFileName(String(raw))
+                let name = TransferHTTP.fileName(String(raw), fallback: "")
                 guard !name.isEmpty else { continue }
                 current.appendPathComponent(name, isDirectory: true)
                 try fm.createDirectory(at: current, withIntermediateDirectories: true)
@@ -629,8 +628,7 @@ private final class TransferConnection: @unchecked Sendable {
             respondError(404, "目标文件夹已经不存在了，请刷新页面")
             return
         }
-        var name = sanitizedFileName(request.query["name"] ?? "")
-        if name.isEmpty { name = "文件" }
+        let name = TransferHTTP.fileName(request.query["name"] ?? "", fallback: "文件")
         if expected > 0, let free = freeSpace(), expected > free - Self.reservedSpace {
             let left = ByteCountFormatter.string(fromByteCount: max(free, 0), countStyle: .file)
             respondError(507, "手机存储空间不足（只剩 \(left)）")

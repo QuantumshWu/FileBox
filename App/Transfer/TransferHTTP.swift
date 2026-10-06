@@ -167,6 +167,33 @@ enum TransferHTTP {
         return "\(kind); filename=\"\(fallback)\"; filename*=UTF-8''\(rfc5987(name))"
     }
 
+    /// Longest name, in UTF-8 bytes, given to an uploaded file or a new folder. The file system
+    /// allows 255; the rest leaves room for the " 2" that makes a name unique.
+    private static let maxNameBytes = 240
+
+    /// `sanitizedFileName(raw)` (or `fallback` when nothing is left), shortened to fit the file
+    /// system's name limit while keeping the extension. Checked before an upload starts, so a long
+    /// name never fails a multi-GB upload at the very end.
+    static func fileName(_ raw: String, fallback: String) -> String {
+        let clean = sanitizedFileName(raw)
+        guard !clean.isEmpty else { return fallback }
+        guard clean.utf8.count > maxNameBytes else { return clean }
+        let ext = (clean as NSString).pathExtension
+        let keepsExtension = !ext.isEmpty && ext.utf8.count <= 16
+        let suffix = keepsExtension ? "." + ext : ""
+        let stem = keepsExtension ? (clean as NSString).deletingPathExtension : clean
+        var short = ""
+        var bytes = suffix.utf8.count
+        for character in stem {
+            let size = String(character).utf8.count
+            if bytes + size > maxNameBytes { break }
+            short.append(character)
+            bytes += size
+        }
+        short = short.trimmingCharacters(in: .whitespaces)
+        return short.isEmpty ? fallback : short + suffix
+    }
+
     private static let attributeChars = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$&+-.^_`|~".utf8)
 
     /// Percent-encodes everything outside RFC 5987's attr-char set.

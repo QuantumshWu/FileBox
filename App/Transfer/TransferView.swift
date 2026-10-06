@@ -65,6 +65,22 @@ struct TransferView: View {
     private var addressSection: some View {
         Section {
             if let address = controller.address {
+                if controller.isLocalNetworkDenied {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("FileBox 没有「本地网络」权限", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("电脑现在打不开这个地址。请在「设置」里找到 FileBox，打开「本地网络」，再回到这里。")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    Button {
+                        if let url = URL(string: UIApplication.openSettingsURLString) {
+                            UIApplication.shared.open(url)
+                        }
+                    } label: {
+                        Label("打开设置", systemImage: "gear")
+                    }
+                }
                 VStack(spacing: 16) {
                     Text(address)
                         .font(.system(.title3, design: .monospaced).weight(.semibold))
@@ -172,7 +188,7 @@ struct TransferView: View {
         case .off: return controller.isEnabled ? "已暂停" : "已关闭"
         case .starting: return "正在启动…"
         case .running: return controller.port.map { "正在运行 · 端口 \($0)" } ?? "正在运行"
-        case .waiting(let message): return "等待网络：\(message)"
+        case .waiting: return "等待网络连接…"
         case .failed(let message): return "启动失败：\(message)"
         }
     }
