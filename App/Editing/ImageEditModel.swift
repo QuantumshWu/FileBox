@@ -157,6 +157,11 @@ final class ImageEditModel: ObservableObject {
         return image.cropping(to: rect) ?? image
     }
 
+    /// False for a moment after a turn or flip, until the preview in the new orientation is ready.
+    var isPreviewOriented: Bool {
+        matchesPreview(state)
+    }
+
     private func matchesPreview(_ other: ImageEditState) -> Bool {
         other.quarterTurns == previewTurns && other.flipped == previewFlipped
     }
@@ -307,18 +312,21 @@ final class ImageEditModel: ObservableObject {
         let state = self.state
         let filters = state.autoEnhance ? (autoFilters ?? []) : []
         let previewWidth = CGFloat(base.width)
-        var output: ImageEditRenderer.Output
-        do {
-            let software = background.enteredBackground
-            output = try await Self.export(source, state: state, auto: filters, previewWidth: previewWidth,
-                                           software: software)
-            if background.enteredBackground && !software {
-                // iOS refuses GPU work in the background, so that render may be broken: redo it on the CPU.
-                try? FileManager.default.removeItem(at: output.url)
-                output = try await Self.export(source, state: state, auto: filters, previewWidth: previewWidth,
-                                               software: true)
-            }
-        } catch {
+        let software = background.enteredBackground
+        var result = await Self.export(source, state: state, auto: filters, previewWidth: previewWidth,
+                                       software: software)
+        if background.enteredBackground && !software {
+            // iOS refuses GPU work in the background, so that render may have failed or come out
+            // broken: redo it on the CPU.
+            if case .success(let broken) = result { try? FileManager.default.removeItem(at: broken.url) }
+            result = await Self.export(source, state: state, auto: filters, previewWidth: previewWidth,
+                                       software: true)
+        }
+        let output: ImageEditRenderer.Output
+        switch result {
+        case .success(let value):
+            output = value
+        case .failure(let error):
             let reason = (error as? ImageEditError)?.errorDescription ?? "生成图片时出错：\(error.localizedDescription)"
             saveError = reason
             if background.enteredBackground { store.show("图片没有保存。\(reason)") }
@@ -342,9 +350,12 @@ final class ImageEditModel: ObservableObject {
 
     /// One export off the main thread.
     private static func export(_ source: URL, state: ImageEditState, auto: [ImageEditAutoFilter],
-                               previewWidth: CGFloat, software: Bool) async throws -> ImageEditRenderer.Output {
-        try await Task.detached(priority: .userInitiated) {
-            try ImageEditRenderer.export(source, state: state, auto: auto, previewWidth: previewWidth, software: software)
+                               previewWidth: CGFloat, software: Bool) async -> Result<ImageEditRenderer.Output, Error> {
+        await Task.detached(priority: .userInitiated) {
+            Result<ImageEditRenderer.Output, Error> {
+                try ImageEditRenderer.export(source, state: state, auto: auto, previewWidth: previewWidth,
+                                             software: software)
+            }
         }.value
     }
 

@@ -3,6 +3,7 @@ import CoreImage.CIFilterBuiltins
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
+import os
 
 /// Errors of the image editor, worded for the user.
 enum ImageEditError: LocalizedError {
@@ -55,12 +56,14 @@ enum ImageEditRenderer {
     /// Longest side of the preview the editor works on.
     static let previewMaxPixels = 2048
 
-    /// Most pixels a full-size export may have. Core Image holds the decoded original and the
-    /// rendered copy at once (about 12 bytes per pixel), and an app only gets part of the phone's memory.
-    private static let exportPixelBudget: CGFloat = {
-        let memory = CGFloat(ProcessInfo.processInfo.physicalMemory)
-        return max(memory * 0.35 / 12, 50_000_000)
-    }()
+    /// Most pixels a full-size export may have right now. Core Image holds the decoded original, its
+    /// GPU copy and the rendered result at once (about 16 bytes per pixel with the encoder), and iOS
+    /// ends an app that goes past its own memory limit, which is well below the phone's memory.
+    private static func exportPixelBudget() -> CGFloat {
+        var available = CGFloat(os_proc_available_memory())
+        if available <= 0 { available = CGFloat(ProcessInfo.processInfo.physicalMemory) * 0.4 }
+        return max(available * 0.6 / 16, 12_000_000)
+    }
 
     private static let previewSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
     private static let sRGB = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
@@ -222,7 +225,10 @@ enum ImageEditRenderer {
     /// `software` renders on the CPU, for when the app may be in the background.
     static func export(_ source: URL, state: ImageEditState, auto: [ImageEditAutoFilter],
                        previewWidth: CGFloat, software: Bool) throws -> Output {
-        try autoreleasepool { () throws -> Output in
+        let renderer = software ? softwareContext : context
+        // A full-size render leaves large buffers in the context's cache; give that memory back.
+        defer { renderer.clearCaches() }
+        return try autoreleasepool { () throws -> Output in
             let (original, reducedSize) = try readForExport(source)
             var edited = original.transformed(
                 by: CGAffineTransform(translationX: -original.extent.minX, y: -original.extent.minY)
@@ -249,8 +255,7 @@ enum ImageEditRenderer {
                 }
                 image = image.settingProperties(properties)
                 do {
-                    try write(image, as: format, to: url, colorSpace: colorSpace,
-                              context: software ? softwareContext : context)
+                    try write(image, as: format, to: url, colorSpace: colorSpace, context: renderer)
                     return Output(url: url, pathExtension: pathExtension, reducedSize: reducedSize)
                 } catch {
                     try? FileManager.default.removeItem(at: url)
@@ -264,9 +269,10 @@ enum ImageEditRenderer {
     /// The upright original, at full size unless that would not fit in memory. Then it is read at
     /// the largest size that does, and the second value is that size.
     private static func readForExport(_ url: URL) throws -> (CIImage, CGSize?) {
+        let budget = exportPixelBudget()
         if let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
-           let size = uprightSize(of: source), size.width * size.height > exportPixelBudget {
-            let scale = (exportPixelBudget / (size.width * size.height)).squareRoot()
+           let size = uprightSize(of: source), size.width * size.height > budget {
+            let scale = (budget / (size.width * size.height)).squareRoot()
             let longest = Int((max(size.width, size.height) * scale).rounded(.down))
             guard let image = uprightImage(from: source, maxPixels: longest) else { throw ImageEditError.unreadable }
             return (CIImage(cgImage: image), CGSize(width: image.width, height: image.height))

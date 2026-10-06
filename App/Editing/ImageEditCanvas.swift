@@ -22,7 +22,10 @@ struct ImageEditCanvas: View {
                 let frame = Self.fit(preview, in: bounds, inset: 24)
                 ZStack {
                     picture(preview, in: frame)
-                    ImageEditCropOverlay(rect: $model.state.crop, ratio: model.cropRatio, imageFrame: frame)
+                    // The crop is in the new orientation, so it would sit wrong on the old preview.
+                    if model.isPreviewOriented {
+                        ImageEditCropOverlay(rect: $model.state.crop, ratio: model.cropRatio, imageFrame: frame)
+                    }
                 }
             } else {
                 let shown = model.croppedPreview(preview)
