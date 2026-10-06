@@ -17,7 +17,7 @@ struct MediaViewer: View {
     @AppStorage("mediaPlaybackMode") private var mode: MediaPlaybackMode = MediaPlaybackMode.defaultMode
 
     @State private var selection: Int
-    @State private var chromeVisible = true
+    @State private var chromeVisible: Bool
     @State private var token = UUID()
     @State private var editingImage: FileItem?
     @State private var trimmingVideo: FileItem?
@@ -25,11 +25,16 @@ struct MediaViewer: View {
 
     private let urls: [URL]
 
+    /// Black between pages while swiping, as in Photos.
+    private static let pageGap: CGFloat = 20
+
     init(items: [FileItem], startIndex: Int) {
         self.items = items
         self.startIndex = startIndex
         urls = items.map(\.url)
-        _selection = State(initialValue: items.indices.contains(startIndex) ? startIndex : 0)
+        let start = items.indices.contains(startIndex) ? startIndex : 0
+        _selection = State(initialValue: start)
+        _chromeVisible = State(initialValue: !(items.indices.contains(start) && items[start].kind == .image))
     }
 
     private var currentItem: FileItem? {
@@ -41,13 +46,18 @@ struct MediaViewer: View {
             Color.black.ignoresSafeArea()
             // Covered by the pages, but on screen: image PiP takes its picture from here.
             MediaImagePiPLayerHost().ignoresSafeArea()
+            // Keeps that picture out of the gaps between pages.
+            Color.black.ignoresSafeArea()
             TabView(selection: $selection) {
                 ForEach(items.indices, id: \.self) { index in
                     page(for: items[index])
+                        .padding(.horizontal, Self.pageGap / 2)
                         .tag(index)
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
+            // Pages one gap wider than the screen: a page still fills it, the gap shows while swiping.
+            .padding(.horizontal, -Self.pageGap / 2)
             .ignoresSafeArea()
 
             if chromeVisible {
@@ -70,8 +80,9 @@ struct MediaViewer: View {
         .onDisappear {
             hub.viewerDisappeared(token: token)
         }
-        .onChange(of: selection) { _, index in
+        .onChange(of: selection) { oldIndex, index in
             pageChanged(to: index)
+            updateChrome(from: oldIndex, to: index)
         }
         .onChange(of: hub.pageRequest) { _, request in
             guard let request, request.urls == urls, items.indices.contains(request.index) else { return }
@@ -106,7 +117,12 @@ struct MediaViewer: View {
     private func page(for item: FileItem) -> some View {
         switch item.kind {
         case .image:
-            MediaImagePage(item: item, onTap: { toggleChrome() }, onQuickLook: { openInQuickLook($0) })
+            MediaImagePage(
+                item: item,
+                onTap: { toggleChrome() },
+                onClose: { viewer.close() },
+                onQuickLook: { openInQuickLook($0) }
+            )
         case .video, .audio:
             MediaPlayablePage(item: item, onTap: { toggleChrome() }, onQuickLook: { openInQuickLook($0) })
         case .folder, .other:
@@ -149,9 +165,31 @@ struct MediaViewer: View {
         selection = index
     }
 
+    /// Taps on a video or audio page belong to the player; the bar stays there.
     private func toggleChrome() {
+        if let kind = currentItem?.kind, kind == .video || kind == .audio { return }
         withAnimation(.easeInOut(duration: 0.2)) {
             chromeVisible.toggle()
+        }
+    }
+
+    /// The bar is always up on video and audio pages; coming to an image from one hides it, as in
+    /// Photos, while moving between images keeps what the last tap chose.
+    private func updateChrome(from oldIndex: Int, to index: Int) {
+        guard items.indices.contains(index) else { return }
+        let visible: Bool
+        switch items[index].kind {
+        case .video, .audio:
+            visible = true
+        case .image:
+            if items.indices.contains(oldIndex), items[oldIndex].kind == .image { return }
+            visible = false
+        case .folder, .other:
+            return
+        }
+        guard visible != chromeVisible else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            chromeVisible = visible
         }
     }
 
@@ -163,34 +201,36 @@ struct MediaViewer: View {
     // MARK: - Chrome
 
     private var topBar: some View {
-        HStack(spacing: 2) {
-            Button("关闭") { viewer.close() }
-                .font(.body.weight(.semibold))
-                .padding(.horizontal, 10)
-                .frame(height: 44)
-            VStack(spacing: 1) {
-                Text(currentItem?.name ?? "")
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if items.count > 1 {
-                    Text("\(selection + 1) / \(items.count)")
-                        .font(.caption2)
-                        .foregroundStyle(.white.opacity(0.7))
-                }
-            }
-            .frame(maxWidth: .infinity)
+        HStack(spacing: 8) {
+            Button { viewer.close() } label: { barIcon("xmark") }
+                .accessibilityLabel("关闭")
+            titleCapsule
+                .frame(maxWidth: .infinity)
             if let item = currentItem {
                 actions(for: item)
             }
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 6)
-        .padding(.bottom, 8)
-        .background {
-            LinearGradient(colors: [.black.opacity(0.75), .black.opacity(0)], startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea(edges: .top)
+        .frame(height: 44)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 6)
+    }
+
+    private var titleCapsule: some View {
+        VStack(spacing: 0) {
+            Text(currentItem?.name ?? "")
+                .font(.footnote.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if items.count > 1 {
+                Text("\(selection + 1) / \(items.count)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.75))
+            }
         }
+        .padding(.horizontal, 12)
+        .frame(minHeight: 38)
+        .mediaBarGlass(Capsule())
     }
 
     @ViewBuilder
@@ -245,9 +285,11 @@ struct MediaViewer: View {
 
     private func barIcon(_ name: String) -> some View {
         Image(systemName: name)
-            .font(.system(size: 17, weight: .semibold))
-            .frame(width: 40, height: 44)
-            .contentShape(Rectangle())
+            .font(.system(size: 16, weight: .semibold))
+            .foregroundStyle(.white)
+            .frame(width: 38, height: 38)
+            .mediaBarGlass(Circle())
+            .contentShape(Circle())
     }
 
     @ViewBuilder
@@ -264,6 +306,16 @@ struct MediaViewer: View {
                 .padding(.bottom, 96)
                 .transition(.opacity)
                 .allowsHitTesting(false)
+        }
+    }
+}
+
+private extension View {
+    /// Dark glass behind the bar's controls, so white symbols stay readable over bright pictures.
+    func mediaBarGlass<S: Shape>(_ shape: S) -> some View {
+        background {
+            shape.fill(.ultraThinMaterial)
+                .overlay { shape.fill(Color.black.opacity(0.3)) }
         }
     }
 }
