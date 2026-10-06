@@ -226,6 +226,25 @@ final class MediaViewerHub: ObservableObject {
         }
     }
 
+    /// Right before the app leaves the screen with a video playing: the session must be the video
+    /// one (not mixing with other apps) and active, or iOS will not start PiP by itself.
+    func ensureVideoAudioSession() {
+        guard audioHolders.contains(.video) else { return }
+        let session = AVAudioSession.sharedInstance()
+        if session.category != .playback || session.mode != .moviePlayback || session.categoryOptions.contains(.mixWithOthers) {
+            try? session.setCategory(.playback, mode: .moviePlayback, options: [])
+        }
+        try? session.setActive(true)
+    }
+
+    /// For the PiP log, e.g. "Playback/MoviePlayback".
+    var audioDescription: String {
+        let session = AVAudioSession.sharedInstance()
+        let category = session.category.rawValue.replacingOccurrences(of: "AVAudioSessionCategory", with: "")
+        let mode = session.mode.rawValue.replacingOccurrences(of: "AVAudioSessionMode", with: "")
+        return category + "/" + mode + (session.categoryOptions.contains(.mixWithOthers) ? "+混音" : "")
+    }
+
     func releaseAudioSession(for use: AudioUse) {
         guard audioHolders.remove(use) != nil else { return }
         let session = AVAudioSession.sharedInstance()

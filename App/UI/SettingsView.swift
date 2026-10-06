@@ -65,6 +65,16 @@ struct SettingsView: View {
                     .font(.caption.monospaced())
                     .textSelection(.enabled)
             }
+
+            Section {
+                Text(MediaDiagnostics.text)
+                    .font(.caption2.monospaced())
+                    .textSelection(.enabled)
+            } header: {
+                Text("小窗记录")
+            } footer: {
+                Text("小窗没出现时，截一张这里的图发给开发者。")
+            }
         }
         .navigationTitle("设置")
         .task {

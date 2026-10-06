@@ -387,6 +387,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     }
 
     private func pictureInPictureDidStart() {
+        MediaDiagnostics.log("图片小窗已开启")
         isStarting = false
         isActive = true
         updateArming()
@@ -394,6 +395,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     }
 
     private func pictureInPictureFailed() {
+        MediaDiagnostics.log("图片小窗开启失败")
         isStarting = false
         isActive = false
         MediaViewerHub.shared.show("小窗暂时无法开启")
@@ -402,6 +404,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
 
     private func pictureInPictureDidStop() {
         let restoring = isRestoringFromPictureInPicture
+        MediaDiagnostics.log(restoring ? "图片小窗回到全屏" : "图片小窗已关闭")
         isRestoringFromPictureInPicture = false
         isStarting = false
         isActive = false

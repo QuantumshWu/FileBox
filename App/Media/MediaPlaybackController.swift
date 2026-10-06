@@ -51,6 +51,12 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     private var pictureInPicture: AVPictureInPictureController?
     /// Whether the page on screen wants PiP to start by itself when the app leaves the screen.
     private var wantsAutomaticPictureInPicture = true
+    /// A new file was loaded: the next time the picture is on screen it gets a fresh PiP controller,
+    /// so nothing left over from an earlier PiP session can keep it from starting.
+    private var pictureInPictureNeedsRefresh = false
+    private var possibleObservation: NSKeyValueObservation?
+    /// When the app resigned: a video played and PiP was ready to start by itself.
+    private var pictureInPictureExpected = false
 
     /// Index (in `sessionItems`) of the file in the player.
     @Published private(set) var currentIndex: Int?
@@ -133,13 +139,21 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// Creates the PiP controller the first time the video layer is in a window. One created before
     /// that (at launch) never becomes "possible", so swiping home only kept the sound playing.
     private func preparePictureInPicture() {
-        guard pictureInPicture == nil, AVPictureInPictureController.isPictureInPictureSupported(),
+        guard AVPictureInPictureController.isPictureInPictureSupported(),
               playerViewController.viewIfLoaded?.window != nil,
+              !isPictureInPictureActive, !isPictureInPictureStarting,
+              pictureInPicture == nil || pictureInPictureNeedsRefresh,
               let controller = AVPictureInPictureController(playerLayer: playerViewController.playerLayer)
         else { return }
         controller.delegate = self
         controller.canStartPictureInPictureAutomaticallyFromInline = wantsAutomaticPictureInPicture
+        possibleObservation = controller.observe(\.isPictureInPicturePossible, options: [.new]) { _, change in
+            let possible = change.newValue ?? false
+            Task { @MainActor in MediaDiagnostics.log(possible ? "小窗可以开启" : "小窗暂不可用") }
+        }
         pictureInPicture = controller
+        pictureInPictureNeedsRefresh = false
+        MediaDiagnostics.log("准备好视频小窗")
     }
 
     func play() {
@@ -156,6 +170,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// playing there, so there is never a floating window and a full one at the same time.
     func endPictureInPictureForReturn() {
         guard let controller = pictureInPicture, controller.isPictureInPictureActive else { return }
+        MediaDiagnostics.log("回到 App，收起视频小窗")
         isRestoringFromPictureInPicture = true
         controller.stopPictureInPicture()
     }
@@ -209,6 +224,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         }
         let item = AVPlayerItem(url: file.url)
         observe(item)
+        pictureInPictureNeedsRefresh = true
         currentURL = file.url
         artwork = nil
         audioOverlay.configure(title: file.name, artwork: nil)
@@ -389,10 +405,23 @@ final class MediaPlaybackController: NSObject, ObservableObject {
 
     private func willResignActive() {
         wasPlayingWhenResigning = isPlaying
+        let controller = pictureInPicture
+        let possible = controller?.isPictureInPicturePossible ?? false
+        pictureInPictureExpected = isPlaying && wantsAutomaticPictureInPicture && possible
         if isPlaying {
             holdsForBackground = true
+            if wantsAutomaticPictureInPicture {
+                // Automatic PiP needs the (non-mixing) video audio session to be active.
+                MediaViewerHub.shared.ensureVideoAudioSession()
+                controller?.canStartPictureInPictureAutomaticallyFromInline = true
+            }
             publishState()
         }
+        guard player.currentItem != nil else { return }
+        MediaDiagnostics.log(
+            "离开 App：播放\(isPlaying ? "中" : "已停") 小窗\(possible ? "可开" : "不可开") "
+                + "自动\(wantsAutomaticPictureInPicture ? "开" : "关") 声音 \(MediaViewerHub.shared.audioDescription)"
+        )
     }
 
     private func didBecomeActive() {
@@ -403,10 +432,16 @@ final class MediaPlaybackController: NSObject, ObservableObject {
 
     private func didEnterBackground() {
         guard wasPlayingWhenResigning, player.currentItem != nil else { return }
+        let waitsForPictureInPicture = pictureInPictureExpected
         Task { [weak self] in
-            // Give automatic PiP time to begin first; only without it does the sound go on alone.
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            self?.keepPlayingInBackgroundIfNeeded()
+            // Expected PiP gets plenty of time to begin; the sound goes on alone only without it,
+            // so the fallback can no longer cut a slow PiP start short.
+            try? await Task.sleep(nanoseconds: waitsForPictureInPicture ? 3_000_000_000 : 300_000_000)
+            guard let self else { return }
+            if waitsForPictureInPicture && !self.isPictureInPictureActive && !self.isPictureInPictureStarting {
+                MediaDiagnostics.log("小窗没有启动")
+            }
+            self.keepPlayingInBackgroundIfNeeded()
         }
     }
 
@@ -420,6 +455,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         playerViewController.player = nil
         detachedForBackground = true
         player.play()
+        MediaDiagnostics.log("后台只播放声音")
     }
 
     private func willEnterForeground() {
@@ -530,11 +566,13 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     // MARK: - Picture in Picture
 
     private func pictureInPictureWillStart() {
+        MediaDiagnostics.log("视频小窗开始开启")
         isPictureInPictureStarting = true
         publishState()
     }
 
     private func pictureInPictureDidStart() {
+        MediaDiagnostics.log("视频小窗已开启")
         isPictureInPictureStarting = false
         isPictureInPictureActive = true
         publishState()
@@ -558,6 +596,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
 
     private func pictureInPictureDidStop() {
         let restoring = isRestoringFromPictureInPicture
+        MediaDiagnostics.log(restoring ? "视频小窗回到全屏" : "视频小窗已关闭")
         isRestoringFromPictureInPicture = false
         isPictureInPictureStarting = false
         isPictureInPictureActive = false
@@ -637,7 +676,11 @@ extension MediaPlaybackController: AVPictureInPictureControllerDelegate {
         _ pictureInPictureController: AVPictureInPictureController,
         failedToStartPictureInPictureWithError error: Error
     ) {
-        Task { @MainActor in self.pictureInPictureFailed() }
+        let reason = (error as NSError).localizedDescription + " (\((error as NSError).code))"
+        Task { @MainActor in
+            MediaDiagnostics.log("视频小窗开启失败：\(reason)")
+            self.pictureInPictureFailed()
+        }
     }
 
     nonisolated func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
