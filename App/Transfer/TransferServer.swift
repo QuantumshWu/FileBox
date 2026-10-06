@@ -190,7 +190,12 @@ private final class TransferConnection: @unchecked Sendable {
         let total: Int64
         /// Whole-file GETs show up in the app; range requests (video seeking) do not.
         let isTracked: Bool
+        /// Bytes read from disk and handed to the network.
+        var queued: Int64 = 0
+        /// Bytes the network has taken.
         var sent: Int64 = 0
+        /// Chunks handed to the network that it has not taken yet.
+        var inFlight = 0
     }
 
     private struct Listing: Encodable {
@@ -209,6 +214,8 @@ private final class TransferConnection: @unchecked Sendable {
 
     private static let maxHeaderSize = 64 * 1024
     private static let chunkSize = 1 << 20
+    /// Download chunks queued on the network at once.
+    private static let downloadDepth = 2
     /// Upload bytes read and thrown away after an early error response (see `lingers`).
     private static let maxDiscard: Int64 = 64 << 20
     private static let headerTimeout: TimeInterval = 30
@@ -568,41 +575,48 @@ private final class TransferConnection: @unchecked Sendable {
         if tracked {
             context.emit(.transferStarted(id: id, name: name, isUpload: false, total: length))
         }
-        send(head) { [weak self] in self?.sendNextChunk() }
+        send(head) { [weak self] in self?.sendChunks() }
     }
 
-    /// Streams the file in 1 MB chunks; the next chunk is read only after the previous one was handed
-    /// to the network, so a slow client never makes the app buffer the file in memory.
-    private func sendNextChunk() {
-        guard let download, !isClosed else { return }
-        let remaining = download.total - download.sent
-        if remaining <= 0 {
-            self.download = nil
-            try? download.handle.close()
-            if download.isTracked {
-                context.emit(.transferFinished(id: download.id, name: download.name, isUpload: false, folder: download.folder))
+    /// Streams the file in 1 MB chunks with at most `downloadDepth` of them queued on the network:
+    /// a fast client never waits for the disk, and a slow one never makes the app buffer the file.
+    private func sendChunks() {
+        while !isClosed, let current = download, current.inFlight < Self.downloadDepth, current.queued < current.total {
+            let count = Int(min(current.total - current.queued, Int64(Self.chunkSize)))
+            let chunk: Data
+            do {
+                chunk = try current.handle.read(upToCount: count) ?? Data()
+            } catch {
+                close(reason: "读取文件失败")
+                return
+            }
+            guard !chunk.isEmpty else {
+                close(reason: "文件在传输过程中被改动了")
+                return
+            }
+            let size = chunk.count
+            download?.queued += Int64(size)
+            download?.inFlight += 1
+            send(chunk) { [weak self] in self?.chunkSent(size) }
+        }
+    }
+
+    private func chunkSent(_ count: Int) {
+        guard var current = download else { return }
+        current.inFlight -= 1
+        current.sent += Int64(count)
+        guard current.sent < current.total else {
+            download = nil
+            try? current.handle.close()
+            if current.isTracked {
+                context.emit(.transferFinished(id: current.id, name: current.name, isUpload: false, folder: current.folder))
             }
             endResponse()
             return
         }
-        let chunk: Data
-        do {
-            chunk = try download.handle.read(upToCount: Int(min(remaining, Int64(Self.chunkSize)))) ?? Data()
-        } catch {
-            close(reason: "读取文件失败")
-            return
-        }
-        guard !chunk.isEmpty else {
-            close(reason: "文件在传输过程中被改动了")
-            return
-        }
-        send(chunk) { [weak self] in
-            guard let self, var current = self.download else { return }
-            current.sent += Int64(chunk.count)
-            self.download = current
-            if current.isTracked { self.reportProgress(id: current.id, done: current.sent) }
-            self.sendNextChunk()
-        }
+        download = current
+        if current.isTracked { reportProgress(id: current.id, done: current.sent) }
+        sendChunks()
     }
 
     // MARK: - Uploads

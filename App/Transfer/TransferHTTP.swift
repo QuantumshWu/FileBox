@@ -175,7 +175,10 @@ enum TransferHTTP {
     /// system's name limit while keeping the extension. Checked before an upload starts, so a long
     /// name never fails a multi-GB upload at the very end.
     static func fileName(_ raw: String, fallback: String) -> String {
-        let clean = sanitizedFileName(raw)
+        // Control characters (NUL, line breaks, ...) are never part of a real file name.
+        var visible = String.UnicodeScalarView()
+        visible.append(contentsOf: raw.unicodeScalars.lazy.filter { $0.properties.generalCategory != .control })
+        let clean = sanitizedFileName(String(visible))
         guard !clean.isEmpty else { return fallback }
         guard clean.utf8.count > maxNameBytes else { return clean }
         let ext = (clean as NSString).pathExtension

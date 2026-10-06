@@ -311,8 +311,11 @@ private enum TransferLocalNetwork {
             case .ready:
                 connection.send(content: Data([0]), completion: .idempotent)
                 DispatchQueue.main.async { result(false) }
-            case .waiting:
-                if connection.currentPath?.unsatisfiedReason == .localNetworkDenied {
+            case .waiting(let error), .failed(let error):
+                var denied = connection.currentPath?.unsatisfiedReason == .localNetworkDenied
+                // kDNSServiceErr_PolicyDenied, which some iOS versions report instead.
+                if case .dns(let code) = error, code == -65570 { denied = true }
+                if denied {
                     DispatchQueue.main.async { result(true) }
                 }
             default:

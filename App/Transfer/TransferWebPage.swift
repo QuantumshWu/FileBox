@@ -113,6 +113,7 @@ const base = '/' + location.pathname.split('/')[1] + '/';
 const $ = id => document.getElementById(id);
 const collator = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
 const PARALLEL = 2;
+const RESERVE = 100 * 1024 * 1024;
 let dir = '';
 let entries = [];
 let freeBytes = null;
@@ -333,8 +334,9 @@ function pump() {
 }
 
 function start(task) {
-  if (freeBytes !== null && task.file.size > freeBytes) {
-    finish(task, 'fail', '手机存储空间不足');
+  // The phone keeps 100 MB free and refuses anything bigger than what is left above that.
+  if (freeBytes !== null && task.file.size > 0 && task.file.size > freeBytes - RESERVE) {
+    finish(task, 'fail', '手机存储空间不足（只剩 ' + fmtSize(Math.max(0, freeBytes)) + '）');
     return;
   }
   task.state = 'up';
@@ -374,7 +376,10 @@ function finish(task, state, text) {
   task.state = state;
   task.status.textContent = text;
   task.li.className = state;
-  if (state === 'done') task.bar.style.width = '100%';
+  if (state === 'done') {
+    task.bar.style.width = '100%';
+    if (freeBytes !== null) freeBytes -= task.file.size;
+  }
   task.cancel.remove();
   if (state === 'done' && task.dir === dir) {
     clearTimeout(reloadTimer);
