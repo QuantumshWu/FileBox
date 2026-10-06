@@ -4,6 +4,7 @@ import UIKit
 
 /// Screenshots (Shortcuts + Back Tap) and screen recording (broadcast extension) into the vault.
 struct CaptureView: View {
+    @EnvironmentObject private var store: FileStore
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
 
@@ -25,6 +26,7 @@ struct CaptureView: View {
         .onAppear {
             // The broadcast sheet makes the app inactive; the privacy shield must not cover it.
             PrivacyShield.shared.isSuppressed = true
+            CaptureRecordingWatcher.watch(store)
         }
         .onDisappear {
             PrivacyShield.shared.isSuppressed = false
@@ -47,6 +49,7 @@ struct CaptureView: View {
                 "再搜索「FileBox」，添加「保存截图到 FileBox」，截图选上一步的「截屏」（一般会自动连好）。",
                 "点顶部的名称，命名为「截图到 FileBox」之类，点「完成」。",
                 "打开「设置」→「辅助功能」→「触控」→「轻点背面」→「轻点两下」，选这个快捷指令。",
+                "轻点两下手机背面试一下。第一次如果询问是否允许共享给 FileBox，选「始终允许」。",
             ])
             Button {
                 if let url = URL(string: "shortcuts://create-shortcut") { openURL(url) }
@@ -96,7 +99,7 @@ struct CaptureView: View {
         } header: {
             Text("录屏")
         } footer: {
-            Text("也可以从控制中心开始：长按「屏幕录制」按钮，选「FileBox 录屏」，再点「开始直播」。受保护的内容（例如部分视频 App 的画面）录下来会是黑屏。打开麦克风时，你的声音是单独的一条音轨：在 FileBox 里播放会和 App 的声音一起播放，有些电脑播放器只播放第一条。录屏不会进入「照片」。")
+            Text("也可以从控制中心开始：长按「屏幕录制」按钮，选「FileBox 录屏」，再点「开始直播」。画面方向以开始录制时为准：要录横屏的游戏或视频，先打开那个 App 并把手机横过来，再从控制中心开始。受保护的内容（例如部分视频 App 的画面）录下来会是黑屏。打开麦克风时，你的声音是单独的一条音轨，有些电脑播放器只播放 App 的声音。录屏不会进入「照片」。")
         }
     }
 
@@ -137,14 +140,15 @@ struct CaptureView: View {
             showsSystemPicker = true
             return
         }
-        // If the sheet does not appear (the app stays active, see onChange), offer the system button.
+        // If the sheet does not appear (the app stays active, see onChange, and nothing is presented
+        // over it), offer the system button.
         awaitsPicker = true
         Task {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
-            if awaitsPicker {
-                awaitsPicker = false
+            if awaitsPicker && !pickerHandle.isPresentingSheet {
                 showsSystemPicker = true
             }
+            awaitsPicker = false
         }
     }
 }
@@ -205,6 +209,12 @@ private final class CapturePickerHandle {
         return true
     }
 
+    /// True while a sheet (the picker's, if it opened inside the app) covers the screen.
+    @MainActor
+    var isPresentingSheet: Bool {
+        picker?.window?.rootViewController?.presentedViewController != nil
+    }
+
     @MainActor
     private static func firstButton(in view: UIView) -> UIButton? {
         for subview in view.subviews {
@@ -233,4 +243,41 @@ private enum CaptureRecordExtension {
         }
         return nil
     }()
+}
+
+/// Moves a finished recording into the vault as soon as the extension reports it. Recordings are
+/// normally collected when the app becomes active, but one stopped while FileBox is open is finished
+/// only after that. Observes for the rest of the process once the capture screen has been shown.
+private enum CaptureRecordingWatcher {
+    /// Posted by FileBoxRecord's SampleHandler after it renames a finished recording.
+    static let notificationName = "io.github.quantumshwu.filebox.recording-finished"
+
+    @MainActor private static weak var store: FileStore?
+    @MainActor private static var isObserving = false
+
+    @MainActor
+    static func watch(_ store: FileStore) {
+        self.store = store
+        guard !isObserving else { return }
+        isObserving = true
+        startObserving()
+    }
+
+    private static func startObserving() {
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            nil,
+            { _, _, _, _, _ in
+                Task { @MainActor in CaptureRecordingWatcher.recordingFinished() }
+            },
+            notificationName as CFString,
+            nil,
+            .deliverImmediately
+        )
+    }
+
+    @MainActor
+    private static func recordingFinished() {
+        store?.collectIncoming()
+    }
 }

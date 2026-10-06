@@ -3,7 +3,7 @@ import Foundation
 import ReplayKit
 
 /// Broadcast Upload Extension: records the whole screen into the App Group "Recordings" folder, where
-/// the app picks the finished file up the next time it becomes active.
+/// the app picks the finished file up the next time it becomes active (or at once if it is open).
 ///
 /// Video is H.264 at the screen's native size, which plays everywhere (Windows included, without
 /// extra codecs). App audio and, when the microphone is switched on in the picker, the microphone are
@@ -21,6 +21,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var videoInput: AVAssetWriterInput?
     private var appAudioInput: AVAssetWriterInput?
     private var micAudioInput: AVAssetWriterInput?
+    /// Format of the first buffer each audio input encoded; buffers in another format are dropped.
+    private var appAudioFormat: AudioStreamBasicDescription?
+    private var micAudioFormat: AudioStreamBasicDescription?
     /// Set once the recording is stopping or has failed; later samples are ignored.
     private var isClosed = false
 
@@ -45,9 +48,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 if writer == nil, let message = startWriting(with: sampleBuffer) { return message }
                 append(sampleBuffer, to: videoInput)
             case .audioApp:
-                append(sampleBuffer, to: appAudioInput)
+                appendAudio(sampleBuffer, to: appAudioInput, format: &appAudioFormat)
             case .audioMic:
-                append(sampleBuffer, to: micAudioInput)
+                appendAudio(sampleBuffer, to: micAudioInput, format: &micAudioFormat)
             @unknown default:
                 break
             }
@@ -87,7 +90,16 @@ final class SampleHandler: RPBroadcastSampleHandler {
             return
         }
         let name = "录屏 \(Self.timestamp(started)).mp4"
-        try? fm.moveItem(at: source, to: fm.uniqueURL(for: name, in: destination))
+        if (try? fm.moveItem(at: source, to: fm.uniqueURL(for: name, in: destination))) != nil {
+            Self.notifyApp()
+        }
+    }
+
+    /// Lets FileBox, if it is open (the user stopped while in it), move the recording in right away.
+    /// The name must match `CaptureRecordingWatcher.notificationName` in the app.
+    private static func notifyApp() {
+        let name = CFNotificationName("io.github.quantumshwu.filebox.recording-finished" as CFString)
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), name, nil, nil, true)
     }
 
     // MARK: - Writing (on `queue`)
@@ -126,6 +138,25 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private func append(_ sampleBuffer: CMSampleBuffer, to input: AVAssetWriterInput?) {
         guard let input, input.isReadyForMoreMediaData else { return }
         input.append(sampleBuffer)
+    }
+
+    /// Appends audio only in the format the input started with. The microphone's format can change
+    /// mid-recording (headphones connected), and feeding the encoder another format would fail the
+    /// writer and lose the whole recording; losing that track's audio from then on is the lesser harm.
+    private func appendAudio(_ sampleBuffer: CMSampleBuffer, to input: AVAssetWriterInput?, format: inout AudioStreamBasicDescription?) {
+        guard let input, input.isReadyForMoreMediaData,
+              let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let incoming = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee
+        else { return }
+        if let expected = format, !Self.sameFormat(expected, incoming) { return }
+        format = incoming
+        input.append(sampleBuffer)
+    }
+
+    private static func sameFormat(_ a: AudioStreamBasicDescription, _ b: AudioStreamBasicDescription) -> Bool {
+        a.mSampleRate == b.mSampleRate && a.mFormatID == b.mFormatID && a.mFormatFlags == b.mFormatFlags
+            && a.mChannelsPerFrame == b.mChannelsPerFrame && a.mBitsPerChannel == b.mBitsPerChannel
+            && a.mBytesPerFrame == b.mBytesPerFrame
     }
 
     /// Gives up after a writer error, deletes the unusable file and returns the message to show.
