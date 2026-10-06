@@ -9,7 +9,9 @@ struct RootView: View {
     @EnvironmentObject private var tabs: TabCoordinator
 
     var body: some View {
-        Group {
+        // A ZStack, not a Group: modifiers on a Group attach to each branch, so locking would
+        // dismiss and re-present the viewer (and break a Picture in Picture that is starting).
+        ZStack {
             if lock.isUnlocked {
                 // Both tabs stay alive while switching, so the browser keeps its pages; locking
                 // removes the whole TabView and with it the private browsing session.

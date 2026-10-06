@@ -55,8 +55,10 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// so nothing left over from an earlier PiP session can keep it from starting.
     private var pictureInPictureNeedsRefresh = false
     private var possibleObservation: NSKeyValueObservation?
-    /// When the app resigned: a video played and PiP was ready to start by itself.
+    /// When the app resigned: a video played and PiP was set to start by itself.
     private var pictureInPictureExpected = false
+    /// Paging to an image paused a playing video; coming back to it plays on.
+    private var resumeOnReturn = false
 
     /// Index (in `sessionItems`) of the file in the player.
     @Published private(set) var currentIndex: Int?
@@ -110,8 +112,10 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         guard items.indices.contains(index) else { return }
         sessionItems = items
         if currentURL == items[index].url {
-            // Already in the player, e.g. the viewer reopened from PiP.
+            // Already in the player, e.g. the viewer reopened from PiP or paged back to it.
             if currentIndex != index { currentIndex = index }
+            if autoplay && resumeOnReturn && !isPictureInPictureEngaged { play() }
+            resumeOnReturn = false
             return
         }
         failuresInARow = 0
@@ -122,6 +126,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// The viewer moved away from the playing file (to an image). PiP keeps playing.
     func leavePlayablePage() {
         guard !isPictureInPictureActive, !isPictureInPictureStarting else { return }
+        resumeOnReturn = player.timeControlStatus != .paused
         player.pause()
     }
 
@@ -142,9 +147,11 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         guard AVPictureInPictureController.isPictureInPictureSupported(),
               playerViewController.viewIfLoaded?.window != nil,
               !isPictureInPictureActive, !isPictureInPictureStarting,
-              pictureInPicture == nil || pictureInPictureNeedsRefresh,
-              let controller = AVPictureInPictureController(playerLayer: playerViewController.playerLayer)
+              pictureInPicture == nil || pictureInPictureNeedsRefresh
         else { return }
+        // Never two controllers on one layer: the old one goes before the new one is made.
+        releasePictureInPictureController()
+        guard let controller = AVPictureInPictureController(playerLayer: playerViewController.playerLayer) else { return }
         controller.delegate = self
         controller.canStartPictureInPictureAutomaticallyFromInline = wantsAutomaticPictureInPicture
         possibleObservation = controller.observe(\.isPictureInPicturePossible, options: [.new]) { _, change in
@@ -156,6 +163,24 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         MediaDiagnostics.log("准备好视频小窗")
     }
 
+    /// Forgets the PiP controller (not while it floats or starts); the next time the picture is on
+    /// screen a fresh one is made. A long-lived one stops being eligible after its layer has left
+    /// the window and the audio session was switched off and on again.
+    private func releasePictureInPictureController() {
+        guard !isPictureInPictureActive, !isPictureInPictureStarting else { return }
+        pictureInPicture?.canStartPictureInPictureAutomaticallyFromInline = false
+        pictureInPicture?.delegate = nil
+        pictureInPicture = nil
+        possibleObservation = nil
+        pictureInPictureNeedsRefresh = true
+    }
+
+    /// The video surface moved to another page host (a new viewer).
+    func surfaceMoved() {
+        guard !isPictureInPictureActive, !isPictureInPictureStarting else { return }
+        pictureInPictureNeedsRefresh = true
+    }
+
     func play() {
         guard player.currentItem != nil else { return }
         MediaViewerHub.shared.activateAudioSession(for: .video)
@@ -163,13 +188,17 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     func pause() {
+        resumeOnReturn = false
         player.pause()
     }
 
     /// FileBox is back on screen while the video floats: it goes back into the viewer and keeps
     /// playing there, so there is never a floating window and a full one at the same time.
     func endPictureInPictureForReturn() {
-        guard let controller = pictureInPicture, controller.isPictureInPictureActive else { return }
+        // A restore the user tapped is already bringing it back.
+        guard !isRestoringFromPictureInPicture, pendingRestore == nil,
+              let controller = pictureInPicture, controller.isPictureInPictureActive
+        else { return }
         MediaDiagnostics.log("回到 App，收起视频小窗")
         isRestoringFromPictureInPicture = true
         controller.stopPictureInPicture()
@@ -193,8 +222,10 @@ final class MediaPlaybackController: NSObject, ObservableObject {
 
     /// Stops playback and forgets the folder.
     func stop() {
+        resumeOnReturn = false
         player.pause()
         player.replaceCurrentItem(with: nil)
+        releasePictureInPictureController()
         itemObservers.removeAll()
         sessionItems = []
         currentURL = nil
@@ -407,7 +438,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         wasPlayingWhenResigning = isPlaying
         let controller = pictureInPicture
         let possible = controller?.isPictureInPicturePossible ?? false
-        pictureInPictureExpected = isPlaying && wantsAutomaticPictureInPicture && possible
+        pictureInPictureExpected = isPlaying && wantsAutomaticPictureInPicture && controller != nil
         if isPlaying {
             holdsForBackground = true
             if wantsAutomaticPictureInPicture {
@@ -420,7 +451,9 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         guard player.currentItem != nil else { return }
         MediaDiagnostics.log(
             "离开 App：播放\(isPlaying ? "中" : "已停") 小窗\(possible ? "可开" : "不可开") "
-                + "自动\(wantsAutomaticPictureInPicture ? "开" : "关") 声音 \(MediaViewerHub.shared.audioDescription)"
+                + "自动\(wantsAutomaticPictureInPicture ? "开" : "关") 声音 \(MediaViewerHub.shared.audioDescription) "
+                + "画面\(playerViewController.viewIfLoaded?.window != nil ? "在屏幕上" : "不在屏幕上")"
+                + "\(playerViewController.player == nil ? " 未连接播放器" : "")"
         )
     }
 
@@ -450,6 +483,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     private func keepPlayingInBackgroundIfNeeded() {
         guard UIApplication.shared.applicationState == .background,
               !isPictureInPictureActive, !isPictureInPictureStarting,
+              pictureInPicture?.isPictureInPictureActive != true,
               player.currentItem != nil, !detachedForBackground
         else { return }
         playerViewController.player = nil
@@ -476,6 +510,9 @@ final class MediaPlaybackController: NSObject, ObservableObject {
             if wasPlayingBeforeInterruption, AVAudioSession.InterruptionOptions(rawValue: rawOptions).contains(.shouldResume) {
                 play()
             }
+            // The session was switched off and on: the PiP controller is made again.
+            surfaceMoved()
+            preparePictureInPicture()
             wasPlayingBeforeInterruption = false
         @unknown default:
             break

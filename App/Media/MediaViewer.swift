@@ -81,10 +81,12 @@ struct MediaViewer: View {
         .statusBarHidden(!chromeVisible)
         .persistentSystemOverlays(chromeVisible ? .automatic : .hidden)
         .onAppear {
+            MediaDiagnostics.log("打开查看页面")
             hub.viewerAppeared(token: token, items: items, coordinator: viewer)
             pageChanged(to: selection)
         }
         .onDisappear {
+            MediaDiagnostics.log("关闭查看页面")
             hub.viewerDisappeared(token: token)
         }
         .onChange(of: selection) { oldIndex, index in

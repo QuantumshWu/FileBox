@@ -49,6 +49,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     private var reportedPaused: Bool?
     private var reportedCount = 0
     private var observers: Set<AnyCancellable> = []
+    private var possibleCancellable: AnyCancellable?
     nonisolated private let snapshot = MediaPiPSnapshot()
 
     private override init() {
@@ -267,7 +268,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     /// Inline the content counts as playing, so that PiP may start automatically; in the window
     /// play / pause is the slideshow.
     private func updatePlaybackState() {
-        let paused = (isActive || isStarting) ? !isSlideshowRunning : false
+        let paused = (isActive || isStarting) ? !isSlideshowRunning : !onImagePage
         let count = max(1, sessionItems.count)
         guard paused != reportedPaused || count != reportedCount else { return }
         reportedPaused = paused
@@ -290,10 +291,9 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         )
         let pip = AVPictureInPictureController(contentSource: source)
         pip.delegate = self
-        pip.publisher(for: \.isPictureInPicturePossible, options: [.initial, .new])
+        possibleCancellable = pip.publisher(for: \.isPictureInPicturePossible, options: [.initial, .new])
             .receive(on: DispatchQueue.main)
             .sink { [weak self] possible in self?.possibleChanged(possible) }
-            .store(in: &observers)
         controller = pip
         return pip
     }
@@ -320,9 +320,27 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         if let controller, controller.canStartPictureInPictureAutomaticallyFromInline != armed {
             controller.canStartPictureInPictureAutomaticallyFromInline = armed
         }
+        if !armed && !floating {
+            // Off image pages there is only the video's PiP controller; this one is made again on
+            // the next image page.
+            releaseController()
+        }
         updatePlaybackState()
         setRefreshing(armed || floating)
         hub.setImageState(keepsAlive: (armed && isPossible) || floating, pictureInPicture: isActive)
+    }
+
+    private func releaseController() {
+        guard let controller else { return }
+        controller.canStartPictureInPictureAutomaticallyFromInline = false
+        controller.delegate = nil
+        self.controller = nil
+        possibleCancellable = nil
+        isPossible = false
+        if holdsAudio {
+            holdsAudio = false
+            MediaViewerHub.shared.releaseAudioSession(for: .image)
+        }
     }
 
     private func setRefreshing(_ on: Bool) {

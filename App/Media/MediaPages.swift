@@ -295,6 +295,7 @@ final class MediaPlayerHostController: UIViewController, UIGestureRecognizerDele
                 playerController.view.removeFromSuperview()
                 playerController.removeFromParent()
             }
+            MediaPlaybackController.shared.surfaceMoved()
             addChild(playerController)
             playerController.view.frame = view.bounds
             playerController.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]

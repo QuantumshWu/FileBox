@@ -47,7 +47,8 @@ final class MediaViewerHub: ObservableObject {
     private init() {
         let center = NotificationCenter.default
         center.publisher(for: UIApplication.didEnterBackgroundNotification)
-            .sink { [weak self] _ in self?.checkInBackground(after: 2) }
+            // After the video's own sound-only fallback (3 s) has decided.
+            .sink { [weak self] _ in self?.checkInBackground(after: 3.5) }
             .store(in: &appObservers)
         center.publisher(for: UIApplication.willEnterForegroundNotification)
             .sink { [weak self] _ in
