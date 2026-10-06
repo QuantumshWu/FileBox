@@ -79,6 +79,7 @@ struct VideoMergeView: View {
         }
         .interactiveDismissDisabled(model.isMerging)
         .task { await model.load() }
+        .onDisappear { model.leftScreen() }
         .alert("无法合并", isPresented: errorBinding) {
             Button("好", role: .cancel) {}
         } message: {
@@ -135,6 +136,9 @@ final class VideoEditMergeModel: ObservableObject {
     let destination: URL
 
     private var task: Task<Void, Never>?
+    /// False once the sheet has gone, e.g. because the app locked itself in the background while
+    /// the export kept running; results are then reported with a banner instead of an alert.
+    private var isOnScreen = false
 
     init(first: FileItem, second: FileItem) {
         order = [first, second]
@@ -145,7 +149,7 @@ final class VideoEditMergeModel: ObservableObject {
     var canMerge: Bool { !isMerging && loadedClips != nil }
 
     var outputName: String {
-        order.map { VideoEditExport.baseName(of: $0, limit: 60) }.joined(separator: " + ") + ".mov"
+        order.map { VideoEditExport.baseName(of: $0, maxBytes: 110) }.joined(separator: " + ") + ".mov"
     }
 
     var methodNote: String {
@@ -172,6 +176,7 @@ final class VideoEditMergeModel: ObservableObject {
     }
 
     func load() async {
+        isOnScreen = true
         for item in order where clips[item.url] == nil && failures[item.url] == nil {
             do {
                 let clip = try await VideoEditClip.load(item.url)
@@ -230,13 +235,23 @@ final class VideoEditMergeModel: ObservableObject {
                 task = nil
                 progress = nil
                 if Task.isCancelled { return }
-                errorMessage = VideoEditExport.message(for: error)
+                let message = VideoEditExport.message(for: error)
+                if isOnScreen {
+                    errorMessage = message
+                } else {
+                    store.show("视频合并没有完成：\(message)")
+                }
             }
         }
     }
 
     func cancel() {
         task?.cancel()
+    }
+
+    /// The sheet went away; a running export continues.
+    func leftScreen() {
+        isOnScreen = false
     }
 
     private func export(_ sources: [VideoEditClip], reencode: Bool, to url: URL) async throws {
@@ -256,11 +271,17 @@ final class VideoEditMergeModel: ObservableObject {
             throw VideoEditError.exportFailed
         }
         if reencode {
-            session.videoComposition = VideoEditMerger.videoComposition(for: sources, track: track)
+            session.videoComposition = VideoEditMerger.videoComposition(
+                for: sources,
+                in: composition,
+                track: track,
+                keepsHDR: preset == AVAssetExportPresetHEVCHighestQuality
+            )
         }
         progress = 0
         try await VideoEditExport.run(session, to: url) { [weak self] value in
-            self?.progress = value
+            guard let self, self.task != nil else { return }
+            self.progress = value
         }
     }
 }

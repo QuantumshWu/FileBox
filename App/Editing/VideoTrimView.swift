@@ -95,6 +95,7 @@ struct VideoTrimView: View {
                         .font(.title3)
                         .frame(width: 44, height: 44)
                 }
+                .accessibilityLabel(model.isPlaying ? "暂停" : "播放")
                 Text("\(VideoEditExport.timeText(model.current)) / \(VideoEditExport.timeText(model.duration))")
                     .font(.subheadline.monospacedDigit())
                     .foregroundStyle(.secondary)

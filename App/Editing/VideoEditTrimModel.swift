@@ -35,6 +35,10 @@ final class VideoEditTrimModel: ObservableObject {
     private var assetDuration = CMTime.zero
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
+    private var interruptionObserver: NSObjectProtocol?
+    /// False once the editor has gone, e.g. because the app locked itself in the background while
+    /// an export kept running; results are then reported with a banner instead of an alert.
+    private var isOnScreen = false
     private var isAdjusting = false
     private var isSeeking = false
     private var pendingSeek: Double?
@@ -53,6 +57,7 @@ final class VideoEditTrimModel: ObservableObject {
     // MARK: - Loading
 
     func load() async {
+        isOnScreen = true
         if let asset {
             attach(asset)
             if frames.contains(where: { $0 == nil }) { await loadFrames(from: asset) }
@@ -123,16 +128,31 @@ final class VideoEditTrimModel: ObservableObject {
                 self?.reachedEnd()
             }
         }
+        // A phone call or another app's audio pauses the player; keep the play button in step.
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            guard let raw, AVAudioSession.InterruptionType(rawValue: raw) == .began else { return }
+            MainActor.assumeIsolated {
+                self?.pause()
+            }
+        }
         if current > 0 { seek(to: current) }
     }
 
-    /// Pauses and releases the player when the editor goes away.
+    /// Pauses and releases the player when the editor goes away. A running export continues.
     func stop() {
+        isOnScreen = false
         pause()
         if let timeObserver { player.removeTimeObserver(timeObserver) }
         timeObserver = nil
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         endObserver = nil
+        if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
+        interruptionObserver = nil
         player.replaceCurrentItem(with: nil)
     }
 
@@ -263,10 +283,11 @@ final class VideoEditTrimModel: ObservableObject {
                 let url = try VideoEditExport.makeTemporaryURL()
                 output = url
                 try await VideoEditExport.run(session, to: url) { [weak self] value in
-                    self?.exportProgress = value
+                    guard let self, self.exportTask != nil else { return }
+                    self.exportProgress = value
                 }
                 try Task.checkCancellation()
-                let name = VideoEditExport.baseName(of: source, limit: 100) + " 剪辑.mov"
+                let name = VideoEditExport.baseName(of: source, maxBytes: 200) + " 剪辑.mov"
                 let folder = source.url.deletingLastPathComponent()
                 guard let saved = store.add(fileAt: url, named: name, into: folder, moving: true) else {
                     throw VideoEditError.saveFailed
@@ -282,10 +303,16 @@ final class VideoEditTrimModel: ObservableObject {
                 exportProgress = nil
                 if Task.isCancelled { return }
                 var message = VideoEditExport.message(for: error)
-                if !precise, VideoEditExport.shouldRetryWithReencode(error) {
+                // The "unsupported" message already says to use 精确.
+                let alreadySaid = (error as? VideoEditError) == .passthroughUnsupported
+                if !precise, !alreadySaid, VideoEditExport.shouldRetryWithReencode(error) {
                     message += "\n可以改用「精确」模式再试一次。"
                 }
-                errorMessage = message
+                if isOnScreen {
+                    errorMessage = message
+                } else {
+                    store.show("「\(source.name)」的剪辑没有保存：\(message)")
+                }
             }
         }
     }

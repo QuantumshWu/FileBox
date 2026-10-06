@@ -16,6 +16,8 @@ struct VideoEditClip {
     let frameRate: Float
     /// "h264", "hevc", or the raw codec code for anything else.
     let codecFamily: String
+    /// `AVVideoTransferFunction_ITU_R_2100_HLG` or `..._SMPTE_ST_2084_PQ` for HDR video, nil for SDR.
+    let hdrTransferFunction: String?
 
     /// Picture size as displayed, after rotation.
     var orientedSize: CGSize {
@@ -49,8 +51,22 @@ struct VideoEditClip {
             naturalSize: size,
             transform: transform,
             frameRate: rate,
-            codecFamily: formats.first.map { Self.family(of: $0) } ?? "?"
+            codecFamily: formats.first.map { Self.family(of: $0) } ?? "?",
+            hdrTransferFunction: formats.first.flatMap { Self.hdrTransferFunction(of: $0) }
         )
+    }
+
+    private static func hdrTransferFunction(of format: CMFormatDescription) -> String? {
+        guard let value = CMFormatDescriptionGetExtension(
+            format, extensionKey: kCMFormatDescriptionExtension_TransferFunction
+        ) as? String else { return nil }
+        if value == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String) {
+            return AVVideoTransferFunction_ITU_R_2100_HLG
+        }
+        if value == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String) {
+            return AVVideoTransferFunction_SMPTE_ST_2084_PQ
+        }
+        return nil
     }
 
     private static func family(of format: CMFormatDescription) -> String {
@@ -110,9 +126,13 @@ enum VideoEditMerger {
 
     /// Re-encoding instructions: every clip is turned upright and aspect-fit (letterboxed) into the
     /// first clip's picture size, at the highest frame rate of the clips (at most 60 fps).
+    /// With `keepsHDR` (an HEVC export) the result stays HDR when a clip is HDR; otherwise the
+    /// compositor renders SDR and tone-maps HDR clips.
     static func videoComposition(
         for clips: [VideoEditClip],
-        track: AVMutableCompositionTrack
+        in composition: AVMutableComposition,
+        track: AVMutableCompositionTrack,
+        keepsHDR: Bool
     ) -> AVMutableVideoComposition {
         let firstSize = clips.first?.orientedSize ?? CGSize(width: 1920, height: 1080)
         let renderSize = CGSize(
@@ -137,7 +157,17 @@ enum VideoEditMerger {
             instructions.append(instruction)
             cursor = cursor + clip.duration
         }
+        // The instructions must cover the composition exactly, without a gap or overhang at the end.
+        let total = composition.duration
+        if let last = instructions.last, total.isNumeric, total > last.timeRange.start {
+            last.timeRange = CMTimeRange(start: last.timeRange.start, end: total)
+        }
         videoComposition.instructions = instructions
+        if keepsHDR, let transfer = clips.compactMap(\.hdrTransferFunction).first {
+            videoComposition.colorPrimaries = AVVideoColorPrimaries_ITU_R_2020
+            videoComposition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_2020
+            videoComposition.colorTransferFunction = transfer
+        }
         return videoComposition
     }
 

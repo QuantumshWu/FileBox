@@ -3,7 +3,7 @@ import SwiftUI
 import UIKit
 
 /// Why a video edit could not be finished, worded for the user.
-enum VideoEditError: LocalizedError {
+enum VideoEditError: LocalizedError, Equatable {
     case unplayable
     case noVideoTrack
     case unreadableDuration
@@ -127,13 +127,19 @@ enum VideoEditExport {
         if #available(iOS 18.0, *) {
             let monitor = Task { @MainActor in
                 for await state in session.states(updateInterval: 0.1) {
+                    // A value buffered before the export ended must not bring the progress back.
+                    if Task.isCancelled { break }
                     if case .exporting(let current) = state {
                         progress(current.fractionCompleted)
                     }
                 }
             }
             defer { monitor.cancel() }
-            try await session.export(to: url, as: .mov)
+            try await withTaskCancellationHandler {
+                try await session.export(to: url, as: .mov)
+            } onCancel: {
+                session.cancelExport()
+            }
         } else {
             session.outputURL = url
             session.outputFileType = .mov
@@ -202,12 +208,13 @@ enum VideoEditExport {
         return "无法读取这个视频：\(error.localizedDescription)"
     }
 
-    /// File name without its extension, shortened so combined names stay within file-system limits.
-    static func baseName(of item: FileItem, limit: Int) -> String {
+    /// File name without its extension, cut to at most `maxBytes` of UTF-8 so names built from it
+    /// stay within the file system's 255-byte limit (a Chinese character takes 3 bytes).
+    static func baseName(of item: FileItem, maxBytes: Int) -> String {
         var base = sanitizedFileName((item.name as NSString).deletingPathExtension)
-        if base.isEmpty { base = "视频" }
-        if base.count > limit { base = String(base.prefix(limit)) }
-        return base
+        while base.utf8.count > maxBytes { base.removeLast() }
+        base = base.trimmingCharacters(in: .whitespaces)
+        return base.isEmpty ? "视频" : base
     }
 
     /// "1:05.3" (or "1:02:05.3"); without tenths for durations in lists.
