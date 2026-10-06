@@ -41,6 +41,7 @@ targets:
         # List FileBox under "Open in / Copy to" for any file, even without the share extension.
         CFBundleDocumentTypes:
           - CFBundleTypeName: Any File
+            CFBundleTypeRole: Viewer
             LSHandlerRank: Alternate
             LSItemContentTypes: [public.data, public.content]
         # The share sheet's "Save Image / Save Video" crashes the app without this key.

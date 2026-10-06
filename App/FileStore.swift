@@ -182,8 +182,13 @@ final class FileStore: ObservableObject {
     private func drain(_ folder: URL) -> Int {
         guard let urls = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else { return 0 }
         var count = 0
-        // Skip only files the share extension is still writing.
-        for url in urls where !url.lastPathComponent.hasPrefix(".partial-") {
+        for url in urls {
+            // Files the share extension is still writing; delete leftovers from a killed extension.
+            if url.lastPathComponent.hasPrefix(".partial-") {
+                let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                if let modified, modified < Date().addingTimeInterval(-3600) { try? fm.removeItem(at: url) }
+                continue
+            }
             let dest = fm.uniqueURL(for: safeName(url.lastPathComponent), in: receivedURL)
             do {
                 try fm.moveItem(at: url, to: dest)

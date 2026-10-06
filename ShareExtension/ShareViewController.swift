@@ -97,10 +97,19 @@ enum IncomingSaver {
         let types = provider.registeredTypeIdentifiers
         let suggestedName = provider.suggestedName
 
-        // 1. Real file content: photos, videos, PDFs, documents...
-        if let type = types.first(where: isBinaryFileType) {
-            try await copyFileRepresentation(provider, type: type, suggestedName: suggestedName, into: folder)
-            return
+        // 1. Real file content: photos, videos, PDFs, documents... Some items (Live Photos, private
+        //    types) offer several representations and not all of them load, so try each in turn,
+        //    preferring types that have a file extension.
+        let binary = types.filter(isBinaryFileType)
+        let ordered = binary.filter { UTType($0)?.preferredFilenameExtension != nil }
+            + binary.filter { UTType($0)?.preferredFilenameExtension == nil }
+        for type in ordered {
+            do {
+                try await copyFileRepresentation(provider, type: type, suggestedName: suggestedName, into: folder)
+                return
+            } catch {
+                continue
+            }
         }
         // 2. Some apps hand over a URL pointing at the file instead.
         if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
