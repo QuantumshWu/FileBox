@@ -6,15 +6,28 @@ struct RootView: View {
     @EnvironmentObject private var lock: LockManager
     @EnvironmentObject private var viewer: ViewerCoordinator
     @EnvironmentObject private var playback: PlaybackState
+    @EnvironmentObject private var tabs: TabCoordinator
 
     var body: some View {
         Group {
             if lock.isUnlocked {
-                NavigationStack {
-                    FolderView(folder: store.rootURL)
-                        .navigationDestination(for: Route.self) { route in
-                            destination(route)
-                        }
+                // Both tabs stay alive while switching, so the browser keeps its pages; locking
+                // removes the whole TabView and with it the private browsing session.
+                TabView(selection: $tabs.selected) {
+                    NavigationStack {
+                        FolderView(folder: store.rootURL)
+                            .navigationDestination(for: Route.self) { route in
+                                destination(route)
+                            }
+                    }
+                    .tabItem { Label("文件", systemImage: "folder") }
+                    .tag(MainTab.files)
+
+                    NavigationStack {
+                        BrowserView()
+                    }
+                    .tabItem { Label("浏览器", systemImage: "globe") }
+                    .tag(MainTab.browser)
                 }
             } else {
                 DecoyView()
@@ -28,7 +41,7 @@ struct RootView: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
                     .background(.thinMaterial, in: Capsule())
-                    .padding(.bottom, 24)
+                    .padding(.bottom, 96)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
@@ -39,6 +52,7 @@ struct RootView: View {
                 .environmentObject(lock)
                 .environmentObject(viewer)
                 .environmentObject(playback)
+                .environmentObject(tabs)
         }
     }
 

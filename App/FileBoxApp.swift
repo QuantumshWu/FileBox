@@ -5,6 +5,7 @@ struct FileBoxApp: App {
     @StateObject private var store = FileStore()
     @StateObject private var lock = LockManager()
     @StateObject private var viewer = ViewerCoordinator()
+    @StateObject private var tabs = TabCoordinator()
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -13,6 +14,7 @@ struct FileBoxApp: App {
                 .environmentObject(store)
                 .environmentObject(lock)
                 .environmentObject(viewer)
+                .environmentObject(tabs)
                 .environmentObject(PlaybackState.shared)
                 .onOpenURL { url in
                     Task { await store.importIncoming(url) }
@@ -29,6 +31,7 @@ struct FileBoxApp: App {
             case .background:
                 PrivacyShield.shared.show()
                 lock.lock()
+                tabs.selected = .files
                 if !PlaybackState.shared.keepsViewerInBackground {
                     viewer.close()
                 }

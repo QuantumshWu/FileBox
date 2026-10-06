@@ -9,6 +9,18 @@ enum Route: Hashable {
     case settings
 }
 
+/// The two tabs shown while unlocked. Both keep their state when switching; everything is torn
+/// down when the app locks.
+enum MainTab: Hashable {
+    case files
+    case browser
+}
+
+@MainActor
+final class TabCoordinator: ObservableObject {
+    @Published var selected: MainTab = .files
+}
+
 struct ViewerRequest: Identifiable {
     let id = UUID()
     /// The media files (images, videos, audio) of one folder, in display order.
