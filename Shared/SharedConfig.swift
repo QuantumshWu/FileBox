@@ -99,9 +99,12 @@ extension FileManager {
     }
 }
 
-/// Makes a user- or app-supplied name safe to use as a single path component.
+/// Makes a user- or app-supplied name safe to use as a single, visible path component.
 func sanitizedFileName(_ raw: String) -> String {
-    raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    var name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         .replacingOccurrences(of: "/", with: "-")
         .replacingOccurrences(of: ":", with: "-")
+    // A leading dot would make the file hidden, and the app lists only visible files.
+    while name.hasPrefix(".") { name.removeFirst() }
+    return name.trimmingCharacters(in: .whitespaces)
 }

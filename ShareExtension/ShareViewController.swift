@@ -13,6 +13,8 @@ final class ShareViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
+        // Don't let a swipe dismiss the sheet halfway through a copy.
+        isModalInPresentation = true
 
         card.backgroundColor = .secondarySystemBackground
         card.layer.cornerRadius = 16
@@ -105,7 +107,8 @@ enum IncomingSaver {
             let url = try await loadURL(provider, type: UTType.fileURL.identifier)
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            try place(url, named: fileName(suggestedName, fallback: url.lastPathComponent, ext: nil), in: folder)
+            let ext = url.pathExtension.isEmpty ? nil : url.pathExtension
+            try place(url, named: fileName(suggestedName, fallback: url.lastPathComponent, ext: ext), in: folder)
             return
         }
         // 3. A web link: keep it as a small text file.
@@ -114,10 +117,9 @@ enum IncomingSaver {
             try placeText(url.absoluteString, named: "\(url.host ?? "链接").txt", in: folder)
             return
         }
-        // 4. Plain text.
+        // 4. Text: either a text *file* (.txt, .csv, .json, .vcf...) or a plain string.
         if let type = types.first(where: { UTType($0)?.conforms(to: .text) == true }) {
-            let text = try await loadText(provider, type: type)
-            try placeText(text, named: fileName(suggestedName, fallback: "文本.txt", ext: "txt"), in: folder)
+            try await saveText(provider, type: type, suggestedName: suggestedName, into: folder)
             return
         }
         throw CocoaError(.fileReadUnknown)
@@ -163,26 +165,50 @@ enum IncomingSaver {
         }
     }
 
-    private static func loadText(_ provider: NSItemProvider, type: String) async throws -> String {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+    /// Text files arrive as file URLs and are copied byte for byte (so GBK etc. survive);
+    /// only a bare string becomes a new 文本.txt.
+    private static func saveText(_ provider: NSItemProvider, type: String, suggestedName: String?, into folder: URL) async throws {
+        let ext = UTType(type)?.preferredFilenameExtension ?? "txt"
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             provider.loadItem(forTypeIdentifier: type, options: nil) { item, error in
-                if let string = item as? String {
-                    continuation.resume(returning: string)
-                } else if let data = item as? Data, let string = String(data: data, encoding: .utf8) {
-                    continuation.resume(returning: string)
-                } else {
-                    continuation.resume(throwing: error ?? CocoaError(.fileReadUnknown))
+                do {
+                    if let url = item as? URL, url.isFileURL {
+                        let scoped = url.startAccessingSecurityScopedResource()
+                        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                        try place(url, named: fileName(suggestedName, fallback: url.lastPathComponent, ext: ext), in: folder)
+                    } else if let data = item as? Data {
+                        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                        try data.write(to: temp)
+                        defer { try? FileManager.default.removeItem(at: temp) }
+                        try place(temp, named: fileName(suggestedName, fallback: "文本.\(ext)", ext: ext), in: folder)
+                    } else if let string = item as? String {
+                        try placeText(string, named: fileName(suggestedName, fallback: "文本.txt", ext: "txt"), in: folder)
+                    } else if let attributed = item as? NSAttributedString {
+                        try placeText(attributed.string, named: fileName(suggestedName, fallback: "文本.txt", ext: "txt"), in: folder)
+                    } else {
+                        throw error ?? CocoaError(.fileReadUnknown)
+                    }
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
                 }
             }
         }
     }
 
     private static func fileName(_ suggested: String?, fallback: String, ext: String?) -> String {
+        // Data-backed items get a temporary name like ".com.apple.Foundation.NSItemProvider.ab12.png".
+        let usableFallback = fallback.contains("NSItemProvider") ? "文件" : fallback
         var name = sanitizedFileName(suggested ?? "")
-        if name.isEmpty { name = sanitizedFileName(fallback) }
+        if name.isEmpty { name = sanitizedFileName(usableFallback) }
         if name.isEmpty { name = "文件" }
-        if let ext, (name as NSString).pathExtension.isEmpty {
-            name += ".\(ext)"
+        // Names like "Report v1.2" have a dot but no real extension; add the type's one.
+        if let ext, !ext.isEmpty {
+            let current = (name as NSString).pathExtension
+            let known = !current.isEmpty && UTType(filenameExtension: current)?.isDeclared == true
+            if !known && current.lowercased() != ext.lowercased() {
+                name += ".\(ext)"
+            }
         }
         return name
     }

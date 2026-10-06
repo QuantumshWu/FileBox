@@ -9,10 +9,15 @@ struct FileBoxApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(store)
-                .onOpenURL { url in store.importIncoming(url) }
+                .onOpenURL { url in
+                    Task { await store.importIncoming(url) }
+                }
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { store.collectIncoming() }
+            if phase == .active {
+                store.collectIncoming()
+                store.refresh()
+            }
         }
     }
 }

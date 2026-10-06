@@ -53,16 +53,16 @@ struct FolderView: View {
         }
         .listStyle(.plain)
         .overlay {
-            if items.isEmpty {
+            if importingPhotos {
+                ProgressView("正在导入…")
+                    .padding()
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            } else if items.isEmpty {
                 ContentUnavailableView(
                     "这里还没有文件",
                     systemImage: "tray",
                     description: Text("在其他 App 里点「分享」→ FileBox，\n或者点右上角的 + 导入")
                 )
-            } else if importingPhotos {
-                ProgressView("正在导入…")
-                    .padding()
-                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
             }
         }
         .navigationTitle(title)
@@ -90,7 +90,7 @@ struct FolderView: View {
         }
         .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.item], allowsMultipleSelection: true) { result in
             if case .success(let urls) = result {
-                store.importFiles(urls, into: folder)
+                Task { await store.importFiles(urls, into: folder) }
             }
         }
         .photosPicker(
@@ -185,7 +185,7 @@ struct FolderView: View {
                 urls.append(file.url)
             }
         }
-        store.importFiles(urls, into: folder, moving: true)
+        await store.importFiles(urls, into: folder, moving: true)
         importingPhotos = false
     }
 }
