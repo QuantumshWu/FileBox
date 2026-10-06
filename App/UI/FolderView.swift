@@ -114,6 +114,7 @@ struct FolderView: View {
         .onChange(of: sort) { reload() }
     }
 
+    /// Import progress, or an empty state that lets touches through so pull-to-refresh still works.
     @ViewBuilder
     private var overlayContent: some View {
         if let progress {
@@ -126,8 +127,10 @@ struct FolderView: View {
                 systemImage: "tray",
                 description: Text("在其他 App 里点「分享」→ FileBox，\n或者点右上角的 + 导入")
             )
+            .allowsHitTesting(false)
         } else if !query.isEmpty && visibleItems.isEmpty {
             ContentUnavailableView.search(text: query)
+                .allowsHitTesting(false)
         }
     }
 
