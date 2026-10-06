@@ -2,24 +2,25 @@ import SwiftUI
 import UIKit
 import WebKit
 
-/// Private (non-persistent) web browser that saves downloads into the vault.
+/// Private (non-persistent) web browser that saves downloads into the vault. It is the root of the
+/// 浏览器 tab: pages and downloads stay while the 文件 tab is shown, and the session ends when the
+/// app locks. All controls sit in the top bar, so the tab bar is the only bar at the bottom.
 struct BrowserView: View {
     @EnvironmentObject private var store: FileStore
-    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var lock: LockManager
     @StateObject private var model = BrowserModel()
 
     @State private var address = ""
     @FocusState private var addressFocused: Bool
     @State private var sheet: BrowserSheet?
     @State private var collectingMedia = false
-    @State private var confirmLeave = false
     @State private var promptText = ""
 
     init() {}
 
     var body: some View {
         VStack(spacing: 0) {
-            addressBar
+            topBar
             progressLine
             Divider()
             BrowserWebContainer(webView: model.webView)
@@ -29,11 +30,7 @@ struct BrowserView: View {
                     }
                 }
         }
-        // A custom back button instead of the system one: the edge swipe then goes back in the page
-        // history, and leaving can warn about running downloads.
         .toolbar(.hidden, for: .navigationBar)
-        .navigationBarBackButtonHidden(true)
-        .toolbar { bottomBar }
         .sheet(item: $sheet) { content in
             switch content {
             case .downloads:
@@ -44,12 +41,6 @@ struct BrowserView: View {
                     sheet = .downloads
                 }
             }
-        }
-        .confirmationDialog("下载还没完成", isPresented: $confirmLeave, titleVisibility: .visible) {
-            Button("停止下载并离开", role: .destructive) { dismiss() }
-            Button("继续下载", role: .cancel) {}
-        } message: {
-            Text("离开浏览器会停止没下载完的文件。")
         }
         .alert(model.dialog?.host ?? "", isPresented: dialogShown, presenting: model.dialog) { dialog in
             switch dialog.kind {
@@ -66,8 +57,12 @@ struct BrowserView: View {
         } message: { dialog in
             Text(dialog.message)
         }
-        .onAppear { model.attach(store) }
-        .onDisappear { model.shutdown() }
+        // Switching tabs calls these; the session itself only ends when the app locks.
+        .onAppear {
+            model.attach(store, lock: lock)
+            model.isOnScreen = true
+        }
+        .onDisappear { model.isOnScreen = false }
         .onChange(of: model.url) { _, _ in
             if !addressFocused { address = displayAddress }
         }
@@ -83,55 +78,75 @@ struct BrowserView: View {
         }
     }
 
-    // MARK: - Address bar
+    // MARK: - Top bar
 
-    private var addressBar: some View {
-        HStack(spacing: 10) {
+    /// Back and forward, the address field, then 本页媒体, downloads and the page menu. While typing
+    /// only the field and 取消 remain.
+    private var topBar: some View {
+        HStack(spacing: 6) {
             if !addressFocused {
-                Button(action: leave) {
-                    Image(systemName: "chevron.backward")
-                        .font(.title3.weight(.semibold))
-                }
-                .accessibilityLabel("返回")
-            }
-            HStack(spacing: 6) {
-                Image(systemName: model.url?.scheme == "https" ? "lock.fill" : "magnifyingglass")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                TextField("搜索或输入网址", text: $address)
-                    .focused($addressFocused)
-                    .keyboardType(.webSearch)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .submitLabel(.go)
-                    .onSubmit(go)
-                if addressFocused {
-                    if !address.isEmpty {
-                        Button { address = "" } label: {
-                            Image(systemName: "xmark.circle.fill")
-                        }
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("清除")
+                HStack(spacing: 0) {
+                    Button { model.webView.goBack() } label: {
+                        BrowserBarIcon(title: "后退", systemImage: "chevron.backward")
                     }
-                } else if model.url != nil {
-                    Button { model.reloadOrStop() } label: {
-                        Image(systemName: model.isLoading ? "xmark" : "arrow.clockwise")
+                    .disabled(!model.canGoBack)
+                    Button { model.webView.goForward() } label: {
+                        BrowserBarIcon(title: "前进", systemImage: "chevron.forward")
                     }
-                    .foregroundStyle(.primary)
-                    .accessibilityLabel(model.isLoading ? "停止" : "重新载入")
+                    .disabled(!model.canGoForward)
                 }
             }
-            .padding(.horizontal, 10)
-            .frame(height: 38)
-            .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10))
+            addressField
             if addressFocused {
                 Button("取消") { addressFocused = false }
+            } else {
+                HStack(spacing: 0) {
+                    Button(action: showMedia) {
+                        BrowserBarIcon(title: "本页媒体", systemImage: "photo.on.rectangle.angled")
+                    }
+                    .disabled(model.url == nil || collectingMedia)
+                    BrowserDownloadsButton(downloads: model.downloads) { sheet = .downloads }
+                    pageMenu
+                }
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .background(.bar)
         .animation(.default, value: addressFocused)
+    }
+
+    private var addressField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: model.url?.scheme == "https" ? "lock.fill" : "magnifyingglass")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            TextField("搜索或输入网址", text: $address)
+                .focused($addressFocused)
+                .keyboardType(.webSearch)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.go)
+                .onSubmit(go)
+            if addressFocused {
+                if !address.isEmpty {
+                    Button { address = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("清除")
+                }
+            } else if model.url != nil {
+                Button { model.reloadOrStop() } label: {
+                    Image(systemName: model.isLoading ? "xmark" : "arrow.clockwise")
+                }
+                .foregroundStyle(.primary)
+                .accessibilityLabel(model.isLoading ? "停止" : "重新载入")
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 38)
+        .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10))
     }
 
     private var progressLine: some View {
@@ -145,46 +160,21 @@ struct BrowserView: View {
         .animation(.easeOut(duration: 0.2), value: model.progress)
     }
 
-    /// The host while browsing (like Safari); the full address appears when editing.
+    /// The host without "www." while browsing (like Safari); the full address appears when editing.
     private var displayAddress: String {
         guard let url = model.url else { return "" }
-        return url.host ?? url.absoluteString
+        guard let host = url.host else { return url.absoluteString }
+        return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
     }
 
     private var startPage: some View {
         ContentUnavailableView {
             Label("无痕浏览", systemImage: "eye.slash")
         } description: {
-            Text("在上方输入网址，或输入文字用必应搜索。\n离开浏览器后，浏览记录、Cookie 和网站数据都会清除；下载的文件保存在「下载」文件夹。")
+            Text("在上方输入网址，或输入文字用必应搜索。\n切换到「文件」时网页和下载都会保留；FileBox 切到后台（自动锁定）时，浏览记录、Cookie 和网站数据都会清除。下载的文件保存在「下载」文件夹。")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(uiColor: .systemBackground))
-    }
-
-    // MARK: - Toolbar
-
-    @ToolbarContentBuilder
-    private var bottomBar: some ToolbarContent {
-        ToolbarItemGroup(placement: .bottomBar) {
-            Button { model.webView.goBack() } label: {
-                Label("后退", systemImage: "chevron.left")
-            }
-            .disabled(!model.canGoBack)
-            Spacer()
-            Button { model.webView.goForward() } label: {
-                Label("前进", systemImage: "chevron.right")
-            }
-            .disabled(!model.canGoForward)
-            Spacer()
-            Button(action: showMedia) {
-                Label("本页媒体", systemImage: "photo.on.rectangle.angled")
-            }
-            .disabled(model.url == nil || collectingMedia)
-            Spacer()
-            pageMenu
-            Spacer()
-            BrowserDownloadsButton(downloads: model.downloads) { sheet = .downloads }
-        }
     }
 
     private var pageMenu: some View {
@@ -204,7 +194,7 @@ struct BrowserView: View {
                 }
             }
         } label: {
-            Label("分享", systemImage: "square.and.arrow.up")
+            BrowserBarIcon(title: "更多", systemImage: "ellipsis.circle")
         }
         .disabled(model.url == nil)
     }
@@ -214,14 +204,6 @@ struct BrowserView: View {
     private func go() {
         model.open(address)
         addressFocused = false
-    }
-
-    private func leave() {
-        if model.downloads.activeCount > 0 {
-            confirmLeave = true
-        } else {
-            dismiss()
-        }
     }
 
     private func showMedia() {
@@ -252,80 +234,33 @@ private enum BrowserSheet: Identifiable {
     }
 }
 
-/// Hosts the model's web view, which outlives SwiftUI view updates.
+/// Hosts the model's web view, which outlives SwiftUI view updates and tab switches. It stays inside
+/// the safe area, so pages end above the tab bar instead of underneath it.
 private struct BrowserWebContainer: UIViewRepresentable {
     let webView: WKWebView
 
-    func makeUIView(context: Context) -> BrowserWebHost {
-        BrowserWebHost(webView: webView)
+    func makeUIView(context: Context) -> UIView {
+        let host = UIView()
+        webView.frame = host.bounds
+        webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        host.addSubview(webView)
+        return host
     }
 
-    func updateUIView(_ uiView: BrowserWebHost, context: Context) {}
+    func updateUIView(_ uiView: UIView, context: Context) {}
 }
 
-/// Holds the web view and, while on screen, turns off the navigation controller's swipe-back
-/// gestures, so a swipe goes back in the page history instead of closing the browser (and with it
-/// the private session).
-private final class BrowserWebHost: UIView {
-    /// The gestures turned off here and whether each was enabled before.
-    private var paused: [(gesture: UIGestureRecognizer, wasEnabled: Bool)] = []
+/// An icon of the top bar with a comfortable tap area; the title is read by VoiceOver.
+private struct BrowserBarIcon: View {
+    let title: String
+    let systemImage: String
 
-    init(webView: WKWebView) {
-        super.init(frame: .zero)
-        webView.frame = bounds
-        webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        addSubview(webView)
-    }
-
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        if window == nil {
-            restoreGestures()
-        } else if paused.isEmpty {
-            pauseGestures()
-        }
-    }
-
-    /// Tries again if the navigation controller was not reachable yet when the view joined the window.
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        if window != nil && paused.isEmpty {
-            pauseGestures()
-        }
-    }
-
-    private func pauseGestures() {
-        guard let navigation = enclosingNavigationController() else { return }
-        var candidates: [UIGestureRecognizer?] = [navigation.interactivePopGestureRecognizer]
-        if #available(iOS 26.0, *) {
-            // Swiping anywhere on the content pops since iOS 26.
-            candidates.append(navigation.interactiveContentPopGestureRecognizer)
-        }
-        let gestures = candidates.compactMap { $0 }
-        paused = gestures.map { (gesture: $0, wasEnabled: $0.isEnabled) }
-        gestures.forEach { $0.isEnabled = false }
-    }
-
-    private func restoreGestures() {
-        for entry in paused {
-            entry.gesture.isEnabled = entry.wasEnabled
-        }
-        paused = []
-    }
-
-    private func enclosingNavigationController() -> UINavigationController? {
-        var responder: UIResponder? = self
-        while let current = responder {
-            if let controller = current as? UIViewController {
-                return controller.navigationController ?? (controller as? UINavigationController)
-            }
-            responder = current.next
-        }
-        return nil
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .labelStyle(.iconOnly)
+            .font(.title3)
+            .frame(width: 32, height: 38)
+            .contentShape(Rectangle())
     }
 }
 
@@ -335,7 +270,7 @@ private struct BrowserDownloadsButton: View {
 
     var body: some View {
         Button(action: action) {
-            Label("下载", systemImage: downloads.activeCount > 0 ? "arrow.down.circle.fill" : "arrow.down.circle")
+            BrowserBarIcon(title: "下载", systemImage: downloads.activeCount > 0 ? "arrow.down.circle.fill" : "arrow.down.circle")
                 .symbolEffect(.pulse, isActive: downloads.activeCount > 0)
         }
     }

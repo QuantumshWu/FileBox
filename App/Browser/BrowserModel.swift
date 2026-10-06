@@ -18,7 +18,8 @@ struct BrowserDialog: Identifiable {
 }
 
 /// State and WebKit delegates of the private browser. It has one web view in a non-persistent data
-/// store, so cookies, history and caches disappear together with it.
+/// store, so cookies, history and caches disappear together with it. It lives as long as the 浏览器
+/// tab, so switching tabs keeps pages and downloads; the session ends when the app locks.
 @MainActor
 final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
     let webView: WKWebView
@@ -32,12 +33,17 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     @Published private(set) var title: String?
     @Published private(set) var dialog: BrowserDialog?
 
+    /// Whether the 浏览器 tab is showing. A dialog cannot be shown in a hidden tab, so JavaScript
+    /// dialogs of a hidden page are answered right away instead of blocking it.
+    var isOnScreen = false
+
     private weak var store: FileStore?
     private let dataStore: WKWebsiteDataStore
+    private var lockObserver: AnyCancellable?
     private var userAgent: String?
     private var dialogReply: ((Bool, String?) -> Void)?
     private var lastCrashReload: Date?
-    /// Set when the browser closes. WebKit raises an exception if a dialog's completion handler is
+    /// Set when the session ends. WebKit raises an exception if a dialog's completion handler is
     /// dropped unanswered, so dialogs that still arrive are answered right away.
     private var isClosed = false
     /// Hosts whose blocked plain-HTTP address was already retried over HTTPS.
@@ -78,21 +84,50 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         webView.publisher(for: \.title).assign(to: &$title)
     }
 
-    func attach(_ store: FileStore) {
+    /// Connects the model to the app. It shuts down the moment the app locks, before SwiftUI removes
+    /// the tabs, so nothing private keeps running even if the model lingers for a while.
+    func attach(_ store: FileStore, lock: LockManager) {
         self.store = store
         downloads.store = store
-        isClosed = false
+        guard lockObserver == nil, !isClosed else { return }
+        lockObserver = lock.$isUnlocked.sink { [weak self] unlocked in
+            if !unlocked { self?.shutdown() }
+        }
     }
 
-    /// Stops everything when the browser closes, which also happens when the app locks itself.
-    /// Full-screen web video and Picture in Picture close too, so nothing stays on screen.
+    /// Ends the private session for good: downloads stop, full-screen web video and Picture in
+    /// Picture close, the page is unloaded and the session's cookies and caches are deleted.
     func shutdown() {
+        guard !isClosed else { return }
         isClosed = true
+        lockObserver = nil
         answerDialog(false)
+        Self.close(webView, downloads)
+    }
+
+    /// Covers the model going away without the app locking first; WebKit is main-thread only.
+    deinit {
+        let webView = self.webView
+        let downloads = self.downloads
+        Task { @MainActor in
+            BrowserModel.close(webView, downloads)
+        }
+    }
+
+    private static func close(_ webView: WKWebView, _ downloads: BrowserDownloadManager) {
         downloads.cancelAll()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
         webView.stopLoading()
         webView.pauseAllMediaPlayback(completionHandler: nil)
         webView.closeAllMediaPresentations(completionHandler: nil)
+        if let blank = URL(string: "about:blank") {
+            webView.load(URLRequest(url: blank))
+        }
+        webView.configuration.websiteDataStore.removeData(
+            ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+            modifiedSince: .distantPast
+        ) {}
     }
 
     // MARK: - Navigation
@@ -306,7 +341,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     // MARK: - Helpers
 
     private func ask(_ dialog: BrowserDialog, reply: @escaping (Bool, String?) -> Void) {
-        guard !isClosed, dialogReply == nil else {
+        guard !isClosed, isOnScreen, dialogReply == nil else {
             reply(false, nil)
             return
         }
