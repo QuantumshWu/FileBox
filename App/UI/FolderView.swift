@@ -1,6 +1,7 @@
 import PhotosUI
 import QuickLook
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 /// One folder of the vault as a plain list. Rows can be dragged onto a folder (move) or onto
@@ -347,7 +348,7 @@ struct FolderView: View {
     private var toolbarContent: some ToolbarContent {
         if selecting {
             ToolbarItem(placement: .topBarLeading) {
-                Button(allVisibleSelected ? "全不选" : "全选", action: toggleAll)
+                Button(allVisibleSelected ? "取消全选" : "全选", action: toggleAll)
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button("完成") { endSelecting() }
@@ -600,6 +601,8 @@ struct FolderView: View {
     /// Files from the 「文件」 or Documents picker; FileStore handles their security scope.
     private func importPicked(_ urls: [URL]) async {
         guard !urls.isEmpty else { return }
+        let activity = FolderImportActivity()
+        defer { activity.end() }
         progress = "正在导入…"
         await store.importFiles(urls, into: folder)
         progress = nil
@@ -613,6 +616,8 @@ struct FolderView: View {
 
     /// Copies the picked photos and videos in, then offers to delete the originals from Photos.
     private func importPhotos(_ picked: [PhotosPickerItem]) async {
+        let activity = FolderImportActivity()
+        defer { activity.end() }
         var files: [URL] = []
         var identifiers: [URL: String] = [:]
         var failed = 0
@@ -649,6 +654,29 @@ struct FolderView: View {
             try? await Task.sleep(nanoseconds: 500_000_000)
             pendingPhotoDeletion = originals
         }
+    }
+}
+
+/// Asks iOS for extra time when the app goes to the background in the middle of an import, so a
+/// long video from Photos or a file provider can finish instead of being cut off.
+@MainActor
+private final class FolderImportActivity {
+    private var id: UIBackgroundTaskIdentifier = .invalid
+
+    init() {
+        // iOS calls this on the main thread when the extra time runs out.
+        id = UIApplication.shared.beginBackgroundTask(withName: "FileBox import") { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.end()
+            }
+        }
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
     }
 }
 

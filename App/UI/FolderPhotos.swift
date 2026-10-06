@@ -3,24 +3,36 @@ import Foundation
 import Photos
 import UniformTypeIdentifiers
 
-/// A photo or video from the picker, copied out to a temporary file.
+/// A photo or video from the picker, kept as a temporary file of our own.
 struct PickedFile: Transferable {
     let url: URL
 
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(importedContentType: .movie) { received in
-            try PickedFile(copying: received.file)
+            try PickedFile(receiving: received)
         }
         FileRepresentation(importedContentType: .image) { received in
-            try PickedFile(copying: received.file)
+            try PickedFile(receiving: received)
         }
     }
 
-    init(copying source: URL) throws {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dest = dir.appendingPathComponent(source.lastPathComponent)
-        try FileManager.default.copyItem(at: source, to: dest)
+    /// The picker deletes its file once this returns. A copy it made just for us is moved rather
+    /// than copied, so a long video does not need twice its size (and time) on the way in.
+    init(receiving received: ReceivedTransferredFile) throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent(received.file.lastPathComponent)
+        do {
+            let moved = !received.isOriginalFile && (try? fm.moveItem(at: received.file, to: dest)) != nil
+            if !moved {
+                try? fm.removeItem(at: dest)
+                try fm.copyItem(at: received.file, to: dest)
+            }
+        } catch {
+            try? fm.removeItem(at: dir)
+            throw error
+        }
         url = dest
     }
 }
