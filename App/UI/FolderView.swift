@@ -42,7 +42,10 @@ struct FolderView: View {
     @State private var newFolderName = ""
     @State private var renaming: FileItem?
     @State private var renameText = ""
+    /// A delete asked for one row (swipe or context menu); its question appears at that row.
     @State private var pendingDelete: [FileItem]?
+    /// A delete asked from the selection bar; its question appears at the bar's button.
+    @State private var pendingBulkDelete: [FileItem]?
 
     @State private var showFileImporter = false
     @State private var showPhotoPicker = false
@@ -159,14 +162,14 @@ struct FolderView: View {
             spacing: 2
         ) {
             ForEach(visibleItems) { item in
-                cell(item)
+                deleteDialog(cell(item), for: [item], isPresented: rowDeleteBinding(item))
             }
         }
     }
 
     private var listRows: some View {
         ForEach(visibleItems) { item in
-            row(item)
+            deleteDialog(row(item), for: [item], isPresented: rowDeleteBinding(item))
                 .listRowInsets(EdgeInsets())
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                     if !selecting {
@@ -474,10 +477,14 @@ struct FolderView: View {
                 }
                 .disabled(selectedFileURLs.isEmpty)
                 Spacer()
-                Button(role: .destructive) { pendingDelete = selectedItems } label: {
-                    Label("删除", systemImage: "trash")
-                }
-                .disabled(selection.isEmpty)
+                deleteDialog(
+                    Button(role: .destructive) { pendingBulkDelete = selectedItems } label: {
+                        Label("删除", systemImage: "trash")
+                    }
+                    .disabled(selection.isEmpty),
+                    for: pendingBulkDelete ?? [],
+                    isPresented: Binding(get: { pendingBulkDelete != nil }, set: { if !$0 { pendingBulkDelete = nil } })
+                )
             }
         } else {
             if isRoot {
@@ -678,15 +685,6 @@ struct FolderView: View {
                 Button("取消", role: .cancel) {}
                 Button("确定") { store.rename(item, to: renameText) }
             }
-            .confirmationDialog(deleteTitle, isPresented: deleteBinding, titleVisibility: .visible, presenting: pendingDelete) { targets in
-                Button("删除", role: .destructive) {
-                    store.delete(targets)
-                    if selecting { endSelecting() }
-                }
-                Button("取消", role: .cancel) {}
-            } message: { targets in
-                Text(targets.contains(where: \.isDirectory) ? "文件夹里的文件也会一起删除，删除后无法恢复。" : "删除后无法恢复。")
-            }
             .confirmationDialog(photoDeletionTitle, isPresented: photoDeletionBinding, titleVisibility: .visible, presenting: pendingPhotoDeletion) { identifiers in
                 Button("删除原件", role: .destructive) {
                     Task {
@@ -704,13 +702,29 @@ struct FolderView: View {
         Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
     }
 
-    private var deleteBinding: Binding<Bool> {
-        Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })
+    /// The delete question, attached to whatever asked for it so iOS shows it right there.
+    private func deleteDialog<Content: View>(_ content: Content, for targets: [FileItem], isPresented: Binding<Bool>) -> some View {
+        content.confirmationDialog(deleteTitle(targets), isPresented: isPresented, titleVisibility: .visible) {
+            Button("删除", role: .destructive) {
+                store.delete(targets)
+                if selecting { endSelecting() }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text(targets.contains(where: \.isDirectory) ? "文件夹里的文件也会一起删除，删除后无法恢复。" : "删除后无法恢复。")
+        }
     }
 
-    private var deleteTitle: String {
-        guard let targets = pendingDelete else { return "" }
-        return targets.count == 1 ? "删除「\(targets[0].name)」？" : "删除这 \(targets.count) 项？"
+    private func rowDeleteBinding(_ item: FileItem) -> Binding<Bool> {
+        Binding(
+            get: { pendingDelete?.first?.url == item.url },
+            set: { if !$0, pendingDelete?.first?.url == item.url { pendingDelete = nil } }
+        )
+    }
+
+    private func deleteTitle(_ targets: [FileItem]) -> String {
+        guard let first = targets.first else { return "" }
+        return targets.count == 1 ? "删除「\(first.name)」？" : "删除这 \(targets.count) 项？"
     }
 
     private var photoDeletionBinding: Binding<Bool> {
