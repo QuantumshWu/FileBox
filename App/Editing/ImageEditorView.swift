@@ -26,7 +26,7 @@ struct ImageEditorView: View {
                 if model.preview != nil {
                     toolPanel
                         .frame(maxWidth: .infinity)
-                        .frame(height: 136)
+                        .frame(height: 142)
                     tabBar
                 }
             }
