@@ -47,7 +47,10 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// The video surface the viewer's pages borrow. A plain AVPlayerLayer with our own controls:
     /// AVPlayerViewController's Picture in Picture stops working once its controls are turned off.
     let playerViewController = MediaPlayerSurfaceController()
+    /// Made once the picture is on screen (see `preparePictureInPicture`).
     private var pictureInPicture: AVPictureInPictureController?
+    /// Whether the page on screen wants PiP to start by itself when the app leaves the screen.
+    private var wantsAutomaticPictureInPicture = true
 
     /// Index (in `sessionItems`) of the file in the player.
     @Published private(set) var currentIndex: Int?
@@ -91,12 +94,6 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         audioOverlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         audioOverlay.isHidden = true
         playerViewController.view.addSubview(audioOverlay)
-        if AVPictureInPictureController.isPictureInPictureSupported(),
-           let controller = AVPictureInPictureController(playerLayer: playerViewController.playerLayer) {
-            controller.delegate = self
-            controller.canStartPictureInPictureAutomaticallyFromInline = true
-            pictureInPicture = controller
-        }
         observeAppAndPlayer()
     }
 
@@ -129,7 +126,20 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     func setAutomaticPictureInPicture(_ enabled: Bool) {
+        wantsAutomaticPictureInPicture = enabled
         pictureInPicture?.canStartPictureInPictureAutomaticallyFromInline = enabled
+    }
+
+    /// Creates the PiP controller the first time the video layer is in a window. One created before
+    /// that (at launch) never becomes "possible", so swiping home only kept the sound playing.
+    private func preparePictureInPicture() {
+        guard pictureInPicture == nil, AVPictureInPictureController.isPictureInPictureSupported(),
+              playerViewController.viewIfLoaded?.window != nil,
+              let controller = AVPictureInPictureController(playerLayer: playerViewController.playerLayer)
+        else { return }
+        controller.delegate = self
+        controller.canStartPictureInPictureAutomaticallyFromInline = wantsAutomaticPictureInPicture
+        pictureInPicture = controller
     }
 
     func play() {
@@ -386,8 +396,8 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     private func didEnterBackground() {
         guard wasPlayingWhenResigning, player.currentItem != nil else { return }
         Task { [weak self] in
-            // Give automatic PiP a moment to begin first.
-            try? await Task.sleep(nanoseconds: 700_000_000)
+            // Give automatic PiP time to begin first; only without it does the sound go on alone.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
             self?.keepPlayingInBackgroundIfNeeded()
         }
     }
@@ -587,6 +597,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
 
     /// The player's view is on screen again (called by its host page).
     func playerViewDidAppear() {
+        preparePictureInPicture()
         guard pendingRestore != nil else { return }
         let id = restoreID
         Task { [weak self] in
