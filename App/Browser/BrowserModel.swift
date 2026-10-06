@@ -36,6 +36,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private let dataStore: WKWebsiteDataStore
     private var userAgent: String?
     private var dialogReply: ((Bool, String?) -> Void)?
+    private var lastCrashReload: Date?
 
     /// Schemes the web view loads itself; anything else would try to open another app.
     private static let pageSchemes: Set<String> = ["http", "https", "about", "data", "blob"]
@@ -160,8 +161,13 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         decidePolicyFor navigationResponse: WKNavigationResponse,
         decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void
     ) {
-        let disposition = (navigationResponse.response as? HTTPURLResponse)?
-            .value(forHTTPHeaderField: "Content-Disposition") ?? ""
+        let http = navigationResponse.response as? HTTPURLResponse
+        // 204/205 mean "stay on this page"; as downloads they would only save empty files.
+        if let status = http?.statusCode, status == 204 || status == 205 {
+            decisionHandler(.cancel)
+            return
+        }
+        let disposition = http?.value(forHTTPHeaderField: "Content-Disposition") ?? ""
         let isAttachment = disposition.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("attachment")
         decisionHandler(isAttachment || !navigationResponse.canShowMIMEType ? .download : .allow)
     }
@@ -182,20 +188,33 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         reportLoadError(error)
     }
 
+    /// Reloads after a web content crash, but not in a loop when a page keeps crashing (usually
+    /// because it runs out of memory).
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        if let last = lastCrashReload, Date().timeIntervalSince(last) < 10 {
+            store?.show("网页反复崩溃（可能内存不足），已停止自动重新载入")
+            return
+        }
+        lastCrashReload = Date()
         webView.reload()
     }
 
     // MARK: - WKUIDelegate
 
-    /// There is only one tab: target=_blank links and window.open load in place.
+    /// There is only one tab: target=_blank links and window.open load in place, and
+    /// `<a download target=_blank>` links are downloaded.
     func webView(
         _ webView: WKWebView,
         createWebViewWith configuration: WKWebViewConfiguration,
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        if let url = navigationAction.request.url, !url.absoluteString.isEmpty, url.absoluteString != "about:blank" {
+        guard let target = navigationAction.request.url,
+              !target.absoluteString.isEmpty, target.absoluteString != "about:blank"
+        else { return nil }
+        if navigationAction.shouldPerformDownload {
+            download(target, referer: url)
+        } else {
             webView.load(navigationAction.request)
         }
         return nil
