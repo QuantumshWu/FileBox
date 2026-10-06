@@ -70,6 +70,8 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     private var wasPlayingBeforeInterruption = false
     private var detachedForBackground = false
     private var pendingRestore: ((Bool) -> Void)?
+    /// PiP asked to go back to the viewer, so its stop is not the user closing it with the X.
+    private var isRestoringFromPictureInPicture = false
     private var restoreID = UUID()
     private var remoteCommandsReady = false
     private var artwork: UIImage?
@@ -533,11 +535,19 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     private func pictureInPictureDidStop() {
+        let restoring = isRestoringFromPictureInPicture
+        isRestoringFromPictureInPicture = false
         isPictureInPictureStarting = false
         isPictureInPictureActive = false
         finishRestore(false)
         publishState()
         let hub = MediaViewerHub.shared
+        if !restoring && UIApplication.shared.applicationState != .active {
+            // Closed with its X while FileBox is away: nothing of it may be left on return.
+            stop()
+            hub.closeViewerAfterPictureInPicture()
+            return
+        }
         if !hub.isViewerPresented || hub.presentedURLs != sessionItems.map(\.url) {
             // Closed with its X after the viewer had closed or moved on to another folder: the
             // session is over.
@@ -550,6 +560,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// Brings the viewer back on the playing file (reopening it if it was closed) before PiP
     /// animates into it.
     private func restoreUserInterface(_ completion: @escaping (Bool) -> Void) {
+        isRestoringFromPictureInPicture = true
         guard let index = currentIndex, sessionItems.indices.contains(index) else {
             completion(false)
             return

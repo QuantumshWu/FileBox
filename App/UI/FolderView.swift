@@ -14,7 +14,8 @@ struct FolderView: View {
     @EnvironmentObject private var lock: LockManager
     @EnvironmentObject private var viewer: ViewerCoordinator
     @AppStorage("sortOrder") private var sort: SortOrder = .date
-    @AppStorage("folderLayout") private var layout: ItemLayout = .grid
+    /// List by default (the user prefers it); the grid is opt-in from the toolbar.
+    @AppStorage("folderLayoutV2") private var layout: ItemLayout = .list
     /// Grid columns, changed by pinching (3...6).
     @AppStorage("folderGridColumns") private var gridColumns = 4
     /// Magnification at the last column change of the current pinch.

@@ -23,7 +23,17 @@ struct FileBoxApp: App {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
-                PrivacyShield.shared.hide()
+                if !lock.isUnlocked && viewer.request != nil && !PlaybackState.shared.isPictureInPictureActive {
+                    // The viewer outlived a Picture in Picture that has since been closed: come
+                    // back to the locked screen, keeping the shield up while the viewer goes away.
+                    viewer.close()
+                    Task {
+                        try? await Task.sleep(nanoseconds: 450_000_000)
+                        PrivacyShield.shared.hide()
+                    }
+                } else {
+                    PrivacyShield.shared.hide()
+                }
                 store.collectIncoming()
                 store.refresh()
             case .inactive:

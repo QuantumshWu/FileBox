@@ -156,6 +156,15 @@ final class MediaViewerHub: ObservableObject {
         }
     }
 
+    /// PiP was closed with its X while FileBox was away: close the viewer so the next visit shows
+    /// the locked screen instead of what was playing.
+    func closeViewerAfterPictureInPicture() {
+        guard UIApplication.shared.applicationState != .active, isViewerPresented else { return }
+        backgroundCheckID = UUID()
+        coordinator?.close()
+        PrivacyShield.shared.show()
+    }
+
     private func closeIfIdleInBackground() {
         let playback = MediaPlaybackController.shared
         let image = MediaImagePiPController.shared

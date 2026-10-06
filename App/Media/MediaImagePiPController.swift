@@ -43,6 +43,8 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     private var refreshTimer: Timer?
     private var slideshowTimer: Timer?
     private var pendingRestore: ((Bool) -> Void)?
+    /// PiP asked to go back to the viewer, so its stop is not the user closing it with the X.
+    private var isRestoringFromPictureInPicture = false
     private var restoreID = UUID()
     private var reportedPaused: Bool?
     private var reportedCount = 0
@@ -392,12 +394,20 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     }
 
     private func pictureInPictureDidStop() {
+        let restoring = isRestoringFromPictureInPicture
+        isRestoringFromPictureInPicture = false
         isStarting = false
         isActive = false
         setSlideshow(false)
         finishRestore(false)
-        // Closed with its X after the viewer had closed: nothing is left to show.
         let hub = MediaViewerHub.shared
+        if !restoring && UIApplication.shared.applicationState != .active {
+            // Closed with its X while FileBox is away: nothing of it may be left on return.
+            teardown()
+            hub.closeViewerAfterPictureInPicture()
+            return
+        }
+        // Closed with its X after the viewer had closed: nothing is left to show.
         if hub.isViewerPresented {
             updateArming()
             hub.checkInBackground(after: 0.6)
@@ -409,6 +419,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     /// Brings the viewer back on the floating image (reopening it if it was closed) before PiP
     /// animates into it.
     private func restoreUserInterface(_ completion: @escaping (Bool) -> Void) {
+        isRestoringFromPictureInPicture = true
         guard let index = currentIndex, sessionItems.indices.contains(index) else {
             completion(false)
             return

@@ -17,7 +17,11 @@ struct MediaViewer: View {
     @AppStorage("mediaPlaybackMode") private var mode: MediaPlaybackMode = MediaPlaybackMode.defaultMode
 
     @State private var selection: Int
-    @State private var chromeVisible: Bool
+    /// Like Photos: only the picture at first; a tap shows the bar (with the player's own controls
+    /// on video pages).
+    @State private var chromeVisible = false
+    /// Hides the bar of a playing video again after a few seconds, along with the player's controls.
+    @State private var chromeHideID = UUID()
     @State private var token = UUID()
     @State private var editingImage: FileItem?
     @State private var trimmingVideo: FileItem?
@@ -34,7 +38,6 @@ struct MediaViewer: View {
         urls = items.map(\.url)
         let start = items.indices.contains(startIndex) ? startIndex : 0
         _selection = State(initialValue: start)
-        _chromeVisible = State(initialValue: !(items.indices.contains(start) && items[start].kind == .image))
     }
 
     private var currentItem: FileItem? {
@@ -165,31 +168,46 @@ struct MediaViewer: View {
         selection = index
     }
 
-    /// Taps on a video or audio page belong to the player; the bar stays there.
+    /// On video and audio pages the same tap also shows or hides the player's own controls, so
+    /// the bar follows them, including hiding again a few seconds into playback.
     private func toggleChrome() {
-        if let kind = currentItem?.kind, kind == .video || kind == .audio { return }
         withAnimation(.easeInOut(duration: 0.2)) {
             chromeVisible.toggle()
         }
+        scheduleChromeHide()
     }
 
-    /// The bar is always up on video and audio pages; coming to an image from one hides it, as in
-    /// Photos, while moving between images keeps what the last tap chose.
+    private func scheduleChromeHide() {
+        let id = UUID()
+        chromeHideID = id
+        guard chromeVisible, let kind = currentItem?.kind, kind == .video || kind == .audio else { return }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard chromeHideID == id, chromeVisible, playback.isPlaying,
+                  let kind = currentItem?.kind, kind == .video || kind == .audio
+            else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                chromeVisible = false
+            }
+        }
+    }
+
+    /// A new video or audio page starts with just the picture; moving between images keeps what
+    /// the last tap chose.
     private func updateChrome(from oldIndex: Int, to index: Int) {
         guard items.indices.contains(index) else { return }
-        let visible: Bool
         switch items[index].kind {
-        case .video, .audio:
-            visible = true
         case .image:
             if items.indices.contains(oldIndex), items[oldIndex].kind == .image { return }
-            visible = false
+        case .video, .audio:
+            break
         case .folder, .other:
             return
         }
-        guard visible != chromeVisible else { return }
+        chromeHideID = UUID()
+        guard chromeVisible else { return }
         withAnimation(.easeInOut(duration: 0.2)) {
-            chromeVisible = visible
+            chromeVisible = false
         }
     }
 
