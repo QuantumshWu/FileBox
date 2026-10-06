@@ -2,30 +2,44 @@ import SwiftUI
 import UIKit
 
 /// An image that fits the page and can be pinched or double-tapped to zoom and panned while zoomed.
-/// At the zoomed image's edge a swipe carries on to the next page of the viewer.
+/// At the zoomed image's edge a swipe carries on to the next page of the viewer. At the fitted size
+/// a swipe up or down drags the image to close the viewer.
 struct MediaZoomableImage: UIViewRepresentable {
     let image: UIImage
     let onSingleTap: () -> Void
+    /// The finger's offset during a swipe to close; `nil` when it lets go without closing.
+    let onDismissDrag: (CGSize?) -> Void
+    let onDismiss: () -> Void
 
     func makeUIView(context: Context) -> MediaZoomScrollView {
         let view = MediaZoomScrollView()
-        view.onSingleTap = onSingleTap
+        configure(view)
         view.display(image)
         return view
     }
 
     func updateUIView(_ view: MediaZoomScrollView, context: Context) {
-        view.onSingleTap = onSingleTap
+        configure(view)
         if view.image !== image { view.display(image) }
+    }
+
+    private func configure(_ view: MediaZoomScrollView) {
+        view.onSingleTap = onSingleTap
+        view.onDismissDrag = onDismissDrag
+        view.onDismiss = onDismiss
     }
 }
 
 final class MediaZoomScrollView: UIScrollView, UIScrollViewDelegate {
     var onSingleTap: (() -> Void)?
+    var onDismissDrag: ((CGSize?) -> Void)?
+    var onDismiss: (() -> Void)?
     private(set) var image: UIImage?
 
     private let imageView = UIImageView()
     private var laidOutSize: CGSize = .zero
+    private let dismissPan = UIPanGestureRecognizer()
+    private let dismissPanDelegate = MediaDismissPanDelegate()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -45,6 +59,12 @@ final class MediaZoomScrollView: UIScrollView, UIScrollViewDelegate {
         let singleTap = UITapGestureRecognizer(target: self, action: #selector(handleSingleTap))
         singleTap.require(toFail: doubleTap)
         addGestureRecognizer(singleTap)
+
+        dismissPan.addTarget(self, action: #selector(handleDismissPan(_:)))
+        dismissPan.maximumNumberOfTouches = 1
+        dismissPanDelegate.scrollView = self
+        dismissPan.delegate = dismissPanDelegate
+        addGestureRecognizer(dismissPan)
     }
 
     required init?(coder: NSCoder) {
@@ -104,11 +124,51 @@ final class MediaZoomScrollView: UIScrollView, UIScrollViewDelegate {
         zoom(to: rect, animated: true)
     }
 
+    /// Far or fast enough closes the viewer; otherwise the image goes back.
+    @objc private func handleDismissPan(_ pan: UIPanGestureRecognizer) {
+        let translation = pan.translation(in: nil)
+        switch pan.state {
+        case .began, .changed:
+            onDismissDrag?(CGSize(width: translation.x, height: translation.y))
+        case .ended:
+            let velocity = pan.velocity(in: nil).y
+            let flung = abs(velocity) > 800 && (velocity > 0) == (translation.y > 0)
+            if abs(translation.y) > 100 || flung {
+                onDismiss?()
+            } else {
+                onDismissDrag?(nil)
+            }
+        default:
+            onDismissDrag?(nil)
+        }
+    }
+
     func viewForZooming(in scrollView: UIScrollView) -> UIView? {
         imageView
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
         centerImage()
+    }
+}
+
+/// Starts the swipe to close only for a mostly vertical drag of an image at its fitted size, and
+/// makes the scroll views' own pans (paging, panning a zoomed image) wait until it gives up.
+final class MediaDismissPanDelegate: NSObject, UIGestureRecognizerDelegate {
+    weak var scrollView: UIScrollView?
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard let scrollView, let pan = gestureRecognizer as? UIPanGestureRecognizer,
+              scrollView.zoomScale <= scrollView.minimumZoomScale + 0.01
+        else { return false }
+        let velocity = pan.velocity(in: scrollView)
+        return abs(velocity.y) > abs(velocity.x) * 1.5
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        otherGestureRecognizer is UIPanGestureRecognizer && otherGestureRecognizer.view is UIScrollView
     }
 }

@@ -3,10 +3,12 @@ import AVKit
 import SwiftUI
 import UIKit
 
-/// One image of the viewer, decoded at a bounded size.
+/// One image of the viewer, decoded at a bounded size. Swiped up or down, it follows the finger,
+/// shrinks a little and closes the viewer.
 struct MediaImagePage: View {
     let item: FileItem
     let onTap: () -> Void
+    let onClose: () -> Void
     let onQuickLook: (URL) -> Void
 
     /// Longest side decoded for display: sharp when zoomed in a little, without decoding 50 MP.
@@ -14,12 +16,30 @@ struct MediaImagePage: View {
 
     @State private var image: UIImage?
     @State private var failed = false
+    @State private var dragOffset: CGSize = .zero
+
+    private var dragScale: CGFloat {
+        1 - 0.15 * min(1, abs(dragOffset.height) / 300)
+    }
 
     var body: some View {
         ZStack {
             Color.black
             if let image {
-                MediaZoomableImage(image: image, onSingleTap: onTap)
+                MediaZoomableImage(
+                    image: image,
+                    onSingleTap: onTap,
+                    onDismissDrag: { offset in
+                        if let offset {
+                            dragOffset = offset
+                        } else {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { dragOffset = .zero }
+                        }
+                    },
+                    onDismiss: onClose
+                )
+                .scaleEffect(dragScale)
+                .offset(dragOffset)
             } else if failed {
                 MediaUnsupportedView(message: "无法显示这张图片", url: item.url, onQuickLook: onQuickLook)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -43,6 +63,7 @@ struct MediaImagePage: View {
             // Pages the viewer has moved past keep no full-size picture; it comes from the cache again.
             image = nil
             failed = false
+            dragOffset = .zero
         }
     }
 }
