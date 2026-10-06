@@ -36,12 +36,26 @@ final class MediaViewerHub: ObservableObject {
     private var imageKeepsAlive = false
     private var imagePiPActive = false
     private var audioHolders: Set<AudioUse> = []
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var backgroundCheckID = UUID()
+    private var appObservers: Set<AnyCancellable> = []
 
     var isViewerPresented: Bool { presentedToken != nil }
     var isVideoPictureInPictureActive: Bool { videoPiPActive }
     var isImagePictureInPictureActive: Bool { imagePiPActive }
 
-    private init() {}
+    private init() {
+        let center = NotificationCenter.default
+        center.publisher(for: UIApplication.didEnterBackgroundNotification)
+            .sink { [weak self] _ in self?.checkInBackground(after: 2) }
+            .store(in: &appObservers)
+        center.publisher(for: UIApplication.willEnterForegroundNotification)
+            .sink { [weak self] _ in
+                self?.backgroundCheckID = UUID()
+                self?.endBackgroundTime()
+            }
+            .store(in: &appObservers)
+    }
 
     // MARK: - Viewer
 
@@ -126,6 +140,49 @@ final class MediaViewerHub: ObservableObject {
         if state.isPictureInPictureActive != pip { state.isPictureInPictureActive = pip }
     }
 
+    /// The viewer stayed open when the app left the screen because PiP was armed or something
+    /// played. If after `seconds` nothing plays or floats any more (PiP did not start, or its window
+    /// was closed), the viewer closes and the privacy shield goes up, as for any other screen.
+    func checkInBackground(after seconds: Double) {
+        guard UIApplication.shared.applicationState == .background, isViewerPresented else { return }
+        beginBackgroundTime()
+        let id = UUID()
+        backgroundCheckID = id
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard let self, self.backgroundCheckID == id else { return }
+            self.closeIfIdleInBackground()
+            self.endBackgroundTime()
+        }
+    }
+
+    private func closeIfIdleInBackground() {
+        let playback = MediaPlaybackController.shared
+        let image = MediaImagePiPController.shared
+        guard UIApplication.shared.applicationState == .background, isViewerPresented,
+              !playback.isPlaying, !playback.isPictureInPictureEngaged, !image.isEngaged
+        else { return }
+        coordinator?.close()
+        PrivacyShield.shared.show()
+    }
+
+    /// Keeps the app running for the check above; without sound playing it would be suspended.
+    private func beginBackgroundTime() {
+        guard backgroundTask == .invalid else { return }
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "MediaViewerCheck") { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.endBackgroundTime()
+            }
+        }
+    }
+
+    private func endBackgroundTime() {
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
+    }
+
     // MARK: - Audio session
 
     /// Video takes over the audio; an image in PiP plays along with other apps' music.
@@ -158,10 +215,23 @@ final class MediaViewerHub: ObservableObject {
 
 /// Decodes images at a bounded size, off the main thread, so huge photos don't exhaust memory.
 enum MediaImageLoader {
+    /// The last few decoded pages, so swiping back does not decode again.
+    private static let cache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.totalCostLimit = 150 * 1024 * 1024
+        return cache
+    }()
+
     static func load(_ url: URL, maxPixel: CGFloat) async -> UIImage? {
-        await Task.detached(priority: .userInitiated) {
+        let key = "\(Int(maxPixel))|\(url.path)" as NSString
+        if let hit = cache.object(forKey: key) { return hit }
+        let image = await Task.detached(priority: .userInitiated) {
             MediaImageLoader.decode(url, maxPixel: maxPixel).map { UIImage(cgImage: $0) }
         }.value
+        if let image, let cgImage = image.cgImage {
+            cache.setObject(image, forKey: key, cost: cgImage.bytesPerRow * cgImage.height)
+        }
+        return image
     }
 
     /// The image (orientation applied) with its longer side at most `maxPixel` pixels.

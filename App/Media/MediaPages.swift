@@ -39,6 +39,11 @@ struct MediaImagePage: View {
             image = loaded
             failed = loaded == nil
         }
+        .onDisappear {
+            // Pages the viewer has moved past keep no full-size picture; it comes from the cache again.
+            image = nil
+            failed = false
+        }
     }
 }
 

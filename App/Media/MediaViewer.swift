@@ -10,6 +10,7 @@ struct MediaViewer: View {
 
     @EnvironmentObject private var viewer: ViewerCoordinator
     @EnvironmentObject private var store: FileStore
+    @EnvironmentObject private var lock: LockManager
     @ObservedObject private var hub = MediaViewerHub.shared
     @ObservedObject private var playback = MediaPlaybackController.shared
     @ObservedObject private var imagePiP = MediaImagePiPController.shared
@@ -85,12 +86,16 @@ struct MediaViewer: View {
         .fullScreenCover(item: $editingImage) { item in
             ImageEditorView(item: item)
                 .environmentObject(store)
+                .environmentObject(lock)
                 .environmentObject(viewer)
+                .environmentObject(PlaybackState.shared)
         }
         .fullScreenCover(item: $trimmingVideo) { item in
             VideoTrimView(item: item)
                 .environmentObject(store)
+                .environmentObject(lock)
                 .environmentObject(viewer)
+                .environmentObject(PlaybackState.shared)
         }
         .quickLookPreview($quickLookURL)
     }
@@ -196,7 +201,11 @@ struct MediaViewer: View {
         .accessibilityLabel("分享")
         switch item.kind {
         case .image:
-            Button { editingImage = item } label: { barIcon("crop.rotate") }
+            Button {
+                // The editor covers the viewer, and with it the layer the floating image comes from.
+                if imagePiP.isEngaged { imagePiP.toggle() }
+                editingImage = item
+            } label: { barIcon("crop.rotate") }
                 .accessibilityLabel("编辑")
             Button { imagePiP.toggle() } label: {
                 barIcon(imagePiP.isActive ? "pip.exit" : "pip.enter")

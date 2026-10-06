@@ -24,6 +24,10 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     let layerView = MediaSampleBufferView()
 
     private(set) var sessionItems: [FileItem] = []
+
+    /// PiP is showing an image or about to.
+    var isEngaged: Bool { isActive || isStarting }
+
     private var currentIndex: Int?
     private var renderedURL: URL?
     private var onImagePage = false
@@ -388,7 +392,13 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         setSlideshow(false)
         finishRestore(false)
         // Closed with its X after the viewer had closed: nothing is left to show.
-        if MediaViewerHub.shared.isViewerPresented { updateArming() } else { teardown() }
+        let hub = MediaViewerHub.shared
+        if hub.isViewerPresented {
+            updateArming()
+            hub.checkInBackground(after: 0.6)
+        } else {
+            teardown()
+        }
     }
 
     /// Brings the viewer back on the floating image (reopening it if it was closed) before PiP

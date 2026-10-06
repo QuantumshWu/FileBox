@@ -58,6 +58,9 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// The folder being played through: the items of the viewer that started playback.
     private(set) var sessionItems: [FileItem] = []
 
+    /// PiP is showing the video or about to.
+    var isPictureInPictureEngaged: Bool { isPictureInPictureActive || isPictureInPictureStarting }
+
     private var isPictureInPictureStarting = false
     private var automaticAdvance = false
     private var failuresInARow = 0
@@ -524,8 +527,14 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         isPictureInPictureActive = false
         finishRestore(false)
         publishState()
-        // PiP was closed with its X after the viewer had closed: the session is over.
-        if !MediaViewerHub.shared.isViewerPresented { stop() }
+        let hub = MediaViewerHub.shared
+        if !hub.isViewerPresented || hub.presentedURLs != sessionItems.map(\.url) {
+            // Closed with its X after the viewer had closed or moved on to another folder: the
+            // session is over.
+            stop()
+        } else {
+            hub.checkInBackground(after: 0.6)
+        }
     }
 
     /// Brings the viewer back on the playing file (reopening it if it was closed) before PiP
