@@ -1,0 +1,181 @@
+import AVFoundation
+import Combine
+import ImageIO
+import SwiftUI
+import UIKit
+
+/// Connects the viewer on screen with the two playback engines (`MediaPlaybackController` for
+/// video and audio, `MediaImagePiPController` for images) and mirrors them into `PlaybackState`.
+@MainActor
+final class MediaViewerHub: ObservableObject {
+    static let shared = MediaViewerHub()
+
+    /// A page the viewer showing `urls` should move to (PiP skip buttons, restoring from PiP).
+    struct PageRequest: Equatable {
+        let id = UUID()
+        let urls: [URL]
+        let index: Int
+    }
+
+    enum AudioUse: Hashable {
+        case video, image
+    }
+
+    @Published private(set) var pageRequest: PageRequest?
+    @Published private(set) var toast: String?
+
+    /// The app's viewer coordinator, used to reopen the viewer when PiP is restored after it closed.
+    private weak var coordinator: ViewerCoordinator?
+    private var requestObserver: AnyCancellable?
+    /// Files of the viewer on screen, nil while it is closed.
+    private(set) var presentedURLs: [URL]?
+    private var presentedToken: UUID?
+
+    private var videoKeepsAlive = false
+    private var videoPiPActive = false
+    private var imageKeepsAlive = false
+    private var imagePiPActive = false
+    private var audioHolders: Set<AudioUse> = []
+
+    var isViewerPresented: Bool { presentedToken != nil }
+    var isVideoPictureInPictureActive: Bool { videoPiPActive }
+    var isImagePictureInPictureActive: Bool { imagePiPActive }
+
+    private init() {}
+
+    // MARK: - Viewer
+
+    func viewerAppeared(token: UUID, items: [FileItem], coordinator: ViewerCoordinator) {
+        presentedToken = token
+        presentedURLs = items.map(\.url)
+        if self.coordinator !== coordinator {
+            self.coordinator = coordinator
+            // Closing the viewer (button, or the app going to the background) clears the request.
+            requestObserver = coordinator.$request.sink { [weak self] request in
+                self?.requestChanged(request)
+            }
+        }
+        publish()
+    }
+
+    /// Fallback for a viewer that went away while its request stayed; a cover presented from the
+    /// viewer (an editor, Quick Look) also makes it disappear, and that must not end playback.
+    func viewerDisappeared(token: UUID) {
+        guard presentedToken == token else { return }
+        if let request = coordinator?.request, request.items.map(\.url) == presentedURLs { return }
+        closePresentedViewer()
+    }
+
+    private func requestChanged(_ request: ViewerRequest?) {
+        guard presentedToken != nil, request?.items.map(\.url) != presentedURLs else { return }
+        closePresentedViewer()
+    }
+
+    private func closePresentedViewer() {
+        presentedToken = nil
+        presentedURLs = nil
+        publish()
+        MediaPlaybackController.shared.viewerClosed()
+        MediaImagePiPController.shared.viewerClosed()
+    }
+
+    /// Moves the viewer to `items[index]`. If another folder (or nothing) is on screen, `reopen`
+    /// presents the viewer again.
+    func reveal(_ items: [FileItem], at index: Int, reopen: Bool) {
+        guard items.indices.contains(index) else { return }
+        let urls = items.map(\.url)
+        if presentedURLs == urls {
+            pageRequest = PageRequest(urls: urls, index: index)
+        } else if reopen {
+            coordinator?.open(items, at: index)
+        }
+    }
+
+    func show(_ message: String) {
+        toast = message
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            if self?.toast == message { self?.toast = nil }
+        }
+    }
+
+    // MARK: - App shell
+
+    func setVideoState(keepsAlive: Bool, pictureInPicture: Bool) {
+        let pipChanged = videoPiPActive != pictureInPicture
+        videoKeepsAlive = keepsAlive
+        videoPiPActive = pictureInPicture
+        publish()
+        if pipChanged { MediaImagePiPController.shared.videoPictureInPictureChanged() }
+    }
+
+    func setImageState(keepsAlive: Bool, pictureInPicture: Bool) {
+        imageKeepsAlive = keepsAlive
+        imagePiPActive = pictureInPicture
+        publish()
+    }
+
+    /// While the viewer is open and something plays or PiP is active or armed, backgrounding must
+    /// neither close the viewer nor cover it with the privacy shield (which would stop PiP from
+    /// starting). A closed viewer leaves nothing to keep: PiP floats on by itself.
+    private func publish() {
+        let state = PlaybackState.shared
+        let pip = videoPiPActive || imagePiPActive
+        let keeps = isViewerPresented && (pip || videoKeepsAlive || imageKeepsAlive)
+        if state.keepsViewerInBackground != keeps { state.keepsViewerInBackground = keeps }
+        if state.isPictureInPictureActive != pip { state.isPictureInPictureActive = pip }
+    }
+
+    // MARK: - Audio session
+
+    /// Video takes over the audio; an image in PiP plays along with other apps' music.
+    @discardableResult
+    func activateAudioSession(for use: AudioUse) -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        let alreadyActive = !audioHolders.isEmpty
+        let needsVideoCategory = use == .video && !audioHolders.contains(.video)
+        audioHolders.insert(use)
+        do {
+            if needsVideoCategory {
+                try session.setCategory(.playback, mode: .moviePlayback, options: [])
+            } else if !alreadyActive {
+                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            }
+            if needsVideoCategory || !alreadyActive {
+                try session.setActive(true)
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func releaseAudioSession(for use: AudioUse) {
+        guard audioHolders.remove(use) != nil, audioHolders.isEmpty else { return }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+}
+
+/// Decodes images at a bounded size, off the main thread, so huge photos don't exhaust memory.
+enum MediaImageLoader {
+    static func load(_ url: URL, maxPixel: CGFloat) async -> UIImage? {
+        await Task.detached(priority: .userInitiated) {
+            MediaImageLoader.decode(url, maxPixel: maxPixel).map { UIImage(cgImage: $0) }
+        }.value
+    }
+
+    /// The image (orientation applied) with its longer side at most `maxPixel` pixels.
+    static func decode(_ url: URL, maxPixel: CGFloat) -> CGImage? {
+        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions),
+              CGImageSourceGetCount(source) > 0
+        else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: Int(maxPixel),
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+    }
+}
