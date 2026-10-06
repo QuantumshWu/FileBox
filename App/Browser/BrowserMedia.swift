@@ -1,3 +1,4 @@
+import ImageIO
 import SwiftUI
 import UIKit
 
@@ -116,20 +117,35 @@ final class BrowserThumbnailLoader {
         session.invalidateAndCancel()
     }
 
-    func image(for url: URL, maxPixels: CGFloat) async -> UIImage? {
+    /// A preview whose shorter side is at least `side` pixels, so it can fill a square.
+    func image(for url: URL, side: CGFloat) async -> UIImage? {
         if let hit = cache.object(forKey: url as NSURL) { return hit }
         guard let result = try? await session.data(for: context.request(for: url)) else { return nil }
         if let status = (result.1 as? HTTPURLResponse)?.statusCode, !(200..<300).contains(status) { return nil }
-        guard let image = UIImage(data: result.0) else { return nil }
-        let longest = max(image.size.width, image.size.height)
-        var preview = image
-        if longest > maxPixels {
-            let scale = maxPixels / longest
-            let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
-            preview = await image.byPreparingThumbnail(ofSize: size) ?? image
-        }
+        guard let preview = Self.downsampled(result.0, side: side) else { return nil }
         cache.setObject(preview, forKey: url as NSURL)
         return preview
+    }
+
+    /// Decodes only a small version of the image, so large photos do not fill the memory.
+    private static func downsampled(_ data: Data, side: CGFloat) -> UIImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
+        else { return nil }
+        var maxPixels = side
+        if let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+           let width = (properties[kCGImagePropertyPixelWidth as String] as? NSNumber)?.doubleValue,
+           let height = (properties[kCGImagePropertyPixelHeight as String] as? NSNumber)?.doubleValue,
+           width > 0, height > 0 {
+            maxPixels = side * CGFloat(min(4, max(width, height) / min(width, height)))
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, Int(maxPixels)),
+        ]
+        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return UIImage(cgImage: thumbnail)
     }
 }
 
@@ -334,7 +350,7 @@ private struct BrowserMediaThumbnail: View {
         }
         .task(id: item.thumbnailURL) {
             guard let source = item.thumbnailURL, ["http", "https"].contains(source.scheme?.lowercased() ?? "") else { return }
-            image = await loader.image(for: source, maxPixels: side * displayScale)
+            image = await loader.image(for: source, side: side * displayScale)
         }
     }
 }

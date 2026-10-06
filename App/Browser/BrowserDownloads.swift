@@ -18,9 +18,13 @@ final class BrowserDownload: ObservableObject, Identifiable {
     @Published var received: Int64 = 0
     /// Total size, or 0 while unknown.
     @Published var expected: Int64 = 0
+    /// True while a page-media download waits for a free slot.
+    @Published var isWaiting = false
 
     fileprivate var webDownload: WKDownload?
     fileprivate var task: URLSessionDownloadTask?
+    /// A page-media download that has not started yet.
+    fileprivate var pending: (session: URLSession, request: URLRequest)?
     /// Where the data is being written, inside its own temporary folder.
     fileprivate var tempFile: URL?
 
@@ -118,6 +122,12 @@ final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelega
 
     weak var store: FileStore?
     private var ticker: Task<Void, Never>?
+    /// Page-media downloads waiting for a free slot, oldest first.
+    private var queue: [BrowserDownload] = []
+
+    /// Page media is fetched a few files at a time: requests that wait inside URLSession for a
+    /// connection to the same server time out after a minute, which would fail big selections.
+    private static let maxParallelFetches = 4
 
     var hasFinished: Bool { items.contains { !$0.isRunning } }
 
@@ -143,39 +153,24 @@ final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelega
         var first: BrowserDownload?
         for url in urls {
             let item = BrowserDownload(name: Self.provisionalName(for: url), source: url)
-            let id = item.id
-            let task = session.downloadTask(with: context.request(for: url)) { [weak self] location, response, error in
-                // The system deletes `location` as soon as this returns.
-                let file = location.flatMap { Self.keepDownloadedFile($0) }
-                Task { @MainActor in
-                    guard let self else {
-                        if let file { Self.removeFolder(of: file) }
-                        return
-                    }
-                    self.sessionTaskEnded(id, file: file, response: response, error: error)
-                }
-            }
-            item.task = task
+            item.pending = (session: session, request: context.request(for: url))
+            item.isWaiting = true
             items.insert(item, at: 0)
+            queue.append(item)
             if first == nil { first = item }
-            task.resume()
         }
-        session.finishTasksAndInvalidate()
         didStart(count: urls.count, first: first)
+        startQueuedFetches()
     }
 
     func cancel(_ item: BrowserDownload) {
-        guard item.isRunning else { return }
-        item.state = .cancelled
-        item.webDownload?.cancel(nil)
-        item.task?.cancel()
-        discardFile(of: item)
-        refreshCount()
+        stop(item)
+        startQueuedFetches()
     }
 
     func cancelAll() {
         for item in items where item.isRunning {
-            cancel(item)
+            stop(item)
         }
         ticker?.cancel()
         ticker = nil
@@ -236,6 +231,56 @@ final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelega
         items.first { $0.webDownload === download }
     }
 
+    /// Cancels one download without starting the next waiting one.
+    private func stop(_ item: BrowserDownload) {
+        guard item.isRunning else { return }
+        item.state = .cancelled
+        item.webDownload?.cancel(nil)
+        item.task?.cancel()
+        if let pending = item.pending {
+            item.pending = nil
+            item.isWaiting = false
+            queue.removeAll { $0 === item }
+            finishSessionIfIdle(pending.session)
+        }
+        discardFile(of: item)
+        refreshCount()
+    }
+
+    /// Starts waiting page-media downloads while fewer than `maxParallelFetches` run.
+    private func startQueuedFetches() {
+        var running = items.filter { $0.isRunning && $0.task != nil }.count
+        while running < Self.maxParallelFetches, !queue.isEmpty {
+            let item = queue.removeFirst()
+            guard item.isRunning, let pending = item.pending else { continue }
+            item.pending = nil
+            item.isWaiting = false
+            let id = item.id
+            let task = pending.session.downloadTask(with: pending.request) { [weak self] location, response, error in
+                // The system deletes `location` as soon as this returns.
+                let file = location.flatMap { Self.keepDownloadedFile($0) }
+                Task { @MainActor in
+                    guard let self else {
+                        if let file { Self.removeFolder(of: file) }
+                        return
+                    }
+                    self.sessionTaskEnded(id, file: file, response: response, error: error)
+                }
+            }
+            item.task = task
+            task.resume()
+            running += 1
+            finishSessionIfIdle(pending.session)
+        }
+    }
+
+    /// Lets a session's running tasks finish and then releases it, once none of its downloads wait.
+    private func finishSessionIfIdle(_ session: URLSession) {
+        if !queue.contains(where: { $0.pending?.session === session }) {
+            session.finishTasksAndInvalidate()
+        }
+    }
+
     private func didStart(count: Int, first: BrowserDownload?) {
         refreshCount()
         startTicking()
@@ -247,6 +292,7 @@ final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelega
     }
 
     private func sessionTaskEnded(_ id: UUID, file: URL?, response: URLResponse?, error: Error?) {
+        defer { startQueuedFetches() }
         guard let item = items.first(where: { $0.id == id }), item.isRunning else {
             if let file { Self.removeFolder(of: file) }
             return
@@ -404,7 +450,21 @@ final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelega
             }
             if needsExtension { name += "." + ext }
         }
-        return name
+        return shortened(name)
+    }
+
+    /// Cuts a long name (servers send whole article titles) to fit the file system's 255-byte limit,
+    /// with room for the " 2" a name collision adds, keeping a short extension.
+    nonisolated private static func shortened(_ name: String, maxBytes: Int = 200) -> String {
+        guard name.utf8.count > maxBytes else { return name }
+        let ext = (name as NSString).pathExtension
+        let keepsExtension = !ext.isEmpty && ext.utf8.count <= 16
+        let suffix = keepsExtension ? "." + ext : ""
+        var base = keepsExtension ? (name as NSString).deletingPathExtension : name
+        while !base.isEmpty && base.utf8.count + suffix.utf8.count > maxBytes {
+            base.removeLast()
+        }
+        return base.trimmingCharacters(in: .whitespaces) + suffix
     }
 }
 
@@ -422,7 +482,7 @@ struct BrowserDownloadsSheet: View {
                     ContentUnavailableView(
                         "还没有下载",
                         systemImage: "arrow.down.circle",
-                        description: Text("长按链接或图片选「下载」，或者用「本页媒体」一次下载多个文件。\n\n" + Self.footnote)
+                        description: Text("长按链接或图片选「下载链接」「下载图片」，或者用「本页媒体」一次下载多个文件。\n\n" + Self.footnote)
                     )
                 } else {
                     List {
@@ -509,6 +569,7 @@ private struct BrowserDownloadRow: View {
     private var status: String {
         switch item.state {
         case .running:
+            if item.isWaiting { return "排队等待…" }
             if item.expected > 0 {
                 return "\(Self.bytes(item.received)) / \(Self.bytes(item.expected))"
             }

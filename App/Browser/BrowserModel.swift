@@ -37,11 +37,20 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private var userAgent: String?
     private var dialogReply: ((Bool, String?) -> Void)?
     private var lastCrashReload: Date?
+    /// Set when the browser closes. WebKit raises an exception if a dialog's completion handler is
+    /// dropped unanswered, so dialogs that still arrive are answered right away.
+    private var isClosed = false
+    /// Hosts whose blocked plain-HTTP address was already retried over HTTPS.
+    private var httpsRetriedHosts: Set<String> = []
 
     /// Schemes the web view loads itself; anything else would try to open another app.
     private static let pageSchemes: Set<String> = ["http", "https", "about", "data", "blob"]
     /// Link schemes WebKit can download from (not javascript:, mailto: and the like).
     private static let downloadableSchemes: Set<String> = ["http", "https", "data", "blob"]
+    /// `.allow`, but without WebKit handing universal links (https links an installed app claims,
+    /// such as shop or video sites) to that app, which would leave and lock FileBox. This is WebKit's
+    /// private `_WKNavigationActionPolicyAllowWithoutTryingAppLink`, which Chrome uses for incognito tabs.
+    private static let allowWithoutAppLinks = WKNavigationActionPolicy(rawValue: WKNavigationActionPolicy.allow.rawValue + 2) ?? .allow
 
     override init() {
         let dataStore = WKWebsiteDataStore.nonPersistent()
@@ -72,14 +81,18 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     func attach(_ store: FileStore) {
         self.store = store
         downloads.store = store
+        isClosed = false
     }
 
     /// Stops everything when the browser closes, which also happens when the app locks itself.
+    /// Full-screen web video and Picture in Picture close too, so nothing stays on screen.
     func shutdown() {
+        isClosed = true
         answerDialog(false)
         downloads.cancelAll()
         webView.stopLoading()
         webView.pauseAllMediaPlayback(completionHandler: nil)
+        webView.closeAllMediaPresentations(completionHandler: nil)
     }
 
     // MARK: - Navigation
@@ -146,7 +159,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             return
         }
         guard let scheme = navigationAction.request.url?.scheme?.lowercased(), !Self.pageSchemes.contains(scheme) else {
-            decisionHandler(.allow)
+            decisionHandler(Self.allowWithoutAppLinks)
             return
         }
         decisionHandler(.cancel)
@@ -293,7 +306,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     // MARK: - Helpers
 
     private func ask(_ dialog: BrowserDialog, reply: @escaping (Bool, String?) -> Void) {
-        guard dialogReply == nil else {
+        guard !isClosed, dialogReply == nil else {
             reply(false, nil)
             return
         }
@@ -327,6 +340,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
                 })
                 actions.append(UIAction(title: "拷贝图片地址", image: UIImage(systemName: "link")) { _ in
                     UIPasteboard.general.url = image
+                    self?.store?.show("已拷贝图片地址")
                 })
             }
             let ours: UIMenuElement = UIMenu(title: "", options: .displayInline, children: actions)
@@ -360,6 +374,19 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled { return }
         // 102: the load became a download or was cancelled by policy; 204: a media plug-in took over.
         if nsError.domain == "WebKitErrorDomain" && (nsError.code == 102 || nsError.code == 204) { return }
+        // iOS blocks plain HTTP unless the app allows it (App Transport Security). Many such links
+        // also work over HTTPS, so try that, once per host in case HTTPS redirects back to HTTP.
+        if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorAppTransportSecurityRequiresSecureConnection,
+           let failed = nsError.userInfo[NSURLErrorFailingURLErrorKey] as? URL, failed.scheme?.lowercased() == "http",
+           let host = failed.host?.lowercased(), httpsRetriedHosts.insert(host).inserted,
+           var components = URLComponents(url: failed, resolvingAgainstBaseURL: false) {
+            components.scheme = "https"
+            if let secure = components.url {
+                store?.show("系统不允许不加密的 HTTP 连接，正在改用 HTTPS 打开")
+                webView.load(URLRequest(url: secure))
+                return
+            }
+        }
         store?.show("打不开网页：\(error.localizedDescription)")
     }
 

@@ -290,6 +290,14 @@ private final class BrowserWebHost: UIView {
         }
     }
 
+    /// Tries again if the navigation controller was not reachable yet when the view joined the window.
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if window != nil && paused.isEmpty {
+            pauseGestures()
+        }
+    }
+
     private func pauseGestures() {
         guard let navigation = enclosingNavigationController() else { return }
         var candidates: [UIGestureRecognizer?] = [navigation.interactivePopGestureRecognizer]
