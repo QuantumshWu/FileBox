@@ -16,7 +16,10 @@ struct FileItem: Identifiable, Hashable {
 
     var kind: FileKind {
         if isDirectory { return .folder }
-        guard let type = UTType(filenameExtension: url.pathExtension.lowercased()) else { return .other }
+        let ext = url.pathExtension.lowercased()
+        // JPEG spellings the system does not always map to an image type.
+        if ["jfif", "jpe", "pjpeg", "pjp"].contains(ext) { return .image }
+        guard let type = UTType(filenameExtension: ext) else { return .other }
         if type.conforms(to: .image) { return .image }
         if type.conforms(to: .movie) || type.conforms(to: .video) { return .video }
         if type.conforms(to: .audio) { return .audio }

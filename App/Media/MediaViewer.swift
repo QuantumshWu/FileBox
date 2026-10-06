@@ -131,7 +131,12 @@ struct MediaViewer: View {
                 onQuickLook: { openInQuickLook($0) }
             )
         case .video, .audio:
-            MediaPlayablePage(item: item, onTap: { toggleChrome() }, onQuickLook: { openInQuickLook($0) })
+            MediaPlayablePage(
+                item: item,
+                onTap: { toggleChrome() },
+                onClose: { viewer.close() },
+                onQuickLook: { openInQuickLook($0) }
+            )
         case .folder, .other:
             ZStack {
                 Color.black

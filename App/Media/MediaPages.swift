@@ -73,12 +73,19 @@ struct MediaImagePage: View {
 struct MediaPlayablePage: View {
     let item: FileItem
     let onTap: () -> Void
+    /// Swiped up or down far enough: the picture follows the finger, shrinks and closes the viewer.
+    let onClose: () -> Void
     let onQuickLook: (URL) -> Void
 
     @ObservedObject private var playback = MediaPlaybackController.shared
     @Environment(\.displayScale) private var displayScale
     @State private var isPlayable: Bool?
     @State private var poster: UIImage?
+    @State private var dragOffset: CGSize = .zero
+
+    private var dragScale: CGFloat {
+        1 - 0.15 * min(1, abs(dragOffset.height) / 300)
+    }
 
     var body: some View {
         ZStack {
@@ -93,7 +100,19 @@ struct MediaPlayablePage: View {
                 .contentShape(Rectangle())
                 .onTapGesture(perform: onTap)
             } else if playback.currentURL == item.url {
-                MediaPlayerHost(onTap: onTap)
+                MediaPlayerHost(
+                    onTap: onTap,
+                    onDismissDrag: { offset in
+                        if let offset {
+                            dragOffset = offset
+                        } else {
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { dragOffset = .zero }
+                        }
+                    },
+                    onDismiss: onClose
+                )
+                .scaleEffect(dragScale)
+                .offset(dragOffset)
             } else {
                 placeholder
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -161,16 +180,24 @@ struct MediaUnsupportedView: View {
 /// page, so the page only borrows it: whichever host comes on screen last takes it.
 struct MediaPlayerHost: UIViewControllerRepresentable {
     let onTap: () -> Void
+    let onDismissDrag: (CGSize?) -> Void
+    let onDismiss: () -> Void
 
     func makeUIViewController(context: Context) -> MediaPlayerHostController {
         let controller = MediaPlayerHostController()
-        controller.onTap = onTap
+        configure(controller)
         return controller
     }
 
     func updateUIViewController(_ controller: MediaPlayerHostController, context: Context) {
-        controller.onTap = onTap
+        configure(controller)
         controller.attachPlayer(force: false)
+    }
+
+    private func configure(_ controller: MediaPlayerHostController) {
+        controller.onTap = onTap
+        controller.onDismissDrag = onDismissDrag
+        controller.onDismiss = onDismiss
     }
 
     static func dismantleUIViewController(_ controller: MediaPlayerHostController, coordinator: Coordinator) {
@@ -180,6 +207,10 @@ struct MediaPlayerHost: UIViewControllerRepresentable {
 
 final class MediaPlayerHostController: UIViewController, UIGestureRecognizerDelegate {
     var onTap: (() -> Void)?
+    var onDismissDrag: ((CGSize?) -> Void)?
+    var onDismiss: (() -> Void)?
+
+    private let dismissPan = UIPanGestureRecognizer()
 
     override func loadView() {
         let host = MediaWindowObservingView()
@@ -205,6 +236,45 @@ final class MediaPlayerHostController: UIViewController, UIGestureRecognizerDele
         tap.delegate = self
         tap.require(toFail: doubleTap)
         view.addGestureRecognizer(tap)
+        // Swipe up or down to close, like an image page.
+        dismissPan.addTarget(self, action: #selector(handleDismissPan(_:)))
+        dismissPan.maximumNumberOfTouches = 1
+        dismissPan.delegate = self
+        view.addGestureRecognizer(dismissPan)
+    }
+
+    /// Far or fast enough closes the viewer; otherwise the picture goes back.
+    @objc private func handleDismissPan(_ pan: UIPanGestureRecognizer) {
+        let translation = pan.translation(in: nil)
+        switch pan.state {
+        case .began, .changed:
+            onDismissDrag?(CGSize(width: translation.x, height: translation.y))
+        case .ended:
+            let velocity = pan.velocity(in: nil).y
+            let flung = abs(velocity) > 800 && (velocity > 0) == (translation.y > 0)
+            if abs(translation.y) > 100 || flung {
+                onDismiss?()
+            } else {
+                onDismissDrag?(nil)
+            }
+        default:
+            onDismissDrag?(nil)
+        }
+    }
+
+    /// The swipe to close starts only for a mostly vertical drag.
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === dismissPan else { return true }
+        let velocity = dismissPan.velocity(in: view)
+        return abs(velocity.y) > abs(velocity.x) * 1.5
+    }
+
+    /// Paging sideways waits until a drag turns out not to be a swipe to close.
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        gestureRecognizer === dismissPan && otherGestureRecognizer is UIPanGestureRecognizer && otherGestureRecognizer.view is UIScrollView
     }
 
     override func viewDidLayoutSubviews() {
@@ -247,7 +317,7 @@ final class MediaPlayerHostController: UIViewController, UIGestureRecognizerDele
     }
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-        true
+        gestureRecognizer !== dismissPan && otherGestureRecognizer !== dismissPan
     }
 
     /// Taps on the player's buttons and slider only work those.
