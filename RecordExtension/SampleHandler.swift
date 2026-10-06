@@ -24,6 +24,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
     /// Format of the first buffer each audio input encoded; buffers in another format are dropped.
     private var appAudioFormat: AudioStreamBasicDescription?
     private var micAudioFormat: AudioStreamBasicDescription?
+    /// Presentation time of the last sample each input accepted.
+    private var lastVideoTime = CMTime.invalid
+    private var lastAppAudioTime = CMTime.invalid
+    private var lastMicAudioTime = CMTime.invalid
     /// Set once the recording is stopping or has failed; later samples are ignored.
     private var isClosed = false
 
@@ -46,11 +50,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
             switch sampleBufferType {
             case .video:
                 if writer == nil, let message = startWriting(with: sampleBuffer) { return message }
-                append(sampleBuffer, to: videoInput)
+                append(sampleBuffer, to: videoInput, after: &lastVideoTime)
             case .audioApp:
-                appendAudio(sampleBuffer, to: appAudioInput, format: &appAudioFormat)
+                appendAudio(sampleBuffer, to: appAudioInput, format: &appAudioFormat, after: &lastAppAudioTime)
             case .audioMic:
-                appendAudio(sampleBuffer, to: micAudioInput, format: &micAudioFormat)
+                appendAudio(sampleBuffer, to: micAudioInput, format: &micAudioFormat, after: &lastMicAudioTime)
             @unknown default:
                 break
             }
@@ -135,22 +139,31 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
     }
 
-    private func append(_ sampleBuffer: CMSampleBuffer, to input: AVAssetWriterInput?) {
+    /// Appends only samples that move the input's time forward: a repeated or earlier timestamp
+    /// would fail the writer and lose the whole recording, while dropping one sample is barely noticeable.
+    private func append(_ sampleBuffer: CMSampleBuffer, to input: AVAssetWriterInput?, after last: inout CMTime) {
         guard let input, input.isReadyForMoreMediaData else { return }
-        input.append(sampleBuffer)
+        let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        guard time.isValid, !last.isValid || time > last else { return }
+        if input.append(sampleBuffer) { last = time }
     }
 
     /// Appends audio only in the format the input started with. The microphone's format can change
     /// mid-recording (headphones connected), and feeding the encoder another format would fail the
     /// writer and lose the whole recording; losing that track's audio from then on is the lesser harm.
-    private func appendAudio(_ sampleBuffer: CMSampleBuffer, to input: AVAssetWriterInput?, format: inout AudioStreamBasicDescription?) {
+    private func appendAudio(
+        _ sampleBuffer: CMSampleBuffer,
+        to input: AVAssetWriterInput?,
+        format: inout AudioStreamBasicDescription?,
+        after last: inout CMTime
+    ) {
         guard let input, input.isReadyForMoreMediaData,
               let description = CMSampleBufferGetFormatDescription(sampleBuffer),
               let incoming = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee
         else { return }
         if let expected = format, !Self.sameFormat(expected, incoming) { return }
         format = incoming
-        input.append(sampleBuffer)
+        append(sampleBuffer, to: input, after: &last)
     }
 
     private static func sameFormat(_ a: AudioStreamBasicDescription, _ b: AudioStreamBasicDescription) -> Bool {

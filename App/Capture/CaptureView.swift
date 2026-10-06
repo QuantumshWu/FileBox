@@ -127,6 +127,7 @@ struct CaptureView: View {
                 CaptureBroadcastPicker(handle: pickerHandle)
                     .opacity(0.02)
                     .allowsHitTesting(false)
+                    .accessibilityHidden(true)
             }
             .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
