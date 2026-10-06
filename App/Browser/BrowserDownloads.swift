@@ -114,7 +114,8 @@ private final class BrowserRedirectDelegate: NSObject, URLSessionTaskDelegate {
 }
 
 /// Runs the browser's downloads (WebKit downloads, and URLSession fetches of page media) and moves
-/// finished files into the vault's 下载 folder. Everything stops when the browser closes.
+/// finished files into the vault's 下载 folder. They keep running while the 文件 tab is shown and
+/// stop when the app locks.
 @MainActor
 final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelegate {
     @Published private(set) var items: [BrowserDownload] = []
@@ -473,7 +474,7 @@ struct BrowserDownloadsSheet: View {
     @ObservedObject var downloads: BrowserDownloadManager
     @Environment(\.dismiss) private var dismiss
 
-    private static let footnote = "下载的文件保存在 FileBox 的「下载」文件夹。下载只在浏览器开着时进行：离开浏览器或 FileBox 切到后台时，没下载完的文件会停止下载。"
+    private static let footnote = "下载的文件保存在 FileBox 的「下载」文件夹。切换到「文件」时下载会继续；FileBox 切到后台（自动锁定）时，没下载完的文件会停止下载。"
 
     var body: some View {
         NavigationStack {
