@@ -25,9 +25,6 @@ struct MediaViewer: View {
 
     private let urls: [URL]
 
-    /// Black between pages while swiping, as in Photos.
-    private static let pageGap: CGFloat = 20
-
     init(items: [FileItem], startIndex: Int) {
         self.items = items
         self.startIndex = startIndex
@@ -46,18 +43,15 @@ struct MediaViewer: View {
             Color.black.ignoresSafeArea()
             // Covered by the pages, but on screen: image PiP takes its picture from here.
             MediaImagePiPLayerHost().ignoresSafeArea()
-            // Keeps that picture out of the gaps between pages.
-            Color.black.ignoresSafeArea()
+            // A paging TabView must be exactly as wide as the screen: widening it to show gaps
+            // between pages moved the current page off screen.
             TabView(selection: $selection) {
                 ForEach(items.indices, id: \.self) { index in
                     page(for: items[index])
-                        .padding(.horizontal, Self.pageGap / 2)
                         .tag(index)
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
-            // Pages one gap wider than the screen: a page still fills it, the gap shows while swiping.
-            .padding(.horizontal, -Self.pageGap / 2)
             .ignoresSafeArea()
 
             if chromeVisible {
