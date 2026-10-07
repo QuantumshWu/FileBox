@@ -154,14 +154,39 @@ final class ViewerPresentationProbeView: UIView {
 /// lower and smaller on a Dynamic Island iPhone), and moved up and grew to the whole screen at the
 /// first layout after the animation ended; closing with the button moved them back down. Laid out
 /// edge to edge outside the scale, they are only drawn smaller and never move.
+///
+/// The fade and the scale are worked out by SwiftUI on every frame (`ViewerPagerFade`). Left to
+/// SwiftUI's own animation of the hosted pager, it handed them to Core Animation in pieces, and as
+/// one piece gave way to the next the closing picture came back for a frame at three quarters of
+/// its opacity and almost full size.
 struct ViewerPagerFrame<Content: View>: View {
     @ObservedObject var transition: ViewerTransition
     @ViewBuilder let content: Content
 
     var body: some View {
         content
-            .opacity(transition.contentOpacity)
-            .scaleEffect(transition.contentScale)
+            .modifier(ViewerPagerFade(opacity: transition.contentOpacity, scale: transition.contentScale))
+    }
+}
+
+/// Opacity and scale as one animatable value: SwiftUI interpolates it and sets the result on each
+/// frame, so what is drawn is always exactly the animation's current value.
+private struct ViewerPagerFade: ViewModifier, Animatable {
+    var opacity: Double
+    var scale: CGFloat
+
+    var animatableData: AnimatablePair<Double, CGFloat> {
+        get { AnimatablePair(opacity, scale) }
+        set {
+            opacity = newValue.first
+            scale = newValue.second
+        }
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(opacity)
+            .scaleEffect(scale)
     }
 }
 
