@@ -645,10 +645,17 @@ struct FolderView: View {
         tracking.revision = revision
         tracking.sort = sort
         if listing.items != items {
-            if animated && abs(listing.items.count - items.count) < 150 {
-                withAnimation(.snappy) { items = listing.items }
-            } else {
+            // The grid keeps its top file in place when the content changes; at the very top,
+            // files sorted in front of it should come into view instead of staying above it.
+            let keepsTop = layout == .grid && gridAnchor != nil && gridAnchor == visibleItems.first?.url
+            let change = {
                 items = listing.items
+                if keepsTop, let top = visibleItems.first?.url, top != gridAnchor { gridAnchor = top }
+            }
+            if animated && abs(listing.items.count - items.count) < 150 {
+                withAnimation(.snappy, change)
+            } else {
+                change()
             }
             mediaItems = listing.media
             previewURLs = listing.previews
