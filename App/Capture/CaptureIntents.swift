@@ -3,8 +3,8 @@ import Foundation
 import UniformTypeIdentifiers
 
 /// Shortcuts action "保存截图到 FileBox". Together with the "截屏" action and Back Tap it puts
-/// screenshots straight into the vault, so they never reach Photos. It runs in the background app
-/// process and only uses `Vault`; open folders refresh the next time the app becomes active.
+/// screenshots straight into the vault, so they never reach Photos. It runs in the app's process
+/// (in the background) and only uses `Vault`, then tells FileStore so open folders show the file.
 struct CaptureSaveScreenshotIntent: AppIntent {
     static var title: LocalizedStringResource = "保存截图到 FileBox"
     static var description: IntentDescription? = IntentDescription("把截图存进 FileBox 的「截图」文件夹，不会进入「照片」。")
@@ -23,6 +23,7 @@ struct CaptureSaveScreenshotIntent: AppIntent {
         let ext = CaptureIntentFiles.fileExtension(of: screenshot, fallback: "png")
         let name = "截图 \(CaptureIntentFiles.timestamp()).\(ext)"
         try CaptureIntentFiles.save(screenshot, named: name, in: Vault.folder(Vault.screenshotsName))
+        CaptureIntentFiles.announceChange()
         return .result()
     }
 }
@@ -43,8 +44,12 @@ struct CaptureSaveFilesIntent: AppIntent {
     func perform() async throws -> some IntentResult & ProvidesDialog {
         guard !files.isEmpty else { throw CaptureIntentError.emptyFile }
         let folder = Vault.folder(Vault.receivedName)
+        var saved = 0
+        // Also after a failure part-way, for the files saved before it.
+        defer { if saved > 0 { CaptureIntentFiles.announceChange() } }
         for file in files {
             try CaptureIntentFiles.save(file, named: CaptureIntentFiles.name(of: file), in: folder)
+            saved += 1
         }
         let count = files.count
         let dialog: IntentDialog = count == 1 ? "已保存到「收件箱」" : "已保存 \(count) 个文件到「收件箱」"
@@ -90,6 +95,11 @@ private enum CaptureIntentFiles {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
         return formatter.string(from: date)
+    }
+
+    /// Lets FileStore (in this process when the app is running) reload open folders.
+    static func announceChange() {
+        NotificationCenter.default.post(name: Notification.Name("FileBoxVaultChanged"), object: nil)
     }
 
     /// The file's own extension, else the one for its type, else `fallback`.

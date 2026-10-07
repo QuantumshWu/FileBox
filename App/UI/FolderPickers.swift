@@ -12,7 +12,8 @@ struct FolderMovePicker: View {
 
     @EnvironmentObject private var store: FileStore
     @Environment(\.dismiss) private var dismiss
-    @State private var targets: [Target] = []
+    /// nil while the vault is being walked.
+    @State private var targets: [Target]?
 
     private struct Target: Identifiable {
         let url: URL
@@ -23,6 +24,13 @@ struct FolderMovePicker: View {
         var id: URL { url }
     }
 
+    /// One of the items being moved, as normalized paths.
+    private struct Moving {
+        let path: String
+        let isFolder: Bool
+        let parent: String
+    }
+
     private var title: String {
         if merging, let item = items.first { return "合并「\(item.name)」到…" }
         return items.count == 1 ? "移动「\(items[0].name)」" : "移动 \(items.count) 项"
@@ -30,7 +38,7 @@ struct FolderMovePicker: View {
 
     var body: some View {
         NavigationStack {
-            List(targets) { target in
+            List(targets ?? []) { target in
                 Button {
                     onMove(target.url)
                 } label: {
@@ -48,6 +56,11 @@ struct FolderMovePicker: View {
                 .disabled(!target.isAllowed)
             }
             .listStyle(.plain)
+            .overlay {
+                if targets == nil {
+                    ProgressView()
+                }
+            }
             .safeAreaInset(edge: .top) {
                 if merging, let item = items.first {
                     Text("「\(item.name)」里的所有内容会放进你选的文件夹：同名文件夹会合并，同名文件会自动改名，不会覆盖。之后「\(item.name)」会被删除。")
@@ -66,24 +79,39 @@ struct FolderMovePicker: View {
                     Button("取消") { dismiss() }
                 }
             }
-            .onAppear(perform: load)
+            .task { await load() }
         }
     }
 
-    private func load() {
+    /// Walks the vault's folders in the background, so the sheet slides up at once even when the
+    /// vault holds thousands of files.
+    private func load() async {
+        guard targets == nil else { return }
+        let root = store.rootURL
+        let isMerging = merging
         let moving = items.map { item in
-            (path: store.normalizedPath(item.url),
-             isFolder: item.isDirectory,
-             parent: store.normalizedPath(item.url.deletingLastPathComponent()))
+            Moving(
+                path: store.normalizedPath(item.url),
+                isFolder: item.isDirectory,
+                parent: store.normalizedPath(item.url.deletingLastPathComponent())
+            )
         }
-        targets = store.allFolders().map { entry in
-            let path = store.normalizedPath(entry.url)
+        let found = await Task.detached(priority: .userInitiated) {
+            FolderMovePicker.buildTargets(root: root, moving: moving, merging: isMerging)
+        }.value
+        targets = found
+    }
+
+    nonisolated private static func buildTargets(root: URL, moving: [Moving], merging: Bool) -> [Target] {
+        let rootPath = FileStore.normalize(root)
+        return FileStore.allFolderURLs(root: root).map { entry in
+            let path = FileStore.normalize(entry.url)
             let insideMoved = moving.contains { $0.isFolder && (path == $0.path || path.hasPrefix($0.path + "/")) }
             let alreadyThere = moving.allSatisfy { $0.parent == path }
             return Target(
                 url: entry.url,
                 depth: entry.depth,
-                name: store.isRoot(entry.url) ? "FileBox" : entry.url.lastPathComponent,
+                name: path == rootPath ? "FileBox" : entry.url.lastPathComponent,
                 isAllowed: !insideMoved && (merging || !alreadyThere)
             )
         }

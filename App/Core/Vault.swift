@@ -11,20 +11,12 @@ struct FileItem: Identifiable, Hashable {
     let isDirectory: Bool
     let size: Int64
     let modified: Date
+    /// Worked out once from the extension; views ask for it all the time.
+    let kind: FileKind
+    /// Visible entries inside a folder, when the listing counted them.
+    let childCount: Int?
 
     var id: URL { url }
-
-    var kind: FileKind {
-        if isDirectory { return .folder }
-        let ext = url.pathExtension.lowercased()
-        // JPEG spellings the system does not always map to an image type.
-        if ["jfif", "jpe", "pjpeg", "pjp"].contains(ext) { return .image }
-        guard let type = UTType(filenameExtension: ext) else { return .other }
-        if type.conforms(to: .image) { return .image }
-        if type.conforms(to: .movie) || type.conforms(to: .video) { return .video }
-        if type.conforms(to: .audio) { return .audio }
-        return .other
-    }
 
     /// Images, videos and audio open in the media viewer; everything else in Quick Look.
     var isMedia: Bool {
@@ -34,12 +26,14 @@ struct FileItem: Identifiable, Hashable {
         }
     }
 
-    init(url: URL, name: String, isDirectory: Bool, size: Int64, modified: Date) {
+    init(url: URL, name: String, isDirectory: Bool, size: Int64, modified: Date, childCount: Int? = nil) {
         self.url = url
         self.name = name
         self.isDirectory = isDirectory
         self.size = size
         self.modified = modified
+        self.kind = Self.kind(of: url, isDirectory: isDirectory)
+        self.childCount = childCount
     }
 
     /// Reads the file's current attributes from disk.
@@ -52,6 +46,18 @@ struct FileItem: Identifiable, Hashable {
             size: Int64(values?.fileSize ?? 0),
             modified: values?.contentModificationDate ?? .distantPast
         )
+    }
+
+    private static func kind(of url: URL, isDirectory: Bool) -> FileKind {
+        if isDirectory { return .folder }
+        let ext = url.pathExtension.lowercased()
+        // JPEG spellings the system does not always map to an image type.
+        if ["jfif", "jpe", "pjpeg", "pjp"].contains(ext) { return .image }
+        guard let type = UTType(filenameExtension: ext) else { return .other }
+        if type.conforms(to: .image) { return .image }
+        if type.conforms(to: .movie) || type.conforms(to: .video) { return .video }
+        if type.conforms(to: .audio) { return .audio }
+        return .other
     }
 }
 
@@ -173,37 +179,37 @@ enum Vault {
         let fm = FileManager.default
         prepareTrash()
         let id = UUID().uuidString
-        let box = trashRoot.appendingPathComponent(id, isDirectory: true)
-        try fm.createDirectory(at: box, withIntermediateDirectories: true)
-        let isFolder = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        let box = trashBox(id)
+        let record = trashRecord(id)
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
+        let isFolder = values?.isDirectory == true
         let entry = TrashEntry(
             id: id,
             name: url.lastPathComponent,
             originalFolder: relativePath(of: url.deletingLastPathComponent()),
             deletedAt: Date(),
             isDirectory: isFolder,
-            size: isFolder ? size(of: url) : Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            // A folder's size is never shown, and adding it up would walk the whole tree.
+            size: isFolder ? 0 : Int64(values?.fileSize ?? 0)
         )
+        // The record goes first: an item in the trash without one could never be restored.
+        try JSONEncoder().encode(entry).write(to: record)
         do {
+            try fm.createDirectory(at: box, withIntermediateDirectories: true)
             try fm.moveItem(at: url, to: entry.url)
         } catch {
             try? fm.removeItem(at: box)
+            try? fm.removeItem(at: record)
             throw error
         }
-        try JSONEncoder().encode(entry).write(to: trashRoot.appendingPathComponent(id + ".json"))
     }
 
-    /// Everything in the trash, most recently deleted first.
+    /// Everything in the trash that can still be restored, most recently deleted first.
     static func trashEntries() -> [TrashEntry] {
         let fm = FileManager.default
-        guard let urls = try? fm.contentsOfDirectory(at: trashRoot, includingPropertiesForKeys: nil) else { return [] }
-        return urls
-            .filter { $0.pathExtension == "json" }
-            .compactMap { url in
-                guard let data = try? Data(contentsOf: url) else { return nil }
-                return try? JSONDecoder().decode(TrashEntry.self, from: data)
-            }
-            .filter { fm.fileExists(atPath: $0.url.path) }
+        let now = Date()
+        return trashRecords()
+            .filter { $0.expiresAt >= now && fm.fileExists(atPath: $0.url.path) }
             .sorted { $0.deletedAt > $1.deletedAt }
     }
 
@@ -211,6 +217,10 @@ enum Vault {
     /// taken in the meantime is merged or numbered). Returns that folder.
     @discardableResult
     static func restoreFromTrash(_ entry: TrashEntry) throws -> URL {
+        // Without its description the item is already being deleted for good (in the background).
+        guard FileManager.default.fileExists(atPath: trashRecord(entry.id).path) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
         let folder = entry.originalFolder.isEmpty ? root : root.appendingPathComponent(entry.originalFolder, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try merge(entry.url, into: folder, move: true)
@@ -219,25 +229,65 @@ enum Vault {
     }
 
     static func removeFromTrash(_ entry: TrashEntry) {
-        let fm = FileManager.default
-        try? fm.removeItem(at: trashRoot.appendingPathComponent(entry.id, isDirectory: true))
-        try? fm.removeItem(at: trashRoot.appendingPathComponent(entry.id + ".json"))
+        removeTrashBox(entry)
+        removeTrashRecord(entry)
     }
 
-    /// Removes for good what has been in the trash longer than `trashDays`, and leftovers.
+    /// Drops the item's description, which takes it off the trash list at once.
+    static func removeTrashRecord(_ entry: TrashEntry) {
+        try? FileManager.default.removeItem(at: trashRecord(entry.id))
+    }
+
+    /// Deletes the item itself; a big folder can take a while.
+    static func removeTrashBox(_ entry: TrashEntry) {
+        try? FileManager.default.removeItem(at: trashBox(entry.id))
+    }
+
+    /// Removes for good what has been in the trash longer than `trashDays`, and leftovers. The
+    /// expired items' descriptions go at once, the items themselves off the main thread.
     static func purgeTrash() {
         let fm = FileManager.default
         let now = Date()
-        let entries = trashEntries()
-        for entry in entries where entry.expiresAt < now {
-            removeFromTrash(entry)
-        }
-        // Boxes without a description (or the other way round) can never be restored.
-        let known = Set(entries.filter { $0.expiresAt >= now }.map(\.id))
-        for url in (try? fm.contentsOfDirectory(at: trashRoot, includingPropertiesForKeys: nil)) ?? [] {
+        let records = trashRecords()
+        let expired = records.filter { $0.expiresAt < now }
+        expired.forEach(removeTrashRecord)
+        // Boxes without a description (or the other way round) can never be restored. Only old
+        // ones go: an item being deleted right now briefly has a description and no item.
+        let known = Set(records.filter { $0.expiresAt >= now && fm.fileExists(atPath: $0.url.path) }.map(\.id))
+        let expiredIDs = Set(expired.map(\.id))
+        let cutoff = now.addingTimeInterval(-3600)
+        let leftovers = (try? fm.contentsOfDirectory(at: trashRoot, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        for url in leftovers {
             let id = url.pathExtension == "json" ? url.deletingPathExtension().lastPathComponent : url.lastPathComponent
-            if !known.contains(id) { try? fm.removeItem(at: url) }
+            if known.contains(id) || expiredIDs.contains(id) { continue }
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            if modified < cutoff { try? fm.removeItem(at: url) }
         }
+        guard !expired.isEmpty else { return }
+        Task.detached(priority: .utility) {
+            expired.forEach(Vault.removeTrashBox)
+        }
+    }
+
+    /// Every description in the trash, expired or not.
+    private static func trashRecords() -> [TrashEntry] {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(at: trashRoot, includingPropertiesForKeys: nil) else { return [] }
+        let decoder = JSONDecoder()
+        return urls
+            .filter { $0.pathExtension == "json" }
+            .compactMap { url in
+                guard let data = try? Data(contentsOf: url) else { return nil }
+                return try? decoder.decode(TrashEntry.self, from: data)
+            }
+    }
+
+    private static func trashBox(_ id: String) -> URL {
+        trashRoot.appendingPathComponent(id, isDirectory: true)
+    }
+
+    private static func trashRecord(_ id: String) -> URL {
+        trashRoot.appendingPathComponent(id + ".json")
     }
 
     private static func prepareTrash() {
@@ -260,16 +310,6 @@ enum Vault {
         let path = clean(url)
         guard path.hasPrefix(rootPath + "/") else { return "" }
         return String(path.dropFirst(rootPath.count + 1))
-    }
-
-    private static func size(of folder: URL) -> Int64 {
-        guard let enumerator = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.fileSizeKey])
-        else { return 0 }
-        var total: Int64 = 0
-        for case let url as URL in enumerator {
-            total += Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-        }
-        return total
     }
 
     private static func migrateFromDocuments() {
