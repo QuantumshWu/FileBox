@@ -178,7 +178,11 @@ struct MediaViewer: View {
         MediaDiagnostics.log("打开查看页面")
         let request = viewer.request
         hub.viewerAppeared(token: token, requestID: request?.id, items: items, coordinator: viewer)
-        transition.appear(animated: request?.animated ?? true)
+        // Once: closing an editor or Quick Look over the viewer makes it appear again.
+        if !paging.appeared {
+            paging.appeared = true
+            transition.appear(animated: request?.animated ?? true)
+        }
         pageChanged(to: selection, from: nil)
         if currentItem?.kind == .audio { chrome.show() }
     }
@@ -360,6 +364,7 @@ struct MediaViewer: View {
         var rotationUntil = Date.distantPast
         /// Set between deleting a file and the viewer getting its new list.
         var deletedKind: FileKind?
+        var appeared = false
 
         init(settled: Int) {
             self.settled = settled

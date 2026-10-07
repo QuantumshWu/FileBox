@@ -550,6 +550,12 @@ final class MediaPlayerHostController: UIViewController, UIGestureRecognizerDele
         }
     }
 
+    /// 2× only for a playing video; on a paused one a held finger can still swipe to close or page.
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        if gestureRecognizer === longPress { return MediaPlaybackController.shared.isPlaying }
+        return true
+    }
+
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         if gestureRecognizer === dismiss.pan || otherGestureRecognizer === dismiss.pan { return false }
         // Held for 2×, the finger neither pages nor closes.

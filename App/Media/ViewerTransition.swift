@@ -95,7 +95,8 @@ struct ViewerBackdrop: View {
 
     var body: some View {
         ZStack {
-            Color.black.opacity(transition.backdrop)
+            // Only under the PiP layer; otherwise it would double the black above while fading.
+            Color.black.opacity(hidesPictureInPictureLayer ? 0 : transition.backdrop)
             MediaImagePiPLayerHost()
                 .opacity(hidesPictureInPictureLayer ? 0 : 1)
             // Keeps that picture out of the gaps between pages.
