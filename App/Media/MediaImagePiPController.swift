@@ -46,8 +46,9 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     private var refreshTimer: Timer?
     private var slideshowTimer: Timer?
     private var pendingRestore: ((Bool) -> Void)?
-    /// PiP asked to go back to the viewer, so its stop is not the user closing it with the X.
-    private var isRestoringFromPictureInPicture = false
+    /// The coming stop is not the user closing PiP with its X: PiP goes back into the viewer (its
+    /// restore button, the app coming back) or the viewer ends it (its button, a video page).
+    private var stopKeepsViewer = false
     private var restoreID = UUID()
     private var reportedPaused: Bool?
     private var reportedCount = 0
@@ -78,6 +79,9 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         center.publisher(for: UIApplication.willResignActiveNotification)
             .sink { [weak self] _ in self?.willResignActive() }
             .store(in: &observers)
+        center.publisher(for: UIApplication.willEnterForegroundNotification)
+            .sink { [weak self] _ in self?.catchUpOnClosedPictureInPicture() }
+            .store(in: &observers)
     }
 
     // MARK: - Viewer
@@ -95,7 +99,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     func leaveImagePage() {
         onImagePage = false
         startWhenPossible = false
-        if isActive || isStarting { controller?.stopPictureInPicture() }
+        if isActive || isStarting { stopKeepingViewer() }
         updateArming()
     }
 
@@ -117,15 +121,27 @@ final class MediaImagePiPController: NSObject, ObservableObject {
 
     /// FileBox is back on screen while the image floats: it goes back into the viewer.
     func endPictureInPictureForReturn() {
-        guard isActive, let controller else { return }
-        isRestoringFromPictureInPicture = true
+        catchUpOnClosedPictureInPicture()
+        guard isActive, !stopKeepsViewer, let controller, controller.isPictureInPictureActive else { return }
+        stopKeepsViewer = true
         controller.stopPictureInPicture()
+    }
+
+    /// The window was closed with its X while the app was away, and iOS may tell only some time
+    /// after the app is back: as soon as AVKit's own state shows it, the viewer closes, before it
+    /// is seen again. The late report then finds nothing left to do.
+    private func catchUpOnClosedPictureInPicture() {
+        guard isActive, !stopKeepsViewer, pendingRestore == nil, let controller,
+              !controller.isPictureInPictureActive
+        else { return }
+        MediaDiagnostics.log("图片小窗已在 App 外关闭")
+        pictureInPictureDidStop()
     }
 
     /// The manual PiP button.
     func toggle() {
         if isActive || isStarting {
-            controller?.stopPictureInPicture()
+            stopKeepingViewer()
             return
         }
         let hub = MediaViewerHub.shared
@@ -459,9 +475,18 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         updateArming()
     }
 
+    /// Ends PiP for a reason of the viewer's own; the viewer stays.
+    private func stopKeepingViewer() {
+        guard let controller else { return }
+        stopKeepsViewer = true
+        controller.stopPictureInPicture()
+    }
+
     // MARK: - Picture in Picture events
 
     private func pictureInPictureWillStart() {
+        // A new window: no stop of an earlier one is still on its way.
+        stopKeepsViewer = false
         isStarting = true
         startWhenPossible = false
         updateArming()
@@ -478,6 +503,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
 
     private func pictureInPictureFailed() {
         MediaDiagnostics.log("图片小窗开启失败")
+        stopKeepsViewer = false
         isStarting = false
         isActive = false
         MediaViewerHub.shared.show("小窗暂时无法开启")
@@ -485,25 +511,28 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     }
 
     private func pictureInPictureDidStop() {
-        let restoring = isRestoringFromPictureInPicture
-        MediaDiagnostics.log(restoring ? "图片小窗回到全屏" : "图片小窗已关闭")
-        isRestoringFromPictureInPicture = false
+        // Already handled (see `catchUpOnClosedPictureInPicture`).
+        guard isActive || isStarting || stopKeepsViewer else { return }
+        let keepsViewer = stopKeepsViewer
+        MediaDiagnostics.log(keepsViewer ? "图片小窗回到全屏" : "图片小窗已关闭")
+        stopKeepsViewer = false
         isStarting = false
         isActive = false
         setSlideshow(false)
         finishRestore(false)
         let hub = MediaViewerHub.shared
-        if !restoring && !LockManager.shared.isUnlocked {
-            // Closed with its X while locked: nothing of it may be left on return.
+        let urls = sessionItems.map(\.url)
+        if !keepsViewer {
+            // Closed with its X: the viewer it floated from closes at once, so coming back shows
+            // the page the viewer was opened from.
             teardown()
-            hub.closeViewerAfterPictureInPicture()
+            hub.closeViewerAfterPictureInPicture(of: urls)
             return
         }
-        // Closed with its X after the viewer had closed: nothing is left to show.
         if hub.isViewerPresented {
             updateArming()
-            hub.checkInBackground(after: 0.6)
         } else {
+            // Back from PiP, but the viewer could not take it: nothing is left to show.
             teardown()
         }
     }
@@ -511,7 +540,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     /// Brings the viewer back on the floating image (reopening it if it was closed) before PiP
     /// animates into it.
     private func restoreUserInterface(_ completion: @escaping (Bool) -> Void) {
-        isRestoringFromPictureInPicture = true
+        stopKeepsViewer = true
         guard let index = currentIndex, sessionItems.indices.contains(index) else {
             completion(false)
             return

@@ -38,8 +38,9 @@ struct ViewerRequest: Identifiable {
     }
 }
 
-/// Opens the full-screen media viewer. It is presented by RootView above everything else, so a
-/// playing video (and its Picture in Picture) survives the app locking itself in the background.
+/// Opens the full-screen media viewer. It is presented by RootView above everything else, so nothing
+/// underneath dismisses it, and it stays open on the same file while the app is in the background.
+/// It closes with its close button, a swipe, or Picture in Picture closed with its X.
 @MainActor
 final class ViewerCoordinator: ObservableObject {
     @Published var request: ViewerRequest?
@@ -52,12 +53,13 @@ final class ViewerCoordinator: ObservableObject {
         }
     }
 
-    /// Closes with the system's dismissal (the app going to the background, the hub).
+    /// Closes with the system's dismissal.
     func close() {
         request = nil
     }
 
-    /// Closes at once: the viewer has already animated its content away.
+    /// Closes at once: the viewer has already animated its content away, or PiP's X closed it and
+    /// nothing of it may be seen going.
     func closeImmediately() {
         withoutAnimation { request = nil }
     }
@@ -85,8 +87,9 @@ final class ViewerCoordinator: ObservableObject {
 final class PlaybackState: ObservableObject {
     static let shared = PlaybackState()
 
-    /// True while a video is playing or Picture in Picture is active or about to start. Then going to
-    /// the background keeps the viewer open and skips the privacy shield, which would block PiP.
+    /// True while the viewer is open and a video plays, or Picture in Picture is active, armed or
+    /// about to start. Going to the background then skips the privacy shield, which would keep PiP
+    /// from starting.
     @Published var keepsViewerInBackground = false
     @Published var isPictureInPictureActive = false
 }

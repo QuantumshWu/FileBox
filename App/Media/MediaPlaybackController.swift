@@ -115,13 +115,15 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     private var automaticAdvance = false
     private var failuresInARow = 0
     private var wasPlayingWhenResigning = false
-    /// Set when the app leaves the screen mid-playback, so the viewer survives iOS pausing the video.
+    /// Set when the app leaves the screen mid-playback, so iOS pausing the video for PiP doesn't
+    /// let the privacy shield in, which would keep PiP from starting.
     private var holdsForBackground = false
     private var wasPlayingBeforeInterruption = false
     private var detachedForBackground = false
     private var pendingRestore: ((Bool) -> Void)?
-    /// PiP asked to go back to the viewer, so its stop is not the user closing it with the X.
-    private var isRestoringFromPictureInPicture = false
+    /// The coming stop is not the user closing PiP with its X: PiP goes back into the viewer (its
+    /// restore button, the app coming back) or the viewer's own button ends it.
+    private var stopKeepsViewer = false
     private var restoreID = UUID()
     private var remoteCommandsReady = false
     private var remoteCommandsEnabled = false
@@ -296,6 +298,9 @@ final class MediaPlaybackController: NSObject, ObservableObject {
             }
         }
         player.play()
+        // The lock screen in the background, with the viewer still open on the paused video: iOS
+        // would pause it again while its picture is attached, so only the sound plays on.
+        if UIApplication.shared.applicationState == .background { keepPlayingInBackgroundIfNeeded() }
     }
 
     func pause() {
@@ -315,13 +320,25 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// FileBox is back on screen while the video floats: it goes back into the viewer and keeps
     /// playing there, so there is never a floating window and a full one at the same time.
     func endPictureInPictureForReturn() {
+        catchUpOnClosedPictureInPicture()
         // A restore the user tapped is already bringing it back.
-        guard !isRestoringFromPictureInPicture, pendingRestore == nil,
+        guard !stopKeepsViewer, pendingRestore == nil,
               let controller = pictureInPicture, controller.isPictureInPictureActive
         else { return }
         MediaDiagnostics.log("回到 App，收起视频小窗")
-        isRestoringFromPictureInPicture = true
+        stopKeepsViewer = true
         controller.stopPictureInPicture()
+    }
+
+    /// The window was closed with its X while the app was away, and iOS may tell only some time
+    /// after the app is back: as soon as AVKit's own state shows it, the viewer closes, before it
+    /// is seen again. The late report then finds nothing left to do.
+    private func catchUpOnClosedPictureInPicture() {
+        guard isPictureInPictureActive, !stopKeepsViewer, pendingRestore == nil,
+              let controller = pictureInPicture, !controller.isPictureInPictureActive
+        else { return }
+        MediaDiagnostics.log("视频小窗已在 App 外关闭")
+        pictureInPictureDidStop()
     }
 
     /// The manual PiP button.
@@ -332,12 +349,20 @@ final class MediaPlaybackController: NSObject, ObservableObject {
             return
         }
         if controller.isPictureInPictureActive {
-            controller.stopPictureInPicture()
+            endPictureInPictureForViewer()
         } else if controller.isPictureInPicturePossible {
             controller.startPictureInPicture()
         } else {
             MediaViewerHub.shared.show("小窗暂时无法开启")
         }
+    }
+
+    /// The viewer takes the floating video back (its PiP button, an editor about to cover it); the
+    /// viewer stays.
+    func endPictureInPictureForViewer() {
+        guard let controller = pictureInPicture, controller.isPictureInPictureActive else { return }
+        stopKeepsViewer = true
+        controller.stopPictureInPicture()
     }
 
     /// Stops playback and forgets the folder.
@@ -614,6 +639,8 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         } else if autoplay {
             player.play()
         }
+        // The next file from the lock screen while the viewer waits in the background (see `play`).
+        if autoplay && UIApplication.shared.applicationState == .background { keepPlayingInBackgroundIfNeeded() }
         updateBuffering()
         if file.kind == .audio { loadMetadata(of: item, url: file.url) }
         warmNeighbours(of: index)
@@ -1064,6 +1091,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     private func willEnterForeground() {
+        catchUpOnClosedPictureInPicture()
         guard detachedForBackground else { return }
         playerViewController.player = player
         detachedForBackground = false
@@ -1212,6 +1240,8 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     private func pictureInPictureWillStart() {
         MediaDiagnostics.log("视频小窗开始开启")
         endBoost()
+        // A new window: no stop of an earlier one is still on its way.
+        stopKeepsViewer = false
         isPictureInPictureStarting = true
         publishState()
     }
@@ -1224,6 +1254,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     private func pictureInPictureFailed() {
+        stopKeepsViewer = false
         isPictureInPictureStarting = false
         isPictureInPictureActive = false
         publishState()
@@ -1240,33 +1271,34 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     private func pictureInPictureDidStop() {
-        let restoring = isRestoringFromPictureInPicture
-        MediaDiagnostics.log(restoring ? "视频小窗回到全屏" : "视频小窗已关闭")
-        isRestoringFromPictureInPicture = false
+        // Already handled (see `catchUpOnClosedPictureInPicture`).
+        guard isPictureInPictureActive || isPictureInPictureStarting || stopKeepsViewer else { return }
+        let keepsViewer = stopKeepsViewer
+        MediaDiagnostics.log(keepsViewer ? "视频小窗回到全屏" : "视频小窗已关闭")
+        stopKeepsViewer = false
         isPictureInPictureStarting = false
         isPictureInPictureActive = false
         finishRestore(false)
         publishState()
         let hub = MediaViewerHub.shared
-        if !restoring && !LockManager.shared.isUnlocked {
-            // Closed with its X while locked: nothing of it may be left on return.
+        let urls = sessionItems.map(\.url)
+        if !keepsViewer {
+            // Closed with its X: the session is over, and the viewer it floated from closes at once,
+            // so coming back shows the page the viewer was opened from.
             stop()
-            hub.closeViewerAfterPictureInPicture()
+            hub.closeViewerAfterPictureInPicture(of: urls)
             return
         }
-        if !hub.isViewerPresented || hub.presentedURLs != sessionItems.map(\.url) {
-            // Closed with its X after the viewer had closed or moved on to another folder: the
-            // session is over.
+        if !hub.isViewerPresented || hub.presentedURLs != urls {
+            // Back from PiP, but the viewer could not take it (closed, or on another folder).
             stop()
-        } else {
-            hub.checkInBackground(after: 0.6)
         }
     }
 
     /// Brings the viewer back on the playing file (reopening it if it was closed) before PiP
     /// animates into it.
     private func restoreUserInterface(_ completion: @escaping (Bool) -> Void) {
-        isRestoringFromPictureInPicture = true
+        stopKeepsViewer = true
         guard let index = currentIndex, sessionItems.indices.contains(index) else {
             completion(false)
             return
