@@ -2,8 +2,9 @@ import QuickLook
 import SwiftUI
 
 /// Full-screen viewer for the images, videos and audio of one folder: swipe between the files,
-/// zoom images, play videos and audio with the system controls, and keep either one floating in
-/// Picture in Picture after leaving the app.
+/// zoom images, play videos and audio with the viewer's own controls, and keep either one floating
+/// in Picture in Picture after leaving the app. It fades in over the folder, and a page swiped up
+/// or down carries on in that direction while the folder shows through.
 struct MediaViewer: View {
     let items: [FileItem]
     let startIndex: Int
@@ -11,23 +12,21 @@ struct MediaViewer: View {
     @EnvironmentObject private var viewer: ViewerCoordinator
     @EnvironmentObject private var store: FileStore
     @EnvironmentObject private var lock: LockManager
-    @ObservedObject private var hub = MediaViewerHub.shared
-    @ObservedObject private var playback = MediaPlaybackController.shared
-    @ObservedObject private var imagePiP = MediaImagePiPController.shared
-    @AppStorage("mediaPlaybackMode") private var mode: MediaPlaybackMode = MediaPlaybackMode.defaultMode
 
     @State private var selection: Int
-    /// Like Photos: only the picture at first; a tap shows the bar (with the player's own controls
-    /// on video pages).
-    @State private var chromeVisible = false
-    /// Hides the bar of a playing video again after a few seconds, along with the player's controls.
-    @State private var chromeHideID = UUID()
+    // Plain references, observed only by the small views that draw them, so that taps, drags and
+    // playback never rebuild the pages.
+    @State private var transition: ViewerTransition
+    @State private var chrome: ViewerChromeModel
+    @State private var paging: PagingState
     @State private var token = UUID()
     @State private var editingImage: FileItem?
     @State private var trimmingVideo: FileItem?
     @State private var quickLookURL: URL?
 
     private let urls: [URL]
+    /// Each file's page. Pages are identified by file, so after a delete each keeps its own state.
+    private let tags: [URL: Int]
 
     /// Black between pages while swiping, as in Photos.
     private static let pageGap: CGFloat = 20
@@ -35,73 +34,78 @@ struct MediaViewer: View {
     init(items: [FileItem], startIndex: Int) {
         self.items = items
         self.startIndex = startIndex
-        urls = items.map(\.url)
+        let urls = items.map(\.url)
+        self.urls = urls
+        var tags: [URL: Int] = [:]
+        tags.reserveCapacity(urls.count)
+        for (index, url) in urls.enumerated() { tags[url] = index }
+        self.tags = tags
         let start = items.indices.contains(startIndex) ? startIndex : 0
         _selection = State(initialValue: start)
+        _transition = State(initialValue: ViewerTransition())
+        _chrome = State(initialValue: ViewerChromeModel())
+        _paging = State(initialValue: PagingState(settled: start))
     }
 
     private var currentItem: FileItem? {
         items.indices.contains(selection) ? items[selection] : nil
     }
 
+    private var hub: MediaViewerHub { .shared }
+    private var playback: MediaPlaybackController { .shared }
+    private var imagePiP: MediaImagePiPController { .shared }
+
+    private var coverIsUp: Bool {
+        editingImage != nil || trimmingVideo != nil || quickLookURL != nil
+    }
+
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
-            // Covered by the pages, but on screen: image PiP takes its picture from here.
-            MediaImagePiPLayerHost().ignoresSafeArea()
-            // Keeps that picture out of the gaps between pages.
-            Color.black.ignoresSafeArea()
-            TabView(selection: $selection) {
-                ForEach(items.indices, id: \.self) { index in
-                    page(for: items[index])
-                        .padding(.horizontal, Self.pageGap / 2)
-                        .tag(index)
-                }
+            ViewerBackdrop(transition: transition)
+            ViewerPagerFrame(transition: transition) {
+                pager
             }
-            .tabViewStyle(.page(indexDisplayMode: .never))
-            // Pages one gap wider than the screen: a page still fills it, the gap shows while swiping.
-            .padding(.horizontal, -Self.pageGap / 2)
-            .ignoresSafeArea()
-
-            if chromeVisible {
-                VStack(spacing: 0) {
-                    topBar
-                    Spacer(minLength: 0)
-                    if let kind = currentItem?.kind, kind == .video || kind == .audio {
-                        MediaVideoControls(onInteraction: { scheduleChromeHide() })
-                            .padding(.bottom, 8)
+            ViewerChrome(
+                items: items,
+                selection: selection,
+                model: chrome,
+                transition: transition,
+                onClose: { fadeExit() },
+                onEditImage: { editImage($0) },
+                onTrimVideo: { trimVideo($0) },
+                onDelete: { delete($0) }
+            )
+            ViewerFollower(selection: $selection, items: items, urls: urls)
+        }
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onChange(of: geometry.size.width) { oldWidth, newWidth in
+                        if oldWidth > 0, abs(oldWidth - newWidth) > 1 { rotationStarted() }
                     }
-                }
-                .transition(.opacity)
             }
+            .ignoresSafeArea()
         }
-        .overlay(alignment: .bottom) { toast }
-        .animation(.easeInOut(duration: 0.2), value: hub.toast)
+        .background(ViewerPresentationProbe().frame(width: 0, height: 0))
         .environment(\.colorScheme, .dark)
-        .statusBarHidden(!chromeVisible)
-        .persistentSystemOverlays(chromeVisible ? .automatic : .hidden)
-        .onAppear {
-            MediaDiagnostics.log("打开查看页面")
-            hub.viewerAppeared(token: token, items: items, coordinator: viewer)
-            pageChanged(to: selection)
-        }
+        // Light status bar and dark menus over the black viewer, also in light mode.
+        .preferredColorScheme(.dark)
+        // The folder stays underneath and shows through while a page is dragged away.
+        .presentationBackground(Color.clear)
+        .onAppear { appeared() }
         .onDisappear {
             MediaDiagnostics.log("关闭查看页面")
             hub.viewerDisappeared(token: token)
         }
         .onChange(of: selection) { oldIndex, index in
-            pageChanged(to: index)
-            updateChrome(from: oldIndex, to: index)
+            selectionChanged(from: oldIndex, to: index)
         }
-        .onChange(of: hub.pageRequest) { _, request in
-            guard let request, request.urls == urls, items.indices.contains(request.index) else { return }
-            selection = request.index
+        .onChange(of: urls) { _, _ in
+            itemsChanged()
         }
-        .onChange(of: playback.currentIndex) { _, index in
-            followPlayback(to: index)
-        }
-        .onChange(of: mode) { _, newMode in
-            hub.show("播放方式：\(newMode.title)")
+        .onChange(of: coverIsUp) { _, up in
+            chrome.coverUp = up
+            if !up { chrome.interacted() }
         }
         .fullScreenCover(item: $editingImage) { item in
             ImageEditorView(item: item)
@@ -122,42 +126,92 @@ struct MediaViewer: View {
 
     // MARK: - Pages
 
+    private var pager: some View {
+        TabView(selection: $selection) {
+            ForEach(items) { item in
+                page(for: item)
+                    // Edge to edge, whatever the bars and the notch take; only the bars keep clear.
+                    .ignoresSafeArea()
+                    .padding(.horizontal, Self.pageGap / 2)
+                    .tag(tags[item.url] ?? 0)
+            }
+        }
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        // Pages one gap wider than the screen: a page still fills it, the gap shows while swiping.
+        .padding(.horizontal, -Self.pageGap / 2)
+        .ignoresSafeArea()
+    }
+
     @ViewBuilder
     private func page(for item: FileItem) -> some View {
+        let bars = chrome
         switch item.kind {
         case .image:
             MediaImagePage(
                 item: item,
-                onTap: { toggleChrome() },
-                onClose: { viewer.close() },
+                transition: transition,
+                onTap: { bars.toggle() },
+                onDismiss: { flingExit() },
                 onQuickLook: { openInQuickLook($0) }
             )
         case .video, .audio:
             MediaPlayablePage(
                 item: item,
-                onTap: { toggleChrome() },
-                onClose: { viewer.close() },
+                transition: transition,
+                onTap: { bars.toggle() },
+                onInteraction: { bars.interacted() },
+                onDismiss: { flingExit() },
                 onQuickLook: { openInQuickLook($0) }
             )
         case .folder, .other:
-            ZStack {
-                Color.black
-                MediaUnsupportedView(message: "无法预览这个文件", url: item.url, onQuickLook: { openInQuickLook($0) })
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { toggleChrome() }
+            ViewerUnsupportedPage(
+                item: item,
+                transition: transition,
+                onTap: { bars.toggle() },
+                onDismiss: { flingExit() },
+                onQuickLook: { openInQuickLook($0) }
+            )
         }
     }
 
-    /// Hands the new page to the engine that plays it.
-    private func pageChanged(to index: Int) {
+    private func appeared() {
+        MediaDiagnostics.log("打开查看页面")
+        let request = viewer.request
+        hub.viewerAppeared(token: token, requestID: request?.id, items: items, coordinator: viewer)
+        transition.appear(animated: request?.animated ?? true)
+        pageChanged(to: selection, from: nil)
+        if currentItem?.kind == .audio { chrome.show() }
+    }
+
+    private func selectionChanged(from oldIndex: Int, to index: Int) {
+        if Date() < paging.rotationUntil {
+            // Turning the phone can make the pager jump; stay on the page that was showing.
+            if index != paging.settled {
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) { selection = paging.settled }
+            }
+            return
+        }
+        pageChanged(to: index, from: oldIndex)
+        // After a delete, `itemsChanged` decides about the bars.
+        guard paging.deletedKind == nil else { return }
+        arrive(at: index, fromKind: items.indices.contains(oldIndex) ? items[oldIndex].kind : nil)
+    }
+
+    /// Hands the new page to the engine that plays it, and gets the neighbours ready.
+    private func pageChanged(to index: Int, from oldIndex: Int?) {
         guard items.indices.contains(index) else { return }
         let item = items[index]
+        paging.settled = index
+        if playback.isBoosted { playback.endBoost() }
         switch item.kind {
         case .video, .audio:
-            imagePiP.leaveImagePage()
-            playback.setAutomaticPictureInPicture(true)
+            // Only a video floats when the app leaves the screen; audio just plays on.
+            playback.setAutomaticPictureInPicture(item.kind == .video)
             playback.show(items, at: index, autoplay: true)
+            // After the player took the audio session, so it never goes off in between.
+            imagePiP.leaveImagePage()
         case .image:
             playback.leavePlayablePage()
             playback.setAutomaticPictureInPicture(false)
@@ -167,184 +221,148 @@ struct MediaViewer: View {
             playback.setAutomaticPictureInPicture(false)
             imagePiP.leaveImagePage()
         }
+        // A video's own shape decides once it is known (see ViewerChrome).
+        if item.kind != .video { ViewerOrientation.restorePortrait() }
+        chrome.currentKind = item.kind
+        chrome.currentURL = item.url
+        prefetchImages(around: index, from: oldIndex)
+        warmPlayers(around: index)
+        // The folder list scrolls to this file, so closing lands on it.
+        NotificationCenter.default.post(
+            name: Notification.Name("FileBoxViewerPageChanged"),
+            object: nil,
+            userInfo: ["url": item.url]
+        )
     }
 
-    /// The player moved on to another file of this folder (playback mode, lock screen); follow it
-    /// while a video or audio page is showing.
-    private func followPlayback(to index: Int?) {
-        guard let index, index != selection, items.indices.contains(index),
-              let item = currentItem, item.kind == .video || item.kind == .audio,
-              playback.sessionItems.map(\.url) == urls
-        else { return }
-        selection = index
-    }
-
-    /// On video and audio pages the same tap also shows or hides the player's own controls, so
-    /// the bar follows them, including hiding again a few seconds into playback.
-    private func toggleChrome() {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            chromeVisible.toggle()
+    /// Decodes the images next to the page, the way the user is swiping first.
+    private func prefetchImages(around index: Int, from oldIndex: Int?) {
+        let forward = oldIndex.map { index >= $0 } ?? true
+        let order = forward ? [index + 1, index - 1, index + 2] : [index - 1, index + 1, index - 2]
+        let images = order.compactMap { i -> FileItem? in
+            items.indices.contains(i) && items[i].kind == .image ? items[i] : nil
         }
-        scheduleChromeHide()
+        MediaImageLoader.prefetch(images, maxPixel: MediaImageLoader.displayMaxPixel)
     }
 
-    private func scheduleChromeHide() {
-        let id = UUID()
-        chromeHideID = id
-        guard chromeVisible, let kind = currentItem?.kind, kind == .video || kind == .audio else { return }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            guard chromeHideID == id, chromeVisible, playback.isPlaying,
-                  let kind = currentItem?.kind, kind == .video || kind == .audio
-            else { return }
-            withAnimation(.easeInOut(duration: 0.2)) {
-                chromeVisible = false
-            }
+    /// Opens the videos and audio next to the page ahead of time, so they start quickly.
+    private func warmPlayers(around index: Int) {
+        let playable = [index - 1, index + 1].compactMap { i -> FileItem? in
+            guard items.indices.contains(i) else { return nil }
+            let kind = items[i].kind
+            return kind == .video || kind == .audio ? items[i] : nil
         }
+        if !playable.isEmpty { PlayerAssetCache.warm(playable) }
     }
 
-    /// A new video or audio page starts with just the picture; moving between images keeps what
-    /// the last tap chose.
-    private func updateChrome(from oldIndex: Int, to index: Int) {
+    /// A new video page starts with just the picture; moving between images keeps what the last
+    /// tap chose; audio shows its controls.
+    private func arrive(at index: Int, fromKind: FileKind?) {
         guard items.indices.contains(index) else { return }
         switch items[index].kind {
         case .image:
-            if items.indices.contains(oldIndex), items[oldIndex].kind == .image { return }
-        case .video, .audio:
-            break
+            if fromKind == .image { return }
+            chrome.hide()
+        case .video:
+            chrome.hide()
+        case .audio:
+            chrome.show()
         case .folder, .other:
             return
         }
-        chromeHideID = UUID()
-        guard chromeVisible else { return }
-        withAnimation(.easeInOut(duration: 0.2)) {
-            chromeVisible = false
+    }
+
+    private func rotationStarted() {
+        paging.rotationUntil = Date().addingTimeInterval(0.5)
+    }
+
+    // MARK: - Closing
+
+    /// A page was swiped away: it flies off by itself while the backdrop fades.
+    private func flingExit() {
+        exitViewer(duration: 0.22, fadeContent: false)
+    }
+
+    /// The close button (or deleting the last file): everything fades out together.
+    private func fadeExit() {
+        exitViewer(duration: 0.2, fadeContent: true)
+    }
+
+    private func exitViewer(duration: Double, fadeContent: Bool) {
+        guard !transition.isExiting else { return }
+        // First, so the pause below doesn't bring the bars back.
+        transition.isExiting = true
+        if !playback.isPictureInPictureEngaged { playback.pause() }
+        let coordinator = viewer
+        let requestID = coordinator.request?.id
+        transition.exit(duration: duration, fadeContent: fadeContent) {
+            // Nothing is left on screen; playback stops as the request goes.
+            guard requestID != nil, coordinator.request?.id == requestID else { return }
+            coordinator.closeImmediately()
         }
     }
 
+    // MARK: - Actions
+
+    private func editImage(_ item: FileItem) {
+        // The editor covers the viewer, and with it the layer the floating image comes from.
+        if imagePiP.isEngaged { imagePiP.toggle() }
+        ViewerOrientation.restorePortrait()
+        chrome.coverUp = true
+        editingImage = item
+    }
+
+    private func trimVideo(_ item: FileItem) {
+        playback.pause()
+        ViewerOrientation.restorePortrait()
+        chrome.coverUp = true
+        trimmingVideo = item
+    }
+
     private func openInQuickLook(_ url: URL) {
+        chrome.coverUp = true
         playback.pause()
         quickLookURL = url
     }
 
-    // MARK: - Chrome
-
-    private var topBar: some View {
-        HStack(spacing: 8) {
-            Button { viewer.close() } label: { barIcon("xmark") }
-                .accessibilityLabel("关闭")
-            titleCapsule
-                .frame(maxWidth: .infinity)
-            if let item = currentItem {
-                actions(for: item)
-            }
+    /// Moves the file to the trash and shows the next one (the one before, if it was the last).
+    private func delete(_ item: FileItem) {
+        if playback.currentURL == item.url { playback.stop() }
+        if item.kind == .image, imagePiP.isEngaged { imagePiP.leaveImagePage() }
+        store.delete([item])
+        guard items.count > 1, let index = items.firstIndex(where: { $0.url == item.url }) else {
+            fadeExit()
+            return
         }
-        .foregroundStyle(.white)
-        .frame(height: 44)
-        .padding(.horizontal, 12)
-        .padding(.bottom, 6)
+        paging.deletedKind = item.kind
+        if index == items.count - 1, selection == index {
+            selection = index - 1
+        }
+        viewer.remove(item.url)
     }
 
-    private var titleCapsule: some View {
-        VStack(spacing: 0) {
-            Text(currentItem?.name ?? "")
-                .font(.footnote.weight(.semibold))
-                .lineLimit(1)
-                .truncationMode(.middle)
-            if items.count > 1 {
-                Text("\(selection + 1) / \(items.count)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.white.opacity(0.75))
-            }
-        }
-        .padding(.horizontal, 12)
-        .frame(minHeight: 38)
-        .mediaBarGlass(Capsule())
+    /// The request now has a file fewer (see `delete`): the viewer stays, with the pages it has.
+    private func itemsChanged() {
+        guard !items.isEmpty else { return }
+        if !items.indices.contains(selection) { selection = items.count - 1 }
+        let deletedKind = paging.deletedKind
+        paging.deletedKind = nil
+        hub.viewerAppeared(token: token, requestID: viewer.request?.id, items: items, coordinator: viewer)
+        pageChanged(to: selection, from: nil)
+        arrive(at: selection, fromKind: deletedKind)
     }
 
-    @ViewBuilder
-    private func actions(for item: FileItem) -> some View {
-        ShareLink(item: item.url) {
-            barIcon("square.and.arrow.up")
-        }
-        .accessibilityLabel("分享")
-        switch item.kind {
-        case .image:
-            Button {
-                // The editor covers the viewer, and with it the layer the floating image comes from.
-                if imagePiP.isEngaged { imagePiP.toggle() }
-                editingImage = item
-            } label: { barIcon("crop.rotate") }
-                .accessibilityLabel("编辑")
-            Button { imagePiP.toggle() } label: {
-                barIcon(imagePiP.isActive ? "pip.exit" : "pip.enter")
-            }
-            .accessibilityLabel("小窗")
-        case .video:
-            Button {
-                playback.pause()
-                trimmingVideo = item
-            } label: { barIcon("scissors") }
-                .accessibilityLabel("编辑")
-            modeMenu
-            Button { playback.togglePictureInPicture() } label: {
-                barIcon(playback.isPictureInPictureActive ? "pip.exit" : "pip.enter")
-            }
-            .accessibilityLabel("小窗")
-        case .audio:
-            modeMenu
-        case .folder, .other:
-            EmptyView()
-        }
-    }
+    /// Bookkeeping that must not re-render the viewer.
+    private final class PagingState {
+        /// The page last handed to the engines.
+        var settled: Int
+        /// Until then the pager may jump because the phone turned; such jumps are undone.
+        var rotationUntil = Date.distantPast
+        /// Set between deleting a file and the viewer getting its new list.
+        var deletedKind: FileKind?
 
-    private var modeMenu: some View {
-        Menu {
-            Picker("播放方式", selection: $mode) {
-                ForEach(MediaPlaybackMode.allCases) { option in
-                    Label(option.title, systemImage: option.symbol)
-                        .tag(option)
-                }
-            }
-        } label: {
-            barIcon(mode.symbol)
-        }
-        .accessibilityLabel("播放方式")
-    }
-
-    private func barIcon(_ name: String) -> some View {
-        Image(systemName: name)
-            .font(.system(size: 16, weight: .semibold))
-            .foregroundStyle(.white)
-            .frame(width: 38, height: 38)
-            .mediaBarGlass(Circle())
-            .contentShape(Circle())
-    }
-
-    @ViewBuilder
-    private var toast: some View {
-        if let message = hub.toast ?? store.banner {
-            Text(message)
-                .font(.subheadline)
-                .foregroundStyle(.white)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(.thinMaterial, in: Capsule())
-                .padding(.horizontal, 24)
-                .padding(.bottom, 96)
-                .transition(.opacity)
-                .allowsHitTesting(false)
-        }
-    }
-}
-
-private extension View {
-    /// Dark glass behind the bar's controls, so white symbols stay readable over bright pictures.
-    func mediaBarGlass<S: Shape>(_ shape: S) -> some View {
-        background {
-            shape.fill(.ultraThinMaterial)
-                .overlay { shape.fill(Color.black.opacity(0.3)) }
+        init(settled: Int) {
+            self.settled = settled
         }
     }
 }
