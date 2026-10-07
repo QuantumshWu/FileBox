@@ -190,10 +190,10 @@ private struct ViewerPagerFade: ViewModifier, Animatable {
     }
 }
 
-/// Hosts the pager without a SwiftUI safe area, so nothing in a page can depend on it: the bars and
-/// the status bar showing or hiding (which changes the safe area on iPhones without a notch) or the
-/// phone turning never move a page. It fills whatever frame it is given; the viewer gives it the
-/// whole screen (see ViewerPagerFrame).
+/// Hosts the pager without a SwiftUI safe area, so no page's layout depends on it: the bars and the
+/// status bar showing or hiding (which changes the safe area on iPhones without a notch) never move
+/// a page. It fills whatever frame it is given; the viewer gives it the whole screen (see
+/// ViewerPagerFrame).
 struct ViewerEdgeToEdge<Content: View>: UIViewControllerRepresentable {
     let content: Content
 
@@ -230,5 +230,20 @@ final class ViewerEdgeToEdgeController<Content: View>: UIHostingController<Conte
         #if DEBUG
         ViewerProbe.shared.register(view, as: "edgeHost")
         #endif
+    }
+
+    /// Cancels the safe area the viewer around passes down, so the UIKit views inside (the
+    /// pager's scroll view and its pages) get none either.
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        let added = additionalSafeAreaInsets
+        let insets = view.safeAreaInsets
+        let cancelling = UIEdgeInsets(
+            top: added.top - insets.top,
+            left: added.left - insets.left,
+            bottom: added.bottom - insets.bottom,
+            right: added.right - insets.right
+        )
+        if cancelling != added { additionalSafeAreaInsets = cancelling }
     }
 }
