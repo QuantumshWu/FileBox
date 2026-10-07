@@ -147,7 +147,12 @@ final class MediaPlayerClock: ObservableObject {
             MainActor.assumeIsolated { self?.refresh() }
         }
         // The length is known as soon as the item is, without waiting for a tick.
-        player.publisher(for: \.currentItem?.duration)
+        player.publisher(for: \.currentItem)
+            .map { item -> AnyPublisher<Void, Never> in
+                guard let item else { return Just(()).eraseToAnyPublisher() }
+                return item.publisher(for: \.duration).map { _ in () }.eraseToAnyPublisher()
+            }
+            .switchToLatest()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.refreshDuration() }
             .store(in: &subscriptions)
