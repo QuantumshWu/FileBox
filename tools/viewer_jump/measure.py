@@ -39,8 +39,11 @@ import numpy as np
 from PIL import Image
 
 COLUMNS = (0.25, 0.5, 0.75)
+# Just inside the picture's left and right red border, where the viewer's bars never are: these see
+# the picture's full height even while the bars cover its top or bottom edge in the middle columns.
+EDGE_COLUMNS = (0.008, 0.992)
 CSV_KEYS = ["index", "t", "file", "h", "seen", "top_pt", "bot_pt", "centre_pt", "green_pt", "estimate_pt"]
-for _c in COLUMNS:
+for _c in COLUMNS + EDGE_COLUMNS:
     CSV_KEYS += [f"red_top@{_c}", f"red_top_inner@{_c}", f"red_bot@{_c}", f"red_bot_inner@{_c}", f"green@{_c}"]
 
 
@@ -82,8 +85,8 @@ def measure_frame(path):
     array = np.asarray(image)
     height, width, _ = array.shape
     result = {"file": os.path.basename(path), "w": width, "h": height}
-    for fraction in COLUMNS:
-        x = int(round(width * fraction))
+    for fraction in COLUMNS + EDGE_COLUMNS:
+        x = min(width - 2, max(1, int(round(width * fraction))))
         # Three neighbouring columns, so one compression artefact never decides alone.
         strip = np.median(array[:, max(0, x - 1):x + 2, :], axis=1)
         for key, value in column_metrics(strip).items():
@@ -119,11 +122,18 @@ def summary_values(row, scale):
         g = row.get(f"green@{c}") if c != 0.5 else None
         if g is not None and t < g < b:
             greens.append(g)
+    edges = []
+    for c in EDGE_COLUMNS:
+        t, b = row.get(f"red_top@{c}"), row.get(f"red_bot@{c}")
+        if t is not None and b is not None and (b - t) / scale >= MIN_HEIGHT_PT:
+            edges.append((t + b) / 2)
     to_pt = lambda v: None if v is None else v / scale
     seen = len(centres) + len(greens)
-    # The pattern's centre: the median of every estimate (each column's middle of the red border and
-    # each green line), so one column caught by a page sliding past never decides alone.
-    estimate = median(centres + greens)
+    # The pattern's centre: from the side borders when the picture reaches the screen's sides (the
+    # bars never cover them), otherwise the median of every middle estimate (each column's middle of
+    # the red border and each green line), so one column caught by a page sliding past or a bar
+    # over an edge never decides alone.
+    estimate = median(edges) if edges else median(centres + greens)
     return (to_pt(median(tops)), to_pt(median(bots)), to_pt(median(centres)), to_pt(median(greens)),
             to_pt(estimate), seen)
 
