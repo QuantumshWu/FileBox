@@ -165,6 +165,9 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// The file waits for its saved position before it may play or show its first frame.
     private var awaitsResume = false
     private var resumeAutoplay = false
+    /// The saved position comes from an earlier visit (设置 → 记住播放位置), not from paging back
+    /// to the file in this session: only then does a message say where it continues.
+    private var announcesResume = false
 
     // Buffering and interruptions
     private var waitingToken: UUID?
@@ -590,6 +593,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         loadedItem = item
         awaitsResume = resumeAt != nil
         resumeAutoplay = autoplay && resumeAt != nil
+        announcesResume = resumeAt != nil && sessionPositions[file.url] == nil
         if presentationSize != .zero { presentationSize = .zero }
         artwork = nil
         artist = nil
@@ -886,9 +890,10 @@ final class MediaPlaybackController: NSObject, ObservableObject {
             // No longer waiting to play; playing itself reports through timeControlStatus.
             playbackStatusChanged()
         }
-        if let seconds {
+        if let seconds, announcesResume {
             MediaViewerHub.shared.show("从 \(MediaVideoControls.format(seconds)) 继续播放")
         }
+        announcesResume = false
         if player.timeControlStatus == .playing || playerViewController.playerLayer.isReadyForDisplay {
             let token = displayToken
             Task { [weak self] in
