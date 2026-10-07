@@ -2,21 +2,37 @@ import SwiftUI
 import UIKit
 import WebKit
 
-/// Private (non-persistent) web browser that saves downloads into the vault. It is the root of the
-/// 浏览器 tab: pages and downloads stay while the 文件 tab is shown, and the session ends when the
-/// app locks. All controls sit in the top bar, so the tab bar is the only bar at the bottom.
+/// The 浏览器 tab: the app's one browser (see `BrowserSession`). A new model after 清除浏览痕迹
+/// brings a new view, so nothing typed or opened in the old one stays.
+struct BrowserTab: View {
+    @EnvironmentObject private var session: BrowserSession
+
+    var body: some View {
+        let model = session.model
+        BrowserView(model: model)
+            .id(ObjectIdentifier(model))
+    }
+}
+
+/// Web browser that saves downloads into the vault. Pages, history, logins and downloads stay while
+/// the 文件 tab is shown, while locked and while the app is in the background; only 清除浏览痕迹
+/// removes them. All controls sit in the top bar, so the tab bar is the only bar at the bottom.
 struct BrowserView: View {
     @EnvironmentObject private var store: FileStore
     @EnvironmentObject private var lock: LockManager
-    @StateObject private var model = BrowserModel()
+    @EnvironmentObject private var session: BrowserSession
+    @ObservedObject private var model: BrowserModel
 
     @State private var address = ""
     @FocusState private var addressFocused: Bool
     @State private var sheet: BrowserSheet?
     @State private var collectingMedia = false
     @State private var promptText = ""
+    @State private var confirmingClear = false
 
-    init() {}
+    init(model: BrowserModel) {
+        _model = ObservedObject(wrappedValue: model)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -57,10 +73,12 @@ struct BrowserView: View {
         } message: { dialog in
             Text(dialog.message)
         }
-        // Switching tabs calls these; the session itself only ends when the app locks.
+        // Switching tabs and locking call these; the page itself stays loaded.
         .onAppear {
-            model.attach(store, lock: lock)
+            model.attach(store)
             model.isOnScreen = true
+            // The view is new after unlocking, but the page it shows may not be.
+            if !addressFocused { address = displayAddress }
         }
         .onDisappear { model.isOnScreen = false }
         .onChange(of: model.url) { _, _ in
@@ -74,7 +92,7 @@ struct BrowserView: View {
         }
         .task {
             try? await Task.sleep(nanoseconds: 600_000_000)
-            if model.url == nil { addressFocused = true }
+            if model.url == nil && model.focusesAddressAtStart { addressFocused = true }
         }
     }
 
@@ -169,34 +187,51 @@ struct BrowserView: View {
 
     private var startPage: some View {
         ContentUnavailableView {
-            Label("无痕浏览", systemImage: "eye.slash")
+            Label("浏览器", systemImage: "globe")
         } description: {
-            Text("在上方输入网址，或输入文字用必应搜索。\n切换到「文件」时网页和下载都会保留；FileBox 切到后台（自动锁定）时，浏览记录、Cookie 和网站数据都会清除。下载的文件保存在「下载」文件夹。")
+            Text("在上方输入网址，或输入文字用必应搜索。\n网页、登录状态和下载记录会一直保留，锁定也不会清除；需要时点右上角「更多」→「清除浏览痕迹」。下载的文件保存在「下载」文件夹。")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(uiColor: .systemBackground))
     }
 
+    /// Page actions, then 锁定 and 清除浏览痕迹, whose question appears at this button.
     private var pageMenu: some View {
         Menu {
             if let url = model.url {
-                ShareLink(item: url) {
-                    Label("分享链接", systemImage: "square.and.arrow.up")
+                Section {
+                    ShareLink(item: url) {
+                        Label("分享链接", systemImage: "square.and.arrow.up")
+                    }
+                    Button {
+                        UIPasteboard.general.url = url
+                        store.show("已拷贝链接")
+                    } label: {
+                        Label("拷贝链接", systemImage: "doc.on.doc")
+                    }
+                    Button { model.download(url) } label: {
+                        Label("下载此页面", systemImage: "arrow.down.doc")
+                    }
                 }
-                Button {
-                    UIPasteboard.general.url = url
-                    store.show("已拷贝链接")
-                } label: {
-                    Label("拷贝链接", systemImage: "doc.on.doc")
+            }
+            Section {
+                Button { lock.lock() } label: {
+                    Label("锁定", systemImage: "lock")
                 }
-                Button { model.download(url) } label: {
-                    Label("下载此页面", systemImage: "arrow.down.doc")
+                Button(role: .destructive) { confirmingClear = true } label: {
+                    Label("清除浏览痕迹", systemImage: "trash")
                 }
+                .disabled(session.isClearing)
             }
         } label: {
             BrowserBarIcon(title: "更多", systemImage: "ellipsis.circle")
         }
-        .disabled(model.url == nil)
+        .confirmationDialog("清除浏览痕迹？", isPresented: $confirmingClear, titleVisibility: .visible) {
+            Button("清除浏览痕迹", role: .destructive) { session.clearTraces(store: store) }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text(session.clearMessage)
+        }
     }
 
     // MARK: - Actions
@@ -234,20 +269,50 @@ private enum BrowserSheet: Identifiable {
     }
 }
 
-/// Hosts the model's web view, which outlives SwiftUI view updates and tab switches. It stays inside
-/// the safe area, so pages end above the tab bar instead of underneath it.
+/// Hosts the model's web view, which outlives SwiftUI view updates, tab switches and locking. It
+/// stays inside the safe area, so pages end above the tab bar instead of underneath it.
 private struct BrowserWebContainer: UIViewRepresentable {
     let webView: WKWebView
 
-    func makeUIView(context: Context) -> UIView {
-        let host = UIView()
-        webView.frame = host.bounds
-        webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        host.addSubview(webView)
-        return host
+    func makeUIView(context: Context) -> BrowserWebHost {
+        BrowserWebHost(webView: webView)
     }
 
-    func updateUIView(_ uiView: UIView, context: Context) {}
+    func updateUIView(_ uiView: BrowserWebHost, context: Context) {}
+}
+
+/// Takes the web view over from the host it had before locking. The web view keeps its size until
+/// this host has one, so the page is never laid out at zero width and keeps its scroll position.
+private final class BrowserWebHost: UIView {
+    private let webView: WKWebView
+
+    init(webView: WKWebView) {
+        self.webView = webView
+        super.init(frame: .zero)
+        webView.autoresizingMask = []
+        addSubview(webView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    /// Whichever host is on screen holds the web view.
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil && webView.superview !== self {
+            addSubview(webView)
+            setNeedsLayout()
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if !bounds.isEmpty && webView.frame != bounds {
+            webView.frame = bounds
+        }
+    }
 }
 
 /// An icon of the top bar with a comfortable tap area; the title is read by VoiceOver.

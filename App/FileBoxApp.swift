@@ -9,6 +9,7 @@ struct FileBoxApp: App {
     @StateObject private var viewer = ViewerCoordinator()
     @StateObject private var tabs = TabCoordinator()
     @StateObject private var nav = FolderUINavigation()
+    @StateObject private var browser = BrowserSession()
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -19,11 +20,14 @@ struct FileBoxApp: App {
                 .environmentObject(viewer)
                 .environmentObject(tabs)
                 .environmentObject(nav)
+                .environmentObject(browser)
                 .environmentObject(PlaybackState.shared)
                 .onOpenURL { url in
                     Task { await store.importIncoming(url) }
                 }
         }
+        // Locking is manual (锁定) or a fresh launch; leaving the app only puts up the privacy
+        // shield, so coming back finds the same tab, folder and open file.
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
@@ -31,21 +35,9 @@ struct FileBoxApp: App {
                     // Back in FileBox: the floating window goes back into the viewer.
                     MediaViewerHub.shared.endPictureInPictureForReturn()
                 }
-                if !lock.isUnlocked && viewer.request != nil && !PlaybackState.shared.isPictureInPictureActive {
-                    // The viewer outlived a Picture in Picture that has since been closed: come
-                    // back to the locked screen at once, with no closing animation to see.
-                    var transaction = Transaction()
-                    transaction.disablesAnimations = true
-                    withTransaction(transaction) { viewer.close() }
-                    Task {
-                        try? await Task.sleep(nanoseconds: 450_000_000)
-                        PrivacyShield.shared.hide()
-                    }
-                } else {
-                    PrivacyShield.shared.hide()
-                }
-                // No blanket reload: no folder survives the lock that leaving the app sets, and
-                // collecting reloads them when it brings anything in.
+                PrivacyShield.shared.hide()
+                // No blanket reload: files the extensions left while the app was away are collected
+                // here, which reloads the open folders when it brings anything in.
                 store.collectIncoming()
             case .inactive:
                 // Not behind a Photos prompt of our own, which makes the app inactive too.
@@ -54,11 +46,6 @@ struct FileBoxApp: App {
                 }
             case .background:
                 PrivacyShield.shared.show()
-                lock.lock()
-                tabs.selected = .files
-                if !PlaybackState.shared.keepsViewerInBackground {
-                    viewer.close()
-                }
             @unknown default:
                 break
             }

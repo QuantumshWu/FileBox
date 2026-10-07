@@ -1,4 +1,6 @@
+import Combine
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 import WebKit
 
@@ -115,7 +117,7 @@ private final class BrowserRedirectDelegate: NSObject, URLSessionTaskDelegate {
 
 /// Runs the browser's downloads (WebKit downloads, and URLSession fetches of page media) and moves
 /// finished files into the vault's 下载 folder. They keep running while the 文件 tab is shown and
-/// stop when the app locks.
+/// while locked; only 清除浏览痕迹 stops them.
 @MainActor
 final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelegate {
     @Published private(set) var items: [BrowserDownload] = []
@@ -125,6 +127,8 @@ final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelega
     private var ticker: Task<Void, Never>?
     /// Page-media downloads waiting for a free slot, oldest first.
     private var queue: [BrowserDownload] = []
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var appObservers: Set<AnyCancellable> = []
 
     /// Page media is fetched a few files at a time: requests that wait inside URLSession for a
     /// connection to the same server time out after a minute, which would fail big selections.
@@ -136,6 +140,13 @@ final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelega
         super.init()
         // Leftovers of a browser session that ended while downloading.
         Self.removeTemporaryFiles()
+        let center = NotificationCenter.default
+        center.publisher(for: UIApplication.didEnterBackgroundNotification)
+            .sink { [weak self] _ in self?.beginBackgroundTime() }
+            .store(in: &appObservers)
+        center.publisher(for: UIApplication.willEnterForegroundNotification)
+            .sink { [weak self] _ in self?.endBackgroundTime() }
+            .store(in: &appObservers)
     }
 
     /// Follows a download WebKit started (a link, a file response, or our own startDownload).
@@ -358,6 +369,25 @@ final class BrowserDownloadManager: NSObject, ObservableObject, WKDownloadDelega
     private func refreshCount() {
         let count = items.filter(\.isRunning).count
         if count != activeCount { activeCount = count }
+        if count == 0 { endBackgroundTime() }
+    }
+
+    /// Asks iOS for extra time when the app goes to the background in the middle of downloads, so
+    /// a quick look at another app does not break them.
+    private func beginBackgroundTime() {
+        guard activeCount > 0, backgroundTask == .invalid else { return }
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "FileBox downloads") { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.endBackgroundTime()
+            }
+        }
+    }
+
+    private func endBackgroundTime() {
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
     }
 
     /// Polls progress while anything runs; cheaper and simpler than observing every task.
@@ -474,7 +504,7 @@ struct BrowserDownloadsSheet: View {
     @ObservedObject var downloads: BrowserDownloadManager
     @Environment(\.dismiss) private var dismiss
 
-    private static let footnote = "下载的文件保存在 FileBox 的「下载」文件夹。切换到「文件」时下载会继续；FileBox 切到后台（自动锁定）时，没下载完的文件会停止下载。"
+    private static let footnote = "下载的文件保存在 FileBox 的「下载」文件夹。切换到「文件」或锁定时下载会继续；FileBox 切到后台太久，没下载完的文件可能会中断。"
 
     var body: some View {
         NavigationStack {
