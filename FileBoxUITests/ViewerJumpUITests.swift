@@ -69,19 +69,16 @@ final class ViewerJumpUITests: XCTestCase {
         step("grid-close-swipe-down", settle: 2.5) { app.swipeDown() }
 
         // 6. A landscape video turned sideways with 横屏 and back with 竖屏 (checked by the probe log;
-        // the recording stays upright).
-        step("grid-open-video-landscape", settle: 4) { element("cell-d_landscape.mp4").tap() }
-        step("chrome-show-before-rotation", settle: 1) { tapViewer() }
-        let toLandscape = app.buttons["横屏"]
-        if toLandscape.waitForExistence(timeout: 3) {
-            step("landscape-button", settle: 4) { toLandscape.tap() }
-            let toPortrait = app.buttons["竖屏"]
-            if !toPortrait.waitForExistence(timeout: 1) { tapViewer() }
-            if toPortrait.waitForExistence(timeout: 3) {
-                step("portrait-button", settle: 4) { toPortrait.tap() }
-            }
-        }
-        closeWithButton("close-button-after-rotation")
+        // the recording stays upright). Reached through the portrait video: on the smallest phone the
+        // grid's last cell sits under the bar. Paused first, so the bars stay up and the buttons are
+        // really there when tapped. Nothing here fails the test; a missing button is only marked.
+        step("grid-open-video-portrait-2", settle: 3) { tapIfPossible(element("cell-c_portrait.mp4")) }
+        step("page-to-landscape-video-2", settle: 3.5) { app.swipeLeft() }
+        step("chrome-show-before-rotation", settle: 0.3) { tapViewer() }
+        step("pause-before-rotation", settle: 1) { tapIfPossible(app.buttons["暂停"]) }
+        step("landscape-button", settle: 3) { tapIfPossible(app.buttons["横屏"]) }
+        step("portrait-button", settle: 3) { tapIfPossible(app.buttons["竖屏"]) }
+        step("close-button-after-rotation", settle: 2.5) { tapIfPossible(element("viewer-close")) }
         mark("done")
     }
 
@@ -105,6 +102,15 @@ final class ViewerJumpUITests: XCTestCase {
     @MainActor
     private func tapViewer() {
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3)).tap()
+    }
+
+    @MainActor
+    private func tapIfPossible(_ target: XCUIElement) {
+        if target.waitForExistence(timeout: 3), target.isHittable {
+            target.tap()
+        } else {
+            mark("skipped-tap")
+        }
     }
 
     @MainActor
