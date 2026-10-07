@@ -42,6 +42,10 @@ struct PickedFile: Transferable {
 enum FolderPhotoOriginals {
     /// Deletes the assets with these local identifiers and returns a message for the banner.
     static func delete(_ identifiers: [String]) async -> String {
+        await PrivacyShield.allowingPrompt { await deleteAssets(identifiers) }
+    }
+
+    private static func deleteAssets(_ identifiers: [String]) async -> String {
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         guard status == .authorized || status == .limited else {
             return "没有访问「照片」的权限，原件已保留。可以在「设置」→ FileBox → 照片 里允许访问"
@@ -69,5 +73,40 @@ enum FolderPhotoOriginals {
             return "已删除 \(assets.count) 个原件，另有 \(skipped) 个无法访问，已保留"
         }
         return "已从「照片」删除 \(assets.count) 个原件，可在「最近删除」里找回"
+    }
+}
+
+/// 存到「照片」: copies images and videos into the Photos library, asking only for permission to add.
+enum FolderUIPhotoSaver {
+    /// Saves the images and videos among `items` and returns a message for the banner.
+    static func save(_ items: [FileItem]) async -> String {
+        let media = items.filter { $0.kind == .image || $0.kind == .video }
+        guard !media.isEmpty else { return "只有图片和视频可以存到「照片」" }
+        let status = await PrivacyShield.allowingPrompt {
+            await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        }
+        guard status == .authorized || status == .limited else {
+            return "没有添加到「照片」的权限，可以在「设置」→ FileBox → 照片 里允许"
+        }
+        // One change per file, so one the library refuses does not take the others with it.
+        var saved = 0
+        var firstError: Error?
+        for item in media {
+            do {
+                try await PHPhotoLibrary.shared().performChanges {
+                    if item.kind == .video {
+                        _ = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: item.url)
+                    } else {
+                        _ = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: item.url)
+                    }
+                }
+                saved += 1
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+        guard let firstError else { return "已存到「照片」\(saved) 项" }
+        if saved == 0 { return "存到「照片」失败：\(firstError.localizedDescription)" }
+        return "已存到「照片」\(saved) 项，\(media.count - saved) 项失败：\(firstError.localizedDescription)"
     }
 }

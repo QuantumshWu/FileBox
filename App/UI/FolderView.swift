@@ -1,3 +1,5 @@
+import AVFoundation
+import Combine
 import PhotosUI
 import QuickLook
 import SwiftUI
@@ -9,10 +11,13 @@ import UniformTypeIdentifiers
 /// The root folder also carries the app's navigation (lock, capture, Wi-Fi transfer, settings).
 struct FolderView: View {
     let folder: URL
+    /// Worked out once; resolving paths on every render is not free.
+    private let isRoot: Bool
 
     @EnvironmentObject private var store: FileStore
     @EnvironmentObject private var lock: LockManager
     @EnvironmentObject private var viewer: ViewerCoordinator
+    @EnvironmentObject private var nav: FolderUINavigation
     @AppStorage("sortOrder") private var sort: SortOrder = .date
     /// List by default (the user prefers it); the grid is opt-in from the toolbar.
     @AppStorage("folderLayoutV2") private var layout: ItemLayout = .list
@@ -20,14 +25,20 @@ struct FolderView: View {
     @AppStorage("folderGridColumns") private var gridColumns = 4
     /// Magnification at the last column change of the current pinch.
     @State private var pinchBase: CGFloat = 1
+    /// The file at the top of the grid, kept up to date by the scroll view. Only handed on as a
+    /// binding, never read while rendering, so scrolling does not re-render the folder.
+    @State private var gridAnchor: URL?
 
     @State private var items: [FileItem] = []
-    @State private var loaded = false
+    /// Derived from `items` whenever they load, so rendering never works them out again.
+    @State private var mediaItems: [FileItem] = []
+    @State private var previewURLs: [URL] = []
     @State private var videoCount = 0
+    @State private var loaded = false
+    /// Bookkeeping that must not re-render the folder when it changes.
+    @State private var tracking = Tracking()
     @State private var query = ""
     @State private var quickLookURL: URL?
-    /// Screens opened from the root toolbar; a NavigationLink inside a Menu is unreliable.
-    @State private var menuRoute: Route?
 
     @State private var selecting = false
     @State private var selection: Set<URL> = []
@@ -52,10 +63,44 @@ struct FolderView: View {
     @State private var photoItems: [PhotosPickerItem] = []
     /// Photos library identifiers of just-imported items, while asking whether to delete them there.
     @State private var pendingPhotoDeletion: [String]?
-    @State private var progress: String?
+    @State private var importStatus: ImportStatus?
+    @State private var importTask: Task<Void, Never>?
+
+    init(folder: URL) {
+        self.folder = folder
+        isRoot = Self.plainPath(folder) == Self.rootPath
+    }
+
+    private static let rootPath = plainPath(Vault.root)
+    private static let viewerPageChanged = Notification.Name("FileBoxViewerPageChanged")
+
+    /// A path to compare without touching the disk.
+    private static func plainPath(_ url: URL) -> String {
+        var path = url.standardizedFileURL.path
+        if path.hasPrefix("/private/") { path.removeFirst("/private".count) }
+        while path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+        return path
+    }
 
     private enum ItemLayout: String {
         case grid, list
+    }
+
+    private final class Tracking {
+        /// Counts reloads, so only the newest result is applied.
+        var generation = 0
+        var revision = -1
+        var sort: SortOrder?
+        /// The file the viewer shows (or showed last).
+        var lastViewed: URL?
+    }
+
+    private struct ImportStatus {
+        var text: String
+        /// nil while the total is not known.
+        var fraction: Double?
+        /// Imports from 「文件」 and Documents can be stopped between files.
+        var cancellable = false
     }
 
     private enum FolderSheet: Identifiable {
@@ -89,7 +134,6 @@ struct FolderView: View {
         }
     }
 
-    private var isRoot: Bool { store.isRoot(folder) }
     private var title: String { isRoot ? "FileBox" : folder.lastPathComponent }
 
     private var visibleItems: [FileItem] {
@@ -102,43 +146,63 @@ struct FolderView: View {
 
     // MARK: - Grid and list
 
-    /// The list is a real List so rows keep the system swipe actions; the grid scrolls itself.
     private var content: some View {
-        Group {
-            switch layout {
-            case .grid:
-                ScrollView { grid }
-                    .simultaneousGesture(pinch)
-            case .list:
-                List { listRows }
-                    .listStyle(.plain)
+        ScrollViewReader { proxy in
+            decorated(layoutView(proxy), proxy: proxy)
+        }
+    }
+
+    /// The list is a real List so rows keep the system swipe actions; the grid scrolls itself.
+    @ViewBuilder
+    private func layoutView(_ proxy: ScrollViewProxy) -> some View {
+        switch layout {
+        case .grid:
+            ScrollView { grid }
+                .scrollPosition(id: $gridAnchor, anchor: .top)
+                .scrollDismissesKeyboard(.immediately)
+                .simultaneousGesture(pinch(proxy))
+        case .list:
+            List { listRows }
+                .listStyle(.plain)
+                .scrollDismissesKeyboard(.immediately)
+                .background { dropBridge }
+        }
+    }
+
+    private func decorated<Content: View>(_ content: Content, proxy: ScrollViewProxy) -> some View {
+        content
+            .overlay { overlayContent }
+            .navigationTitle(selecting ? "已选择 \(selection.count) 项" : title)
+            .navigationBarBackButtonHidden(selecting)
+            .searchable(text: $query, prompt: "搜索文件名")
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .toolbar { toolbarContent }
+            // In selection mode its bar takes the tab bar's place.
+            .toolbar(selecting ? .hidden : .visible, for: .tabBar)
+            .refreshable {
+                store.collectIncoming()
+                await reload()
             }
-        }
-        .overlay { overlayContent }
-        .navigationTitle(selecting ? "已选择 \(selection.count) 项" : title)
-        .navigationBarBackButtonHidden(selecting)
-        .searchable(text: $query, prompt: "搜索文件名")
-        .toolbar { toolbarContent }
-        .refreshable {
-            store.collectIncoming()
-            reload()
-        }
-        .quickLookPreview($quickLookURL, in: previewURLs)
-        .navigationDestination(item: $menuRoute) { route in
-            routeDestination(route)
-        }
-        .onAppear(perform: reload)
-        .onChange(of: store.revision) { reload() }
-        .onChange(of: sort) { reload() }
+            .quickLookPreview($quickLookURL, in: previewURLs)
+            .onAppear(perform: appeared)
+            .onChange(of: store.revision) { Task { await reload() } }
+            .onChange(of: sort) { Task { await reload() } }
+            .onReceive(NotificationCenter.default.publisher(for: Self.viewerPageChanged)) { note in
+                followViewer(note, proxy: proxy)
+            }
+            .onChange(of: viewer.request == nil) { _, closed in
+                guard closed else { return }
+                reveal(tracking.lastViewed, proxy: proxy)
+                tracking.lastViewed = nil
+            }
     }
 
     /// Import progress, or an empty state that lets touches through so pull-to-refresh still works.
     @ViewBuilder
     private var overlayContent: some View {
-        if let progress {
-            ProgressView(progress)
-                .padding()
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        if let importStatus {
+            importCard(importStatus)
         } else if loaded && items.isEmpty {
             ContentUnavailableView(
                 "这里还没有文件",
@@ -154,6 +218,32 @@ struct FolderView: View {
         }
     }
 
+    /// Only its 取消 button takes touches; the folder stays usable around it.
+    private func importCard(_ status: ImportStatus) -> some View {
+        VStack(spacing: 12) {
+            Group {
+                if let fraction = status.fraction {
+                    ProgressView(value: fraction) {
+                        Text(status.text)
+                    }
+                } else {
+                    ProgressView(status.text)
+                }
+            }
+            .allowsHitTesting(false)
+            if status.cancellable {
+                Button("取消") { cancelImport() }
+            }
+        }
+        .padding()
+        .frame(width: 240)
+        .background {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(.thinMaterial)
+                .allowsHitTesting(false)
+        }
+    }
+
     private var columnCount: Int { min(max(gridColumns, 3), 6) }
 
     private var grid: some View {
@@ -165,6 +255,7 @@ struct FolderView: View {
                 deleteDialog(cell(item), for: [item], isPresented: rowDeleteBinding(item))
             }
         }
+        .scrollTargetLayout()
     }
 
     private var listRows: some View {
@@ -177,6 +268,26 @@ struct FolderView: View {
                     }
                 }
         }
+    }
+
+    /// Drops onto list rows go through UIKit (see FolderUIDropBridge); the List keeps them otherwise.
+    private var dropBridge: some View {
+        FolderUIDropBridge(
+            isEnabled: !selecting,
+            target: { index in
+                let shown = visibleItems
+                guard shown.indices.contains(index) else { return nil }
+                let item = shown[index]
+                return item.isDirectory || item.kind == .video ? item.url : nil
+            },
+            onTargetChange: { url in
+                if dropTarget != url { dropTarget = url }
+            },
+            onDrop: { tokens, url in
+                guard let item = visibleItems.first(where: { $0.url == url }) else { return }
+                _ = drop(tokens, on: item)
+            }
+        )
     }
 
     /// Swipe a row left for 删除 / 重命名 / 移动. Delete still asks first, so no destructive role
@@ -197,17 +308,33 @@ struct FolderView: View {
         .tint(.blue)
     }
 
-    /// Pinching out shows fewer, bigger squares; pinching in shows more, like in Photos.
-    private var pinch: some Gesture {
+    /// Pinching out shows fewer, bigger squares; pinching in shows more, like in Photos. The file
+    /// at the top stays at the top, so the place in the folder is not lost.
+    private func pinch(_ proxy: ScrollViewProxy) -> some Gesture {
         MagnifyGesture()
             .onChanged { value in
                 let ratio = value.magnification / pinchBase
+                let columns: Int
                 if ratio > 1.25, columnCount > 3 {
-                    pinchBase = value.magnification
-                    withAnimation(.snappy) { gridColumns = columnCount - 1 }
+                    columns = columnCount - 1
                 } else if ratio < 0.8, columnCount < 6 {
-                    pinchBase = value.magnification
-                    withAnimation(.snappy) { gridColumns = columnCount + 1 }
+                    columns = columnCount + 1
+                } else {
+                    return
+                }
+                pinchBase = value.magnification
+                let anchor = gridAnchor
+                withAnimation(.snappy) {
+                    gridColumns = columns
+                }
+                guard let anchor else { return }
+                // Once the new columns are laid out, the same file goes back to the top.
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        withAnimation(.snappy) {
+                            proxy.scrollTo(anchor, anchor: .top)
+                        }
+                    }
                 }
             }
             .onEnded { _ in
@@ -239,6 +366,8 @@ struct FolderView: View {
         }
     }
 
+    /// Every list row is a plain button, folders included: one chevron (the row's own) and the same
+    /// highlight for all. Drops onto rows arrive through the List's drop bridge.
     @ViewBuilder
     private func row(_ item: FileItem) -> some View {
         if selecting {
@@ -251,18 +380,18 @@ struct FolderView: View {
             .buttonStyle(FolderRowButtonStyle())
             .background(isSelected ? Color.accentColor.opacity(0.1) : Color.clear)
         } else {
-            acceptingDrops(
-                link(item, style: FolderRowButtonStyle()) {
-                    rowLabel(item, isSelected: nil)
-                }
-                .background(rowBackground(item))
-                .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 12))
-                .contextMenu { menu(for: item) }
-                .draggable(FolderDragRegistry.shared.token(for: item.url)) {
-                    FolderDragPreview(item: item)
-                },
-                on: item
-            )
+            Button {
+                activate(item)
+            } label: {
+                rowLabel(item, isSelected: nil)
+            }
+            .buttonStyle(FolderRowButtonStyle())
+            .background(rowBackground(item))
+            .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 12))
+            .contextMenu { menu(for: item) }
+            .draggable(FolderDragRegistry.shared.token(for: item.url)) {
+                FolderDragPreview(item: item)
+            }
         }
     }
 
@@ -272,7 +401,7 @@ struct FolderView: View {
             .padding(.vertical, 8)
     }
 
-    /// Folders push their own view; files open in the media viewer or Quick Look.
+    /// Grid cells: folders push their own view; files open in the media viewer or Quick Look.
     @ViewBuilder
     private func link<Content: View, Style: ButtonStyle>(
         _ item: FileItem,
@@ -295,7 +424,7 @@ struct FolderView: View {
         }
     }
 
-    /// Folder rows take any dragged item, video rows take another video; other rows take nothing.
+    /// Grid cells of folders take any dragged item, video cells take another video.
     @ViewBuilder
     private func acceptingDrops<Content: View>(_ content: Content, on item: FileItem) -> some View {
         if item.isDirectory || item.kind == .video {
@@ -327,9 +456,20 @@ struct FolderView: View {
 
     // MARK: - Actions
 
+    /// A tap on a list row: folders push their own view, files open.
+    private func activate(_ item: FileItem) {
+        if item.isDirectory {
+            dismissKeyboard()
+            nav.path.append(.folder(item.url))
+        } else {
+            open(item)
+        }
+    }
+
     private func open(_ item: FileItem) {
+        dismissKeyboard()
         if item.isMedia {
-            let media = visibleItems.filter(\.isMedia)
+            let media = query.isEmpty ? mediaItems : visibleItems.filter(\.isMedia)
             if let index = media.firstIndex(where: { $0.url == item.url }) {
                 viewer.open(media, at: index)
             }
@@ -338,8 +478,28 @@ struct FolderView: View {
         }
     }
 
-    private var previewURLs: [URL] {
-        items.filter { !$0.isDirectory && !$0.isMedia }.map(\.url)
+    /// Closes the search keyboard, so UIKit does not bring it back once the viewer or Quick Look closes.
+    private func dismissKeyboard() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+
+    /// The viewer moved on to another file: bring it into view behind the viewer (only as far as
+    /// needed), so closing the viewer lands on it.
+    private func followViewer(_ note: Notification, proxy: ScrollViewProxy) {
+        guard viewer.request != nil,
+              let url = note.userInfo?["url"] as? URL ?? note.object as? URL
+        else { return }
+        tracking.lastViewed = url
+        reveal(url, proxy: proxy)
+    }
+
+    private func reveal(_ url: URL?, proxy: ScrollViewProxy) {
+        guard let url, visibleItems.contains(where: { $0.url == url }) else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            proxy.scrollTo(url, anchor: nil)
+        }
     }
 
     private func drop(_ tokens: [String], on target: FileItem) -> Bool {
@@ -399,22 +559,113 @@ struct FolderView: View {
         Button { startRename(item) } label: {
             Label("重命名", systemImage: "pencil")
         }
+        if !item.isDirectory {
+            Button { store.duplicate(item) } label: {
+                Label("创建副本", systemImage: "plus.square.on.square")
+            }
+        }
+        if Self.savesToPhotos(item) {
+            Button { saveToPhotos([item]) } label: {
+                Label("存到「照片」", systemImage: "square.and.arrow.down")
+            }
+        }
         Divider()
         Button(role: .destructive) { pendingDelete = [item] } label: {
             Label("删除", systemImage: "trash")
         }
     }
 
+    private static func savesToPhotos(_ item: FileItem) -> Bool {
+        item.kind == .image || item.kind == .video
+    }
+
+    private func saveToPhotos(_ targets: [FileItem]) {
+        let media = targets.filter { Self.savesToPhotos($0) }
+        guard !media.isEmpty else { return }
+        // Videos and bigger batches take a moment; the result replaces this.
+        if media.count > 3 || media.contains(where: { $0.kind == .video }) {
+            store.show("正在存到「照片」…")
+        }
+        Task {
+            let message = await FolderUIPhotoSaver.save(media)
+            store.show(message)
+        }
+    }
+
+    /// Files keep their extension: only the name before it is offered for editing.
     private func startRename(_ item: FileItem) {
-        renameText = item.name
+        renameText = keptExtension(of: item) == nil ? item.name : (item.name as NSString).deletingPathExtension
         renaming = item
     }
 
-    private func reload() {
-        items = store.items(in: folder, sort: sort)
-        videoCount = items.filter { $0.kind == .video }.count
-        loaded = true
-        selection.formIntersection(items.map(\.url))
+    private func commitRename(_ item: FileItem) {
+        var name = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        if let ext = keptExtension(of: item), !name.lowercased().hasSuffix("." + ext.lowercased()) {
+            name += "." + ext
+        }
+        store.rename(item, to: name)
+    }
+
+    private func keptExtension(of item: FileItem) -> String? {
+        guard !item.isDirectory else { return nil }
+        let ext = (item.name as NSString).pathExtension
+        return ext.isEmpty ? nil : ext
+    }
+
+    // MARK: - Loading
+
+    /// The first load is synchronous, so a pushed folder never slides in empty. Coming back to an
+    /// unchanged folder (popping back to it, closing the viewer) does not list it again.
+    private func appeared() {
+        if !loaded {
+            let listing = FolderUIListing(items: FileStore.listItems(in: folder, sort: sort))
+            apply(listing, revision: store.revision, sort: sort, animated: false)
+        } else if tracking.revision != store.revision || tracking.sort != sort {
+            Task { await reload() }
+        }
+    }
+
+    /// Lists the folder off the main thread; of overlapping reloads only the newest is applied.
+    private func reload() async {
+        tracking.generation += 1
+        let generation = tracking.generation
+        let url = folder
+        let order = sort
+        let revision = store.revision
+        let listing = await Task.detached(priority: .userInitiated) {
+            FolderUIListing(items: FileStore.listItems(in: url, sort: order))
+        }.value
+        guard generation == tracking.generation else { return }
+        apply(listing, revision: revision, sort: order, animated: loaded)
+    }
+
+    /// Rows slide in and out for ordinary changes; a first load or a huge import just appears.
+    private func apply(_ listing: FolderUIListing, revision: Int, sort: SortOrder, animated: Bool) {
+        tracking.revision = revision
+        tracking.sort = sort
+        if listing.items != items {
+            // The grid keeps its top file in place when the content changes; at the very top,
+            // files sorted in front of it should come into view instead of staying above it.
+            let keepsTop = layout == .grid && gridAnchor != nil && gridAnchor == visibleItems.first?.url
+            let change = {
+                items = listing.items
+                if keepsTop, let top = visibleItems.first?.url, top != gridAnchor { gridAnchor = top }
+            }
+            if animated && abs(listing.items.count - items.count) < 150 {
+                withAnimation(.snappy, change)
+            } else {
+                change()
+            }
+            mediaItems = listing.media
+            previewURLs = listing.previews
+            videoCount = listing.videoCount
+        }
+        if !loaded { loaded = true }
+        if !selection.isEmpty {
+            let kept = selection.intersection(items.map(\.url))
+            if kept != selection { selection = kept }
+        }
         if selecting && items.isEmpty { endSelecting() }
     }
 
@@ -449,9 +700,17 @@ struct FolderView: View {
         }
     }
 
+    private func startSelecting() {
+        withAnimation {
+            selecting = true
+        }
+    }
+
     private func endSelecting() {
-        selecting = false
-        selection = []
+        withAnimation {
+            selecting = false
+            selection = []
+        }
     }
 
     // MARK: - Toolbar
@@ -477,6 +736,11 @@ struct FolderView: View {
                 }
                 .disabled(selectedFileURLs.isEmpty)
                 Spacer()
+                Button { saveToPhotos(selectedItems) } label: {
+                    Label("存到「照片」", systemImage: "square.and.arrow.down")
+                }
+                .disabled(!selectedItems.contains(where: { Self.savesToPhotos($0) }))
+                Spacer()
                 deleteDialog(
                     Button(role: .destructive) { pendingBulkDelete = selectedItems } label: {
                         Label("删除", systemImage: "trash")
@@ -495,7 +759,7 @@ struct FolderView: View {
                 }
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button("选择") { selecting = true }
+                Button("选择") { startSelecting() }
                     .disabled(items.isEmpty)
                 layoutButton
                 addMenu
@@ -542,14 +806,21 @@ struct FolderView: View {
                     Label("从 Documents 导入", systemImage: "tray.and.arrow.down")
                 }
             }
-            .disabled(progress != nil)
+            .disabled(importStatus != nil)
         } label: {
             Label("添加", systemImage: "plus")
         }
     }
 
+    /// Sub-folders get 锁定 here too, so locking never means backing out to the top first.
     private var moreMenu: some View {
         Menu {
+            if !isRoot {
+                Button { lock.lock() } label: {
+                    Label("锁定", systemImage: "lock")
+                }
+                Divider()
+            }
             Picker("排序", selection: $sort) {
                 ForEach(SortOrder.allCases) { order in
                     Text(order.title).tag(order)
@@ -557,33 +828,21 @@ struct FolderView: View {
             }
             if isRoot {
                 Divider()
-                Button { menuRoute = .capture } label: {
+                Button { nav.path.append(.capture) } label: {
                     Label("截图与录屏", systemImage: "record.circle")
                 }
-                Button { menuRoute = .transfer } label: {
+                Button { nav.path.append(.transfer) } label: {
                     Label("Wi-Fi 传输", systemImage: "wifi")
                 }
-                Button { menuRoute = .trash } label: {
+                Button { nav.path.append(.trash) } label: {
                     Label("回收站", systemImage: "trash")
                 }
-                Button { menuRoute = .settings } label: {
+                Button { nav.path.append(.settings) } label: {
                     Label("设置", systemImage: "gearshape")
                 }
             }
         } label: {
             Label("更多", systemImage: "ellipsis.circle")
-        }
-    }
-
-    @ViewBuilder
-    private func routeDestination(_ route: Route) -> some View {
-        switch route {
-        case .folder(let url): FolderView(folder: url)
-        case .capture: CaptureView()
-        case .transfer: TransferView()
-        case .settings: SettingsView()
-        case .trash: TrashView()
-        default: EmptyView()
         }
     }
 
@@ -608,7 +867,7 @@ struct FolderView: View {
             .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.folder, .item], allowsMultipleSelection: true) { result in
                 switch result {
                 case .success(let urls):
-                    Task { await importPicked(urls) }
+                    importPicked(urls)
                 case .failure(let error):
                     store.report(error)
                 }
@@ -680,14 +939,18 @@ struct FolderView: View {
     private func dialogs<Content: View>(_ content: Content) -> some View {
         content
             .alert("新建文件夹", isPresented: $showNewFolder) {
-                TextField("名称", text: $newFolderName)
+                TextField("新建文件夹", text: $newFolderName)
                 Button("取消", role: .cancel) {}
                 Button("创建") { store.createFolder(named: newFolderName, in: folder) }
             }
             .alert("重命名", isPresented: renameBinding, presenting: renaming) { item in
                 TextField("名称", text: $renameText)
                 Button("取消", role: .cancel) {}
-                Button("确定") { store.rename(item, to: renameText) }
+                Button("确定") { commitRename(item) }
+            } message: { item in
+                if let ext = keptExtension(of: item) {
+                    Text("扩展名 .\(ext) 会保留")
+                }
             }
             .confirmationDialog(photoDeletionTitle, isPresented: photoDeletionBinding, titleVisibility: .visible, presenting: pendingPhotoDeletion) { identifiers in
                 Button("删除原件", role: .destructive) {
@@ -741,20 +1004,36 @@ struct FolderView: View {
 
     // MARK: - Importing
 
-    /// Files from the 「文件」 or Documents picker; FileStore handles their security scope.
-    private func importPicked(_ urls: [URL]) async {
-        guard !urls.isEmpty else { return }
-        let activity = FolderImportActivity()
-        defer { activity.end() }
-        progress = "正在导入…"
-        await store.importFiles(urls, into: folder)
-        progress = nil
+    /// Files from the 「文件」 or Documents picker; FileStore handles their security scope. It counts
+    /// the files as they are copied and can be stopped between files.
+    private func importPicked(_ urls: [URL]) {
+        guard !urls.isEmpty, importStatus == nil else { return }
+        importStatus = ImportStatus(text: "正在导入…", cancellable: true)
+        importTask = Task {
+            let activity = FolderImportActivity()
+            defer { activity.end() }
+            await store.importFiles(urls, into: folder, moving: false, progress: { done, total in
+                guard importStatus?.cancellable == true else { return }
+                importStatus = ImportStatus(
+                    text: "正在导入 \(done)/\(total)…",
+                    fraction: total > 0 ? Double(done) / Double(total) : nil,
+                    cancellable: true
+                )
+            })
+            importStatus = nil
+            importTask = nil
+        }
+    }
+
+    private func cancelImport() {
+        importTask?.cancel()
+        importStatus = ImportStatus(text: "正在停止…", fraction: importStatus?.fraction)
     }
 
     private func importFromDocuments(_ urls: [URL]) {
         guard let last = urls.last else { return }
         FolderDocumentsLocation.remember(folderOf: last)
-        Task { await importPicked(urls) }
+        importPicked(urls)
     }
 
     /// Copies the picked photos and videos in, then offers to delete the originals from Photos.
@@ -765,7 +1044,10 @@ struct FolderView: View {
         var identifiers: [URL: String] = [:]
         var failed = 0
         for (index, item) in picked.enumerated() {
-            progress = "正在导入 \(index + 1)/\(picked.count)…"
+            importStatus = ImportStatus(
+                text: "正在导入 \(index + 1)/\(picked.count)…",
+                fraction: Double(index) / Double(picked.count)
+            )
             do {
                 if let file = try await item.loadTransferable(type: PickedFile.self) {
                     files.append(file.url)
@@ -784,7 +1066,7 @@ struct FolderView: View {
         for file in files {
             try? fm.removeItem(at: file.deletingLastPathComponent())
         }
-        progress = nil
+        importStatus = nil
         if failed > 0 {
             // Replaces FileStore's "导入了 N 个文件" banner, so it carries both counts.
             store.show(imported.isEmpty
@@ -797,6 +1079,39 @@ struct FolderView: View {
             try? await Task.sleep(nanoseconds: 500_000_000)
             pendingPhotoDeletion = originals
         }
+    }
+}
+
+/// A folder's contents with what the folder view derives from them, built off the main thread.
+private struct FolderUIListing {
+    let items: [FileItem]
+    /// Images, videos and audio in display order: what the viewer pages through.
+    let media: [FileItem]
+    /// The other files: what Quick Look pages through.
+    let previews: [URL]
+    let videoCount: Int
+
+    init(items: [FileItem]) {
+        self.items = items
+        var media: [FileItem] = []
+        var previews: [URL] = []
+        var videos = 0
+        for item in items {
+            switch item.kind {
+            case .image, .audio:
+                media.append(item)
+            case .video:
+                media.append(item)
+                videos += 1
+            case .other:
+                previews.append(item.url)
+            case .folder:
+                break
+            }
+        }
+        self.media = media
+        self.previews = previews
+        videoCount = videos
     }
 }
 
@@ -832,11 +1147,19 @@ private struct FolderRowButtonStyle: ButtonStyle {
     }
 }
 
-/// One file or folder: an optional selection mark, thumbnail, name and size/date.
+/// One file or folder: an optional selection mark, thumbnail, name and details (item count for
+/// folders, length for videos, size and date).
 struct FileRow: View {
     let item: FileItem
     /// nil outside selection mode.
-    var isSelected: Bool? = nil
+    var isSelected: Bool?
+
+    @State private var duration: String?
+
+    init(item: FileItem, isSelected: Bool? = nil) {
+        self.item = item
+        self.isSelected = isSelected
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -845,11 +1168,14 @@ struct FileRow: View {
                     .font(.title2)
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                     .frame(width: 24)
+                    .transition(.opacity)
             }
             FolderThumbnail(item: item, side: 56)
             VStack(alignment: .leading, spacing: 2) {
+                // Cut in the middle, so the extension stays visible.
                 Text(item.name)
                     .lineLimit(2)
+                    .truncationMode(.middle)
                 Text(detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -862,11 +1188,104 @@ struct FileRow: View {
             }
         }
         .contentShape(Rectangle())
+        .task(id: item) {
+            guard item.kind == .video else { return }
+            duration = await FolderUIVideoLength.text(for: item)
+        }
     }
 
     private var detail: String {
         let date = item.modified.formatted(date: .abbreviated, time: .shortened)
-        if item.isDirectory { return date }
-        return "\(ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)) · \(date)"
+        if item.isDirectory {
+            guard let count = item.childCount else { return date }
+            return "\(count) 项 · \(date)"
+        }
+        let size = ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
+        if let duration { return "\(size) · \(duration) · \(date)" }
+        return "\(size) · \(date)"
     }
 }
+
+/// Video lengths for list rows as display text, loaded once per file version.
+@MainActor
+private enum FolderUIVideoLength {
+    private static var cache: [String: String] = [:]
+
+    static func text(for item: FileItem) async -> String? {
+        let key = "\(item.url.path)|\(item.modified.timeIntervalSince1970)"
+        if let hit = cache[key] { return hit }
+        guard let duration = try? await AVURLAsset(url: item.url).load(.duration) else { return nil }
+        let seconds = duration.seconds
+        guard seconds.isFinite, seconds >= 0 else { return nil }
+        let total = Int(seconds.rounded())
+        let text = total >= 3600
+            ? String(format: "%d:%02d:%02d", total / 3600, total % 3600 / 60, total % 60)
+            : String(format: "%d:%02d", total / 60, total % 60)
+        cache[key] = text
+        return text
+    }
+}
+
+// MARK: - Until the file-data package is merged
+
+// FileStore and FileItem members that the file-data package adds. A type's own member always wins
+// over a protocol's default, so these defaults only run where that package is not merged yet.
+
+protocol FolderUIListingSource {
+    static func listItems(in folder: URL, sort: SortOrder) -> [FileItem]
+}
+
+extension FolderUIListingSource {
+    static func listItems(in folder: URL, sort: SortOrder) -> [FileItem] {
+        let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+        guard let urls = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
+        else { return [] }
+        var result = urls.map { FileItem(url: $0) }
+        result.sort { a, b in
+            if a.isDirectory != b.isDirectory { return a.isDirectory }
+            switch sort {
+            case .date: return a.modified > b.modified
+            case .name: return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            case .size: return a.size > b.size
+            }
+        }
+        return result
+    }
+}
+
+extension FileStore: FolderUIListingSource {}
+
+@MainActor
+protocol FolderUIStoreActions: AnyObject {
+    func duplicate(_ item: FileItem)
+    func importFiles(_ urls: [URL], into folder: URL, moving: Bool, progress: (@MainActor (Int, Int) -> Void)?) async
+}
+
+extension FolderUIStoreActions where Self: FileStore {
+    func duplicate(_ item: FileItem) {
+        do {
+            try Vault.place(item.url, in: item.url.deletingLastPathComponent(), move: false)
+            refresh()
+        } catch {
+            report(error)
+        }
+    }
+
+    func importFiles(_ urls: [URL], into folder: URL, moving: Bool, progress: (@MainActor (Int, Int) -> Void)?) async {
+        progress?(0, urls.count)
+        await importFiles(urls, into: folder, moving: moving)
+        progress?(urls.count, urls.count)
+    }
+}
+
+extension FileStore: FolderUIStoreActions {}
+
+protocol FolderUIItemFacts {
+    var childCount: Int? { get }
+}
+
+extension FolderUIItemFacts {
+    var childCount: Int? { nil }
+}
+
+extension FileItem: FolderUIItemFacts {}

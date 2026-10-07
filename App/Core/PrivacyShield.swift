@@ -9,6 +9,9 @@ final class PrivacyShield {
 
     /// Set while a system sheet that makes the app inactive must stay usable (the broadcast picker).
     var isSuppressed = false
+    /// Set while a Photos prompt of our own is up: it makes the app inactive, and the shield would
+    /// blank the app behind it. Only `.inactive` honours it; the background always gets the shield.
+    var suppressWhileInactive = false
 
     private var window: UIWindow?
 
@@ -26,6 +29,14 @@ final class PrivacyShield {
     func hide() {
         window?.isHidden = true
         window = nil
+    }
+
+    /// Runs `work`, which may show a Photos prompt, with `suppressWhileInactive` set.
+    nonisolated static func allowingPrompt<T>(_ work: () async -> T) async -> T {
+        await MainActor.run { PrivacyShield.shared.suppressWhileInactive = true }
+        let result = await work()
+        await MainActor.run { PrivacyShield.shared.suppressWhileInactive = false }
+        return result
     }
 }
 

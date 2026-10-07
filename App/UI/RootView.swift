@@ -7,6 +7,7 @@ struct RootView: View {
     @EnvironmentObject private var viewer: ViewerCoordinator
     @EnvironmentObject private var playback: PlaybackState
     @EnvironmentObject private var tabs: TabCoordinator
+    @EnvironmentObject private var nav: FolderUINavigation
 
     var body: some View {
         // A ZStack, not a Group: modifiers on a Group attach to each branch, so locking would
@@ -14,9 +15,10 @@ struct RootView: View {
         ZStack {
             if lock.isUnlocked {
                 // Both tabs stay alive while switching, so the browser keeps its pages; locking
-                // removes the whole TabView and with it the private browsing session.
+                // removes the whole TabView and with it the private browsing session. The files
+                // path outlives the lock, so unlocking lands in the folder that was open.
                 TabView(selection: $tabs.selected) {
-                    NavigationStack {
+                    NavigationStack(path: $nav.path) {
                         FolderView(folder: store.rootURL)
                             .navigationDestination(for: Route.self) { route in
                                 destination(route)
@@ -35,19 +37,24 @@ struct RootView: View {
                 DecoyView()
             }
         }
+        // Only the banner animates, so list changes that come with a message keep their own
+        // animation; it never takes the taps meant for the rows under it.
         .overlay(alignment: .bottom) {
-            if lock.isUnlocked, let banner = store.banner {
-                Text(banner)
-                    .font(.subheadline)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(.thinMaterial, in: Capsule())
-                    .padding(.bottom, 96)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            ZStack {
+                if lock.isUnlocked, let banner = store.banner {
+                    Text(banner)
+                        .font(.subheadline)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(.thinMaterial, in: Capsule())
+                        .padding(.bottom, 96)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
             }
+            .animation(.spring, value: store.banner)
+            .allowsHitTesting(false)
         }
-        .animation(.spring, value: store.banner)
         .fullScreenCover(item: $viewer.request) { request in
             MediaViewer(items: request.items, startIndex: request.startIndex)
                 .environmentObject(store)
