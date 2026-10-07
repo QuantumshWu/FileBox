@@ -29,7 +29,10 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     var isEngaged: Bool { isActive || isStarting }
 
     private var currentIndex: Int?
+    /// The image the PiP picture is (being) made of.
     private var renderedURL: URL?
+    /// Set while the picture of `renderedURL` is still being made.
+    private var renderingURL: URL?
     private var onImagePage = false
     private var isStarting = false
     private var isPossible = false
@@ -72,6 +75,9 @@ final class MediaImagePiPController: NSObject, ObservableObject {
                 .sink { [weak self] _ in self?.enqueueFrame() }
                 .store(in: &observers)
         }
+        center.publisher(for: UIApplication.willResignActiveNotification)
+            .sink { [weak self] _ in self?.willResignActive() }
+            .store(in: &observers)
     }
 
     // MARK: - Viewer
@@ -127,16 +133,23 @@ final class MediaImagePiPController: NSObject, ObservableObject {
             hub.show("请先关闭视频小窗")
             return
         }
-        guard frame != nil, let pip = makeControllerIfNeeded() else {
+        let current = frame != nil && frame?.url == renderedURL
+        if !current, let index = currentIndex, sessionItems.indices.contains(index) {
+            // The picture of this page is not made yet (it waits for paging to settle): make it now.
+            renderedURL = sessionItems[index].url
+            render(sessionItems[index], immediate: true)
+        }
+        guard let pip = makeControllerIfNeeded() else {
             hub.show("小窗暂时无法开启")
             return
         }
         holdAudio()
-        if pip.isPictureInPicturePossible {
+        if current && pip.isPictureInPicturePossible {
             pip.startPictureInPicture()
             return
         }
-        // The layer may have just entered the window; wait a moment for PiP to become possible.
+        // The picture is still being made, or the layer has just entered the window: start as
+        // soon as both are ready.
         startWhenPossible = true
         let token = UUID()
         startToken = token
@@ -144,6 +157,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard let self, self.startToken == token, self.startWhenPossible else { return }
             self.startWhenPossible = false
+            self.updateArming()
             MediaViewerHub.shared.show("小窗暂时无法开启")
         }
     }
@@ -169,28 +183,79 @@ final class MediaImagePiPController: NSObject, ObservableObject {
 
     // MARK: - Pictures
 
-    private func setCurrent(_ index: Int) {
+    /// `immediate` skips the settle delay: PiP skip buttons and the slideshow, or PiP showing.
+    private func setCurrent(_ index: Int, immediate: Bool = false) {
         currentIndex = index
         updateTimebase()
-        let url = sessionItems[index].url
-        guard url != renderedURL else { return }
-        renderedURL = url
+        let item = sessionItems[index]
+        guard item.url != renderedURL else { return }
+        renderedURL = item.url
+        render(item, immediate: immediate || isEngaged)
+    }
+
+    /// Makes the PiP picture of `item`. While paging it waits for the page to settle and then
+    /// reuses the page's own decode. The previous picture stays armed until the new one lands, so
+    /// paging never releases the PiP controller and its audio session.
+    private func render(_ item: FileItem, immediate: Bool) {
+        let url = item.url
         renderTask?.cancel()
+        renderingURL = url
         renderTask = Task { [weak self] in
-            let made: MediaPiPFrame? = await MediaImageLoader.limited { MediaPiPFrame.make(from: url) }
+            if !immediate {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                if Task.isCancelled { return }
+            }
+            let made = await MediaImagePiPController.makeFrame(for: item)
             guard let self, !Task.isCancelled, self.renderedURL == url else { return }
+            self.renderingURL = nil
             guard let made else {
                 // Never float the previous picture under this one's name.
                 self.frame = nil
                 self.layerView.displayLayer.flushAndRemoveImage()
-                if self.isActive { MediaViewerHub.shared.show("这张图片无法在小窗里显示") }
+                if self.isActive || self.startWhenPossible {
+                    self.startWhenPossible = false
+                    MediaViewerHub.shared.show("这张图片无法在小窗里显示")
+                }
                 self.updateArming()
                 return
             }
             self.frame = made
             self.enqueueFrame()
             self.updateArming()
+            self.startIfWaiting()
         }
+    }
+
+    /// From the decode the viewer's page uses (joining it while it runs), so a photo is read from
+    /// disk once; decoded on its own only when the viewer is closed (slideshow in PiP).
+    private static func makeFrame(for item: FileItem) async -> MediaPiPFrame? {
+        let url = item.url
+        if MediaViewerHub.shared.isViewerPresented {
+            let image = await MediaImageLoader.load(item, maxPixel: MediaImageLoader.displayMaxPixel, priority: .background)
+            if Task.isCancelled { return nil }
+            if let cgImage = image?.cgImage {
+                let made = await Task.detached(priority: .utility) { MediaPiPFrame.make(from: cgImage, url: url) }.value
+                if made != nil || Task.isCancelled { return made }
+            }
+        }
+        if Task.isCancelled { return nil }
+        return await MediaImageLoader.limited(priority: .background) { MediaPiPFrame.make(from: url) }
+    }
+
+    /// Leaving the app right after paging: the new picture is made at once, so automatic PiP
+    /// does not show the previous one for long.
+    private func willResignActive() {
+        guard let url = renderingURL, frame?.url != url, let index = currentIndex,
+              sessionItems.indices.contains(index), sessionItems[index].url == url
+        else { return }
+        render(sessionItems[index], immediate: true)
+    }
+
+    /// The manual button asked for PiP before the picture or the controller was ready.
+    private func startIfWaiting() {
+        guard startWhenPossible, isPossible, let frame, frame.url == renderedURL, let controller else { return }
+        startWhenPossible = false
+        controller.startPictureInPicture()
     }
 
     /// Hands the current picture to the layer again. Called periodically, because the layer may
@@ -235,7 +300,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
             if sessionItems[index].kind == .image { break }
         }
         guard index != start, sessionItems[index].kind == .image else { return }
-        setCurrent(index)
+        setCurrent(index, immediate: true)
         MediaViewerHub.shared.reveal(sessionItems, at: index, reopen: false)
     }
 
@@ -300,10 +365,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
 
     private func possibleChanged(_ possible: Bool) {
         isPossible = possible
-        if possible, startWhenPossible {
-            startWhenPossible = false
-            controller?.startPictureInPicture()
-        }
+        startIfWaiting()
         updateArming()
     }
 
@@ -320,7 +382,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         if let controller, controller.canStartPictureInPictureAutomaticallyFromInline != armed {
             controller.canStartPictureInPictureAutomaticallyFromInline = armed
         }
-        if !armed && !floating {
+        if !armed && !floating && !startWhenPossible {
             // Off image pages there is only the video's PiP controller; this one is made again on
             // the next image page.
             releaseController()
@@ -383,6 +445,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         renderTask = nil
         frame = nil
         renderedURL = nil
+        renderingURL = nil
         currentIndex = nil
         sessionItems = []
         onImagePage = false
@@ -406,6 +469,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
 
     private func pictureInPictureDidStart() {
         MediaDiagnostics.log("图片小窗已开启")
+        if frame?.url != renderedURL { MediaDiagnostics.log("小窗显示的是上一张图片") }
         isStarting = false
         isActive = true
         updateArming()
@@ -584,12 +648,20 @@ private final class MediaPiPSnapshot: @unchecked Sendable {
 
 /// One image drawn into a pixel buffer for the display layer.
 private struct MediaPiPFrame: @unchecked Sendable {
+    /// The file the picture shows.
+    let url: URL
     let pixelBuffer: CVPixelBuffer
     let format: CMVideoFormatDescription
 
-    /// The image at `url` scaled to fit 1920×1080 (either way round), keeping its aspect ratio.
+    /// The image at `url`, decoded on its own.
     static func make(from url: URL) -> MediaPiPFrame? {
-        guard let image = MediaImageLoader.decode(url, maxPixel: 1920), image.width > 0, image.height > 0 else { return nil }
+        guard let image = MediaImageLoader.decode(url, maxPixel: 1920) else { return nil }
+        return make(from: image, url: url)
+    }
+
+    /// `image` scaled to fit 1920×1080 (either way round), keeping its aspect ratio.
+    static func make(from image: CGImage, url: URL) -> MediaPiPFrame? {
+        guard image.width > 0, image.height > 0 else { return nil }
         let sourceWidth = CGFloat(image.width)
         let sourceHeight = CGFloat(image.height)
         let scale = min(1, 1920 / max(sourceWidth, sourceHeight), 1080 / min(sourceWidth, sourceHeight))
@@ -627,6 +699,6 @@ private struct MediaPiPFrame: @unchecked Sendable {
             formatDescriptionOut: &format
         ) == noErr, let format
         else { return nil }
-        return MediaPiPFrame(pixelBuffer: buffer, format: format)
+        return MediaPiPFrame(url: url, pixelBuffer: buffer, format: format)
     }
 }
