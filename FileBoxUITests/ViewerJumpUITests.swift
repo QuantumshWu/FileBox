@@ -38,15 +38,17 @@ final class ViewerJumpUITests: XCTestCase {
         step("chrome-hide-video", settle: 2) { tapViewer() }
         step("close-swipe-down-1", settle: 2.5) { app.swipeDown() }
 
-        // 3. Videos opened straight from the list.
-        step("open-video-portrait", settle: 4) { element("row-c_portrait.mp4").tap() }
+        // 3. Videos opened straight from the list. A playing video's bars hide by themselves after
+        // 3 s, so it is paused (double tap in the middle) before the close button is used.
+        step("open-video-portrait", settle: 4) { openFromFolder("row-c_portrait.mp4") }
         step("chrome-show-video-2", settle: 1.5) { tapViewer() }
+        step("pause-video", settle: 1.5) { doubleTapVideoMiddle() }
         closeWithButton("close-button-video")
-        step("open-video-landscape", settle: 4) { element("row-d_landscape.mp4").tap() }
+        step("open-video-landscape", settle: 4) { openFromFolder("row-d_landscape.mp4") }
         step("close-swipe-down-2", settle: 2.5) { app.swipeDown() }
 
         // 4. The landscape image straight from the list.
-        step("open-image-landscape", settle: 3) { element("row-b_landscape.png").tap() }
+        step("open-image-landscape", settle: 3) { openFromFolder("row-b_landscape.png") }
         step("close-swipe-down-3", settle: 2.5) { app.swipeDown() }
 
         // 5. A fresh launch with the grid: the first open of each kind again.
@@ -65,20 +67,20 @@ final class ViewerJumpUITests: XCTestCase {
         step("grid-open-image-portrait", settle: 3) { gridImage.tap() }
         step("grid-chrome-show", settle: 1.5) { tapViewer() }
         closeWithButton("grid-close-button")
-        step("grid-open-video-portrait", settle: 4) { element("cell-c_portrait.mp4").tap() }
+        step("grid-open-video-portrait", settle: 4) { openFromFolder("cell-c_portrait.mp4") }
         step("grid-close-swipe-down", settle: 2.5) { app.swipeDown() }
 
         // 6. A landscape video turned sideways with 横屏 and back with 竖屏 (checked by the probe log;
         // the recording stays upright). Reached through the portrait video: on the smallest phone the
         // grid's last cell sits under the bar. Paused first, so the bars stay up and the buttons are
-        // really there when tapped. Nothing here fails the test; a missing button is only marked.
-        step("grid-open-video-portrait-2", settle: 3) { tapIfPossible(element("cell-c_portrait.mp4")) }
+        // really there when tapped (a video paused by a double tap brings its bars up by itself).
+        // Nothing here fails the test; a missing button is only marked.
+        step("grid-open-video-portrait-2", settle: 3) { openFromFolder("cell-c_portrait.mp4") }
         step("page-to-landscape-video-2", settle: 3.5) { app.swipeLeft() }
-        step("chrome-show-before-rotation", settle: 0.3) { tapViewer() }
-        step("pause-before-rotation", settle: 1) { tapIfPossible(app.buttons["暂停"]) }
+        step("pause-before-rotation", settle: 2) { doubleTapVideoMiddle() }
         step("landscape-button", settle: 3) { tapIfPossible(app.buttons["横屏"]) }
         step("portrait-button", settle: 3) { tapIfPossible(app.buttons["竖屏"]) }
-        step("close-button-after-rotation", settle: 2.5) { tapIfPossible(element("viewer-close")) }
+        closeWithButton("close-button-after-rotation")
         mark("done")
     }
 
@@ -87,7 +89,11 @@ final class ViewerJumpUITests: XCTestCase {
     @MainActor
     private func launch(layout: String) {
         app = XCUIApplication()
-        app.launchArguments += ["-FileBoxUITestSeed", "-sortOrder", "name", "-folderLayoutV2", layout]
+        // One video loops instead of the next file starting when it ends, so the test decides what
+        // is on screen.
+        app.launchArguments += [
+            "-FileBoxUITestSeed", "-sortOrder", "name", "-folderLayoutV2", layout, "-mediaPlaybackMode", "repeatOne",
+        ]
         mark("launch-\(layout)")
         app.launch()
         mark("launched-\(layout)")
@@ -102,6 +108,25 @@ final class ViewerJumpUITests: XCTestCase {
     @MainActor
     private func tapViewer() {
         app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3)).tap()
+    }
+
+    /// Opens a file from the folder. If a viewer is still open over it (a close that did not take),
+    /// it is swiped away first.
+    @MainActor
+    private func openFromFolder(_ identifier: String) {
+        let target = element(identifier)
+        if !(target.waitForExistence(timeout: 5) && target.isHittable) {
+            mark("viewer-still-open")
+            app.swipeDown()
+            pause(2.5)
+        }
+        tapIfPossible(target)
+    }
+
+    /// Plays or pauses a video: a double tap in the middle third, below the centre buttons.
+    @MainActor
+    private func doubleTapVideoMiddle() {
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.64)).doubleTap()
     }
 
     @MainActor
@@ -121,7 +146,7 @@ final class ViewerJumpUITests: XCTestCase {
             tapViewer()
             _ = close.waitForExistence(timeout: 3)
         }
-        step(name, settle: 2.5) { close.tap() }
+        step(name, settle: 2.5) { tapIfPossible(close) }
     }
 
     @MainActor

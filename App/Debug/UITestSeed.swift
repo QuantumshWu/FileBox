@@ -109,7 +109,8 @@ enum UITestSeed {
         return data
     }
 
-    /// Four seconds at 30 fps, H.264, the frame number drawn on each frame.
+    /// Twenty seconds at 10 fps, H.264, the frame number drawn on each frame. Long enough that a
+    /// video never ends in the middle of a test step.
     private static func video(to url: URL, width: Int, height: Int, label: String) throws {
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
@@ -127,9 +128,9 @@ enum UITestSeed {
         writer.add(input)
         guard writer.startWriting() else { throw writer.error ?? SeedError.writer }
         writer.startSession(atSourceTime: .zero)
-        let fps: Int32 = 30
+        let fps: Int32 = 10
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
-        for index in 0..<(4 * Int(fps)) {
+        for index in 0..<(20 * Int(fps)) {
             while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.005) }
             guard let pool = adaptor.pixelBufferPool else { throw SeedError.writer }
             var made: CVPixelBuffer?
