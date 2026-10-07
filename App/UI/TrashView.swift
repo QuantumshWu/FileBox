@@ -1,46 +1,54 @@
+import QuickLook
 import SwiftUI
 
-/// 回收站: deleted files stay here for `Vault.trashDays` days. Swipe to restore one to where it
-/// was or to delete it for good; 清空 removes everything now.
+/// 回收站: deleted files stay here for `Vault.trashDays` days. Tap one to look at it, swipe to
+/// restore it to where it was or to delete it for good; 清空 removes everything now.
 struct TrashView: View {
     @EnvironmentObject private var store: FileStore
 
     @State private var entries: [Vault.TrashEntry] = []
     @State private var pendingForever: Vault.TrashEntry?
     @State private var confirmEmpty = false
+    /// A trashed file shown read-only in Quick Look.
+    @State private var previewURL: URL?
 
     var body: some View {
         List {
             ForEach(entries) { entry in
-                row(entry)
-                    .contextMenu {
-                        Button { store.restore([entry]) } label: {
-                            Label("恢复", systemImage: "arrow.uturn.backward")
-                        }
-                        Button(role: .destructive) { pendingForever = entry } label: {
-                            Label("彻底删除", systemImage: "trash.slash")
-                        }
+                Button {
+                    if !entry.isDirectory { previewURL = entry.url }
+                } label: {
+                    row(entry)
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    Button { store.restore([entry]) } label: {
+                        Label("恢复", systemImage: "arrow.uturn.backward")
                     }
-                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        Button { pendingForever = entry } label: {
-                            Label("彻底删除", systemImage: "trash.slash")
-                        }
-                        .tint(.red)
-                        Button { store.restore([entry]) } label: {
-                            Label("恢复", systemImage: "arrow.uturn.backward")
-                        }
-                        .tint(.blue)
+                    Button(role: .destructive) { pendingForever = entry } label: {
+                        Label("彻底删除", systemImage: "trash.slash")
                     }
-                    .confirmationDialog(
-                        "彻底删除「\(entry.name)」？",
-                        isPresented: foreverBinding(entry),
-                        titleVisibility: .visible
-                    ) {
-                        Button("彻底删除", role: .destructive) { store.deleteForever([entry]) }
-                        Button("取消", role: .cancel) {}
-                    } message: {
-                        Text("彻底删除后无法恢复。")
+                }
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    Button { pendingForever = entry } label: {
+                        Label("彻底删除", systemImage: "trash.slash")
                     }
+                    .tint(.red)
+                    Button { store.restore([entry]) } label: {
+                        Label("恢复", systemImage: "arrow.uturn.backward")
+                    }
+                    .tint(.blue)
+                }
+                .confirmationDialog(
+                    "彻底删除「\(entry.name)」？",
+                    isPresented: foreverBinding(entry),
+                    titleVisibility: .visible
+                ) {
+                    Button("彻底删除", role: .destructive) { store.deleteForever([entry]) }
+                    Button("取消", role: .cancel) {}
+                } message: {
+                    Text("彻底删除后无法恢复。")
+                }
             }
         }
         .listStyle(.plain)
@@ -79,6 +87,7 @@ struct TrashView: View {
                     }
             }
         }
+        .quickLookPreview($previewURL)
         .onAppear(perform: reload)
         .onChange(of: store.revision) { reload() }
     }
@@ -97,6 +106,7 @@ struct TrashView: View {
             Spacer(minLength: 0)
         }
         .padding(.vertical, 2)
+        .contentShape(Rectangle())
     }
 
     private func detail(_ entry: Vault.TrashEntry) -> String {
@@ -116,7 +126,14 @@ struct TrashView: View {
         )
     }
 
+    /// Restored and deleted rows slide away instead of vanishing.
     private func reload() {
-        entries = store.trashEntries()
+        let fresh = store.trashEntries()
+        guard fresh != entries else { return }
+        if entries.isEmpty {
+            entries = fresh
+        } else {
+            withAnimation(.snappy) { entries = fresh }
+        }
     }
 }

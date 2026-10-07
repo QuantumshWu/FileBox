@@ -81,7 +81,7 @@ struct FolderGridCell: View {
     }
 }
 
-/// A file's Quick Look thumbnail cropped to a square, or the folder symbol for a folder.
+/// A file's thumbnail cropped to a square, or the folder symbol for a folder.
 struct FolderThumbnail: View {
     let item: FileItem
     let side: CGFloat
@@ -92,6 +92,8 @@ struct FolderThumbnail: View {
     @State private var image: UIImage?
 
     var body: some View {
+        // Whatever is already in memory (this size or another) shows in the very first frame.
+        let shown: UIImage? = item.isDirectory ? nil : (image ?? Thumbnails.cached(for: item, side: side, scale: displayScale))
         ZStack {
             if item.isDirectory {
                 Image(systemName: "folder.fill")
@@ -99,8 +101,8 @@ struct FolderThumbnail: View {
                     .scaledToFit()
                     .foregroundStyle(.blue)
                     .padding(side * 0.1)
-            } else if let image {
-                Image(uiImage: image)
+            } else if let shown {
+                Image(uiImage: shown)
                     .resizable()
                     .scaledToFill()
             } else if FolderGridCell.fillsCell(item) {
@@ -117,11 +119,18 @@ struct FolderThumbnail: View {
         }
         .frame(width: side, height: side)
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius ?? side * 0.14))
-        .task(id: "\(item.url.path)|\(item.modified.timeIntervalSince1970)|\(Int(side))") {
+        .task(id: Thumbnails.key(for: item, side: side, scale: displayScale)) {
             guard !item.isDirectory, side >= 1 else { return }
-            // Quick Look fits the thumbnail inside the requested square. Twice the side keeps a
-            // cropped photo or video sharp up to an aspect ratio of 2:1.
-            image = await Thumbnails.image(for: item, side: (side * 2).rounded(), scale: displayScale)
+            if let hit = Thumbnails.exactCached(for: item, side: side, scale: displayScale) {
+                image = hit
+                return
+            }
+            // Cells flung past in a fast scroll are gone before this ends and never start work.
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            guard !Task.isCancelled else { return }
+            let loaded = await Thumbnails.image(for: item, side: side, scale: displayScale)
+            guard !Task.isCancelled else { return }
+            image = loaded
         }
     }
 }
@@ -130,10 +139,10 @@ struct FolderThumbnail: View {
 private struct FolderVideoDurationLabel: View {
     let item: FileItem
 
-    @State private var text = ""
+    @State private var text: String?
 
     var body: some View {
-        Text(text)
+        Text(text ?? FolderVideoDurations.cachedText(for: item) ?? "")
             .font(.caption2.weight(.semibold))
             .monospacedDigit()
             .foregroundStyle(.white)
@@ -141,28 +150,45 @@ private struct FolderVideoDurationLabel: View {
             .padding(.trailing, 5)
             .padding(.bottom, 4)
             .task(id: item) {
-                text = await FolderVideoDurations.text(for: item) ?? ""
+                let loaded = await FolderVideoDurations.text(for: item)
+                guard !Task.isCancelled else { return }
+                text = loaded
             }
     }
 }
 
-/// Video durations as display text, loaded once per file version.
+/// Video durations as display text, loaded once per file version. Files without a readable
+/// duration are remembered too, so they are not opened again on every appearance.
 @MainActor
-private enum FolderVideoDurations {
-    private static var cache: [String: String] = [:]
+enum FolderVideoDurations {
+    private static var texts: [String: String] = [:]
+    private static var failures: Set<String> = []
+
+    /// The text if it is already known.
+    static func cachedText(for item: FileItem) -> String? {
+        texts[cacheKey(item)]
+    }
 
     static func text(for item: FileItem) async -> String? {
-        let key = "\(item.url.path)|\(item.modified.timeIntervalSince1970)"
-        if let hit = cache[key] { return hit }
-        guard let duration = try? await AVURLAsset(url: item.url).load(.duration) else { return nil }
-        let seconds = duration.seconds
-        guard seconds.isFinite, seconds >= 0 else { return nil }
+        let fileKey = cacheKey(item)
+        if let hit = texts[fileKey] { return hit }
+        if failures.contains(fileKey) { return nil }
+        let duration = try? await AVURLAsset(url: item.url).load(.duration)
+        guard let seconds = duration?.seconds, seconds.isFinite, seconds >= 0 else {
+            // A cancelled load says nothing about the file.
+            if !Task.isCancelled { failures.insert(fileKey) }
+            return nil
+        }
         let total = Int(seconds.rounded())
         let text = total >= 3600
             ? String(format: "%d:%02d:%02d", total / 3600, total % 3600 / 60, total % 60)
             : String(format: "%d:%02d", total / 60, total % 60)
-        cache[key] = text
+        texts[fileKey] = text
         return text
+    }
+
+    private static func cacheKey(_ item: FileItem) -> String {
+        "\(item.url.path)|\(item.modified.timeIntervalSince1970)"
     }
 }
 
