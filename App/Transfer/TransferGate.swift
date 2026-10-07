@@ -16,7 +16,8 @@ struct TransferAccessRequest: Identifiable, Equatable {
 /// Decides which browsers may use the transfer server. A browser is known by a random session
 /// cookie; the first time it asks, the phone shows a prompt, and only an allowed session reaches the
 /// files. Approvals survive a brief server restart (the app inactive for a moment) but are all
-/// revoked when the user leaves the transfer screen or the app locks; no computer is remembered.
+/// revoked when the user leaves the transfer screen or FileBox goes to the background; no computer
+/// is remembered.
 /// Safe to use from any queue.
 final class TransferGate: @unchecked Sendable {
     enum State: String {

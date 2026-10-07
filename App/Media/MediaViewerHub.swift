@@ -183,6 +183,15 @@ final class MediaViewerHub: ObservableObject {
         if UIApplication.shared.applicationState == .background { PrivacyShield.shared.show() }
     }
 
+    /// 锁定: nothing of the vault may stay floating over the decoy or come back onto it. Picture in
+    /// Picture closes as if with its X, which ends its playback, and a viewer still open closes at
+    /// once. Leaving the app never locks, so this is only the 锁定 buttons.
+    func closeForLock() {
+        MediaPlaybackController.shared.closePictureInPictureForLock()
+        MediaImagePiPController.shared.closePictureInPictureForLock()
+        if isViewerPresented { coordinator?.closeImmediately() }
+    }
+
     // MARK: - Audio session
 
     /// Video takes over the audio; an image in PiP plays along with other apps' music. Every call

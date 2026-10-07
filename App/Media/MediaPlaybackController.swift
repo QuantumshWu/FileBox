@@ -124,6 +124,8 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// The coming stop is not the user closing PiP with its X: PiP goes back into the viewer (its
     /// restore button, the app coming back) or the viewer's own button ends it.
     private var stopKeepsViewer = false
+    /// 锁定 is closing PiP: its stop ends the session and nothing goes back on screen.
+    private var closesForLock = false
     private var restoreID = UUID()
     private var remoteCommandsReady = false
     private var remoteCommandsEnabled = false
@@ -362,6 +364,18 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     func endPictureInPictureForViewer() {
         guard let controller = pictureInPicture, controller.isPictureInPictureActive else { return }
         stopKeepsViewer = true
+        controller.stopPictureInPicture()
+    }
+
+    /// 锁定: the floating video closes as if with its X, so playback ends and nothing of it stays
+    /// over the decoy or can be restored onto it.
+    func closePictureInPictureForLock() {
+        catchUpOnClosedPictureInPicture()
+        guard let controller = pictureInPicture, controller.isPictureInPictureActive else { return }
+        MediaDiagnostics.log("锁定，关闭视频小窗")
+        closesForLock = true
+        stopKeepsViewer = false
+        finishRestore(false)
         controller.stopPictureInPicture()
     }
 
@@ -1242,6 +1256,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         endBoost()
         // A new window: no stop of an earlier one is still on its way.
         stopKeepsViewer = false
+        closesForLock = false
         isPictureInPictureStarting = true
         publishState()
     }
@@ -1273,9 +1288,10 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     private func pictureInPictureDidStop() {
         // Already handled (see `catchUpOnClosedPictureInPicture`).
         guard isPictureInPictureActive || isPictureInPictureStarting || stopKeepsViewer else { return }
-        let keepsViewer = stopKeepsViewer
+        let keepsViewer = stopKeepsViewer && !closesForLock
         MediaDiagnostics.log(keepsViewer ? "视频小窗回到全屏" : "视频小窗已关闭")
         stopKeepsViewer = false
+        closesForLock = false
         isPictureInPictureStarting = false
         isPictureInPictureActive = false
         finishRestore(false)
@@ -1298,6 +1314,11 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// Brings the viewer back on the playing file (reopening it if it was closed) before PiP
     /// animates into it.
     private func restoreUserInterface(_ completion: @escaping (Bool) -> Void) {
+        // 锁定 is closing it: the viewer never comes back over the decoy.
+        guard !closesForLock else {
+            completion(false)
+            return
+        }
         stopKeepsViewer = true
         guard let index = currentIndex, sessionItems.indices.contains(index) else {
             completion(false)

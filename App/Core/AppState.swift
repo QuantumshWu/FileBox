@@ -10,8 +10,9 @@ enum Route: Hashable {
     case trash
 }
 
-/// The two tabs shown while unlocked. Both keep their state when switching; everything is torn
-/// down when the app locks.
+/// The two tabs shown while unlocked. Both keep their state when switching. Locking removes the
+/// tabs, but the selected tab, the 文件 path and the browser live above the lock, so unlocking
+/// lands where the user was.
 enum MainTab: Hashable {
     case files
     case browser
@@ -40,7 +41,8 @@ struct ViewerRequest: Identifiable {
 
 /// Opens the full-screen media viewer. It is presented by RootView above everything else, so nothing
 /// underneath dismisses it, and it stays open on the same file while the app is in the background.
-/// It closes with its close button, a swipe, or Picture in Picture closed with its X.
+/// It closes with its close button, a swipe, or Picture in Picture closed with its X (which 锁定
+/// also does).
 @MainActor
 final class ViewerCoordinator: ObservableObject {
     @Published var request: ViewerRequest?

@@ -52,7 +52,7 @@ struct SettingsView: View {
             } header: {
                 Text("隐私")
             } footer: {
-                Text("从后台划掉 FileBox 或点「锁定」后才会上锁；切到后台再回来不用重新输入口令。这里的文件不会出现在「文件」App 里，也不会进入 iCloud 或电脑备份，删除 App 就会全部丢失。")
+                Text("从后台划掉 FileBox 或点「锁定」后才会上锁；切到后台再回来不用重新输入口令。锁定时，小窗里的视频或图片会一起关闭。这里的文件不会出现在「文件」App 里，也不会进入 iCloud 或电脑备份，删除 App 就会全部丢失。")
             }
 
             Section {
@@ -67,7 +67,7 @@ struct SettingsView: View {
             } header: {
                 Text("浏览器")
             } footer: {
-                Text("网页、Cookie、登录状态和下载记录会一直保留，锁定或切到后台都不会清除。清除后浏览器回到起始页，已下载的文件仍在「下载」里。")
+                Text("打开的网页、浏览历史、Cookie 和登录状态会一直保留，切到后台、锁定或重新打开 App 都不会清除。清除后浏览器回到起始页，已下载的文件仍在「下载」里。")
             }
 
             Section {

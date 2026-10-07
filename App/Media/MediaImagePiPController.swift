@@ -49,6 +49,8 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     /// The coming stop is not the user closing PiP with its X: PiP goes back into the viewer (its
     /// restore button, the app coming back) or the viewer ends it (its button, a video page).
     private var stopKeepsViewer = false
+    /// 锁定 is closing PiP: its stop ends the session and nothing goes back on screen.
+    private var closesForLock = false
     private var restoreID = UUID()
     private var reportedPaused: Bool?
     private var reportedCount = 0
@@ -124,6 +126,18 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         catchUpOnClosedPictureInPicture()
         guard isActive, !stopKeepsViewer, let controller, controller.isPictureInPictureActive else { return }
         stopKeepsViewer = true
+        controller.stopPictureInPicture()
+    }
+
+    /// 锁定: the floating image closes as if with its X, so nothing of it stays over the decoy or
+    /// can be restored onto it.
+    func closePictureInPictureForLock() {
+        catchUpOnClosedPictureInPicture()
+        guard isActive, let controller, controller.isPictureInPictureActive else { return }
+        MediaDiagnostics.log("锁定，关闭图片小窗")
+        closesForLock = true
+        stopKeepsViewer = false
+        finishRestore(false)
         controller.stopPictureInPicture()
     }
 
@@ -487,6 +501,7 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     private func pictureInPictureWillStart() {
         // A new window: no stop of an earlier one is still on its way.
         stopKeepsViewer = false
+        closesForLock = false
         isStarting = true
         startWhenPossible = false
         updateArming()
@@ -513,9 +528,10 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     private func pictureInPictureDidStop() {
         // Already handled (see `catchUpOnClosedPictureInPicture`).
         guard isActive || isStarting || stopKeepsViewer else { return }
-        let keepsViewer = stopKeepsViewer
+        let keepsViewer = stopKeepsViewer && !closesForLock
         MediaDiagnostics.log(keepsViewer ? "图片小窗回到全屏" : "图片小窗已关闭")
         stopKeepsViewer = false
+        closesForLock = false
         isStarting = false
         isActive = false
         setSlideshow(false)
@@ -540,6 +556,11 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     /// Brings the viewer back on the floating image (reopening it if it was closed) before PiP
     /// animates into it.
     private func restoreUserInterface(_ completion: @escaping (Bool) -> Void) {
+        // 锁定 is closing it: the viewer never comes back over the decoy.
+        guard !closesForLock else {
+            completion(false)
+            return
+        }
         stopKeepsViewer = true
         guard let index = currentIndex, sessionItems.indices.contains(index) else {
             completion(false)

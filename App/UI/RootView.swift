@@ -36,6 +36,11 @@ struct RootView: View {
                 DecoyView()
             }
         }
+        // 锁定 (never leaving the app): a video or image floating in Picture in Picture closes, so
+        // nothing of the vault stays over the decoy or can be brought back onto it.
+        .onChange(of: lock.isUnlocked) { _, unlocked in
+            if !unlocked { MediaViewerHub.shared.closeForLock() }
+        }
         // Only the banner animates, so list changes that come with a message keep their own
         // animation; it never takes the taps meant for the rows under it.
         .overlay(alignment: .bottom) {

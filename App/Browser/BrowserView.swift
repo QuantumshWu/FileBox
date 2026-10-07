@@ -15,8 +15,8 @@ struct BrowserTab: View {
 }
 
 /// Web browser that saves downloads into the vault. Pages, history, logins and downloads stay while
-/// the 文件 tab is shown, while locked and while the app is in the background; only 清除浏览痕迹
-/// removes them. All controls sit in the top bar, so the tab bar is the only bar at the bottom.
+/// the 文件 tab is shown, while locked and while the app is in the background, and the page with its
+/// history comes back after a relaunch; only 清除浏览痕迹 removes them. All controls sit in the top bar, so the tab bar is the only bar at the bottom.
 struct BrowserView: View {
     @EnvironmentObject private var store: FileStore
     @EnvironmentObject private var lock: LockManager
@@ -189,7 +189,7 @@ struct BrowserView: View {
         ContentUnavailableView {
             Label("浏览器", systemImage: "globe")
         } description: {
-            Text("在上方输入网址，或输入文字用必应搜索。\n网页、登录状态和下载记录会一直保留，锁定也不会清除；需要时点右上角「更多」→「清除浏览痕迹」。下载的文件保存在「下载」文件夹。")
+            Text("在上方输入网址，或输入文字用必应搜索。\n打开的网页、浏览历史和登录状态会一直保留，锁定或重新打开 App 都不会清除；需要时点右上角「更多」→「清除浏览痕迹」。下载的文件保存在「下载」文件夹。")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(uiColor: .systemBackground))

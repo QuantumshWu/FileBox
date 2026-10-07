@@ -20,13 +20,14 @@ struct BrowserDialog: Identifiable {
 /// State and WebKit delegates of the browser. It has one web view in WebKit's default (persistent)
 /// data store, so cookies, logins and site data are kept until 清除浏览痕迹. `BrowserSession` keeps
 /// it for the app's lifetime, so the page, its history and downloads survive switching tabs and
-/// locking; clearing replaces it with a new one.
+/// locking, and the page with its back and forward history is saved for the next launch (the app
+/// locks when it ends, and locking clears nothing). Clearing replaces it with a new one.
 @MainActor
 final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
     let webView: WKWebView
     let downloads = BrowserDownloadManager()
     /// Whether the start page puts the cursor in the address field. Not after 清除浏览痕迹, which
-    /// should not bring up the keyboard by itself.
+    /// should not bring up the keyboard by itself, and not when a saved page comes back.
     let focusesAddressAtStart: Bool
 
     @Published private(set) var progress: Double = 0
@@ -51,6 +52,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     private var isClosed = false
     /// Hosts whose blocked plain-HTTP address was already retried over HTTPS.
     private var httpsRetriedHosts: Set<String> = []
+    /// The page and history saved at the last launch, loaded once the 浏览器 tab first shows.
+    private var savedPage: Data?
+    private var appObservers: Set<AnyCancellable> = []
 
     /// Schemes the web view loads itself; anything else would try to open another app.
     private static let pageSchemes: Set<String> = ["http", "https", "about", "data", "blob"]
@@ -61,7 +65,10 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     /// `_WKNavigationActionPolicyAllowWithoutTryingAppLink`, which Chrome uses for incognito tabs.
     private static let allowWithoutAppLinks = WKNavigationActionPolicy(rawValue: WKNavigationActionPolicy.allow.rawValue + 2) ?? .allow
 
-    init(focusesAddressAtStart: Bool = true) {
+    /// - Parameter afterClearing: made by 清除浏览痕迹, so it starts empty: no saved page, and no
+    ///   keyboard by itself.
+    init(afterClearing: Bool = false) {
+        let savedPage = afterClearing ? nil : BrowserModel.readSavedPage()
         let dataStore = WKWebsiteDataStore.default()
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = dataStore
@@ -74,7 +81,8 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             in: .defaultClient
         ))
         self.dataStore = dataStore
-        self.focusesAddressAtStart = focusesAddressAtStart
+        self.focusesAddressAtStart = !afterClearing && savedPage == nil
+        self.savedPage = savedPage
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.allowsBackForwardNavigationGestures = true
         super.init()
@@ -86,12 +94,21 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         webView.publisher(for: \.canGoForward).assign(to: &$canGoForward)
         webView.publisher(for: \.url).assign(to: &$url)
         webView.publisher(for: \.title).assign(to: &$title)
+        // The app may be ended while away (swiped off, or by iOS); the page is saved before that.
+        NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
+            .sink { [weak self] _ in self?.savePage() }
+            .store(in: &appObservers)
     }
 
-    /// Connects the model to the app (banners, saving downloads into the vault).
+    /// Connects the model to the app (banners, saving downloads into the vault). The first time,
+    /// the page of the last launch comes back with its back and forward history.
     func attach(_ store: FileStore) {
         self.store = store
         downloads.store = store
+        if let savedPage, !isClosed {
+            self.savedPage = nil
+            webView.interactionState = savedPage
+        }
     }
 
     /// Locking keeps the page, but nothing of it may go on playing, or stay in full screen or
@@ -101,11 +118,13 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         webView.closeAllMediaPresentations(completionHandler: nil)
     }
 
-    /// Retires the model for 清除浏览痕迹: downloads stop, page media closes and the page is
-    /// unloaded. Deleting the website data is up to `BrowserSession`.
+    /// Retires the model for 清除浏览痕迹: downloads stop, page media closes, the page is unloaded
+    /// and the saved page is deleted. Deleting the website data is up to `BrowserSession`.
     func shutdown() {
         guard !isClosed else { return }
         isClosed = true
+        savedPage = nil
+        Self.removeSavedPage()
         answerDialog(false)
         downloads.cancelAll()
         webView.navigationDelegate = nil
@@ -115,6 +134,42 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         if let blank = URL(string: "about:blank") {
             webView.load(URLRequest(url: blank))
         }
+    }
+
+    // MARK: - Saved page
+
+    /// Kept out of backups, like the vault; only 清除浏览痕迹 deletes it.
+    nonisolated private static var savedPageURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("BrowserPage.state")
+    }
+
+    /// Saves the page with its back and forward history (WebKit's own state of the web view), or
+    /// removes the saved one while the browser is on its start page.
+    func savePage() {
+        // Not before the saved page has come back, and never after clearing.
+        guard !isClosed, savedPage == nil else { return }
+        if webView.url == nil && webView.backForwardList.currentItem == nil {
+            Self.removeSavedPage()
+            return
+        }
+        guard let data = webView.interactionState as? Data else { return }
+        var url = Self.savedPageURL
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        guard (try? data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])) != nil else { return }
+        // An atomic write replaces the file, so the flag is set again each time.
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? url.setResourceValues(values)
+    }
+
+    nonisolated static func removeSavedPage() {
+        try? FileManager.default.removeItem(at: savedPageURL)
+    }
+
+    nonisolated private static func readSavedPage() -> Data? {
+        guard let data = try? Data(contentsOf: savedPageURL), !data.isEmpty else { return nil }
+        return data
     }
 
     // MARK: - Navigation
