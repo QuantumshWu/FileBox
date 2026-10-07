@@ -6,6 +6,7 @@ struct FileBoxApp: App {
     @StateObject private var lock = LockManager.shared
     @StateObject private var viewer = ViewerCoordinator()
     @StateObject private var tabs = TabCoordinator()
+    @StateObject private var nav = FolderUINavigation()
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
@@ -15,6 +16,7 @@ struct FileBoxApp: App {
                 .environmentObject(lock)
                 .environmentObject(viewer)
                 .environmentObject(tabs)
+                .environmentObject(nav)
                 .environmentObject(PlaybackState.shared)
                 .onOpenURL { url in
                     Task { await store.importIncoming(url) }
@@ -40,10 +42,14 @@ struct FileBoxApp: App {
                 } else {
                     PrivacyShield.shared.hide()
                 }
+                // No blanket reload: no folder survives the lock that leaving the app sets, and
+                // collecting reloads them when it brings anything in.
                 store.collectIncoming()
-                store.refresh()
             case .inactive:
-                PrivacyShield.shared.show()
+                // Not behind a Photos prompt of our own, which makes the app inactive too.
+                if !PrivacyShield.shared.suppressWhileInactive {
+                    PrivacyShield.shared.show()
+                }
             case .background:
                 PrivacyShield.shared.show()
                 lock.lock()
