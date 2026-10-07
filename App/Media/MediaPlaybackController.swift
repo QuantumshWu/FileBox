@@ -213,13 +213,15 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         endBoost()
         guard !isPictureInPictureActive, !isPictureInPictureStarting else { return }
         saveResumePosition()
-        if player.timeControlStatus != .paused || (awaitsResume && resumeAutoplay) {
+        let waitedToPlay = awaitsResume && resumeAutoplay
+        if player.timeControlStatus != .paused || waitedToPlay {
             resumeOnReturn = true
         }
         resumeAutoplay = false
         offPlayablePage = true
         applyRemoteCommandState()
         pauseForUs()
+        if waitedToPlay { playbackStatusChanged() }
     }
 
     /// The viewer closed: stop, unless the video is floating in PiP.
@@ -278,6 +280,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         if awaitsResume {
             // It plays once the saved position is reached.
             resumeAutoplay = true
+            playbackStatusChanged()
             return
         }
         MediaViewerHub.shared.activateAudioSession(for: .video)
@@ -294,9 +297,12 @@ final class MediaPlaybackController: NSObject, ObservableObject {
 
     func pause() {
         resumeOnReturn = false
+        let waitedToPlay = awaitsResume && resumeAutoplay
         resumeAutoplay = false
         saveResumePosition()
         pauseForUs()
+        // Already paused while it waited for its saved position: nothing else reports it.
+        if waitedToPlay { playbackStatusChanged() }
     }
 
     func togglePlayPause() {
@@ -543,7 +549,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     @discardableResult
     func beginBoost() -> Bool {
         if isBoosted { return true }
-        guard isPlaying, !isScrubbing, !isPictureInPictureEngaged else { return false }
+        guard isPlaying, !isScrubbing, !awaitsResume, !isPictureInPictureEngaged else { return false }
         isBoosted = true
         player.rate = min(3, max(2, speed * 2))
         updateNowPlaying()
@@ -600,6 +606,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         if let resumeAt {
             // Applied once the item is ready (see `issuePendingSeek`); it plays after that.
             chase(to: resumeAt, tolerance: .zero, purpose: .resume)
+            playbackStatusChanged()
         } else if autoplay {
             player.play()
         }
@@ -873,7 +880,12 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         awaitsResume = false
         let autoplay = resumeAutoplay
         resumeAutoplay = false
-        if autoplay && !isScrubbing { play() }
+        if autoplay && !isScrubbing {
+            play()
+        } else {
+            // No longer waiting to play; playing itself reports through timeControlStatus.
+            playbackStatusChanged()
+        }
         if let seconds {
             MediaViewerHub.shared.show("从 \(MediaVideoControls.format(seconds)) 继续播放")
         }
@@ -937,7 +949,10 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     private func playbackStatusChanged() {
-        let playing = player.currentItem.map { $0.status != .failed } == true && player.timeControlStatus != .paused
+        // Waiting for the saved position before playing counts as playing, like waiting for data.
+        let waitsToPlay = awaitsResume && resumeAutoplay
+        let playing = player.currentItem.map { $0.status != .failed } == true
+            && (player.timeControlStatus != .paused || waitsToPlay)
         if isPlaying != playing {
             if !playing {
                 // An audio interruption may be reported after the pause it caused.
@@ -1038,7 +1053,8 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         else { return }
         playerViewController.player = nil
         detachedForBackground = true
-        player.play()
+        // A file still seeking to its saved position plays once it is there.
+        if !awaitsResume { player.play() }
         MediaDiagnostics.log("后台只播放声音")
     }
 
