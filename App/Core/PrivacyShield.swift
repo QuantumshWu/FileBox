@@ -1,8 +1,10 @@
+import Combine
 import SwiftUI
 import UIKit
 
 /// An opaque window above everything (full-screen covers included) while the app is inactive or in
-/// the background, so the app switcher never shows private content.
+/// the background, so the app switcher never shows private content. It only covers: the app stays
+/// unlocked underneath and looks the same when it comes back.
 @MainActor
 final class PrivacyShield {
     static let shared = PrivacyShield()
@@ -14,6 +16,21 @@ final class PrivacyShield {
     var suppressWhileInactive = false
 
     private var window: UIWindow?
+    private var playbackObserver: AnyCancellable?
+
+    private init() {
+        // A playing video or Picture in Picture keeps the shield away in the background; once that
+        // has ended (PiP closed, playback stopped) the shield goes up after all. Read on the next
+        // turn, since @Published reports the new value before it is stored.
+        playbackObserver = PlaybackState.shared.$keepsViewerInBackground
+            .removeDuplicates()
+            .filter { !$0 }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard UIApplication.shared.applicationState == .background else { return }
+                self?.show()
+            }
+    }
 
     func show() {
         guard window == nil, !isSuppressed, !PlaybackState.shared.keepsViewerInBackground,

@@ -13,9 +13,9 @@ struct RootView: View {
         // dismiss and re-present the viewer (and break a Picture in Picture that is starting).
         ZStack {
             if lock.isUnlocked {
-                // Both tabs stay alive while switching, so the browser keeps its pages; locking
-                // removes the whole TabView and with it the private browsing session. The files
-                // path outlives the lock, so unlocking lands in the folder that was open.
+                // Both tabs stay alive while switching. Locking removes the whole TabView, but the
+                // selected tab, the files path and the browser (BrowserSession) live above the
+                // lock, so unlocking lands where the user was, with the page still loaded.
                 TabView(selection: $tabs.selected) {
                     NavigationStack(path: $nav.path) {
                         FolderView(folder: store.rootURL)
@@ -27,7 +27,7 @@ struct RootView: View {
                     .tag(MainTab.files)
 
                     NavigationStack {
-                        BrowserView()
+                        BrowserTab()
                     }
                     .tabItem { Label("浏览器", systemImage: "globe") }
                     .tag(MainTab.browser)
@@ -70,7 +70,7 @@ struct RootView: View {
     private func destination(_ route: Route) -> some View {
         switch route {
         case .folder(let url): FolderView(folder: url)
-        case .browser: BrowserView()
+        case .browser: BrowserTab()
         case .capture: CaptureView()
         case .transfer: TransferView()
         case .settings: SettingsView()

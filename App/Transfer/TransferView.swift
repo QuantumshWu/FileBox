@@ -47,6 +47,9 @@ struct TransferView: View {
             controller.disappear()
         }
         .onChange(of: scenePhase) { _, phase in
+            // Going to the background ends the session like leaving this screen: every computer has
+            // to be allowed again. A brief inactive moment keeps the approvals.
+            if phase == .background { TransferGate.shared.revokeAll() }
             controller.sceneChanged(active: phase == .active)
         }
     }

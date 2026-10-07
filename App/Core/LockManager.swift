@@ -2,12 +2,13 @@ import CryptoKit
 import Foundation
 
 /// Privacy lock. While locked the app shows an empty decoy file manager; typing the passcode into its
-/// search field unlocks the real vault. The app locks itself whenever it goes to the background.
+/// search field unlocks the real vault. Being unlocked is only kept in memory, so the app locks when
+/// its process ends (swiped away in the app switcher, or ended by iOS) and from the 锁定 buttons;
+/// going to the background and coming back keeps it unlocked.
 /// Only a salted hash of the passcode is stored, on the phone.
 @MainActor
 final class LockManager: ObservableObject {
-    /// The app's one lock, also read by the media engines (closing Picture in Picture while locked
-    /// must leave nothing of the viewer behind).
+    /// The app's one lock, also watched by objects that live above it (the 文件 path, the browser).
     static let shared = LockManager()
 
     @Published private(set) var isUnlocked = false

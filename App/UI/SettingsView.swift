@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject private var store: FileStore
     @EnvironmentObject private var lock: LockManager
+    @EnvironmentObject private var browser: BrowserSession
 
     /// Seconds a double tap on the left or right of a video skips.
     @AppStorage("mediaDoubleTapStep") private var doubleTapStep = 10
@@ -15,6 +16,7 @@ struct SettingsView: View {
     @State private var codeMessage: String?
     @State private var usedBytes: Int64?
     @State private var trashBytes: Int64?
+    @State private var confirmingClear = false
 
     private var version: String {
         let info = Bundle.main.infoDictionary
@@ -50,7 +52,22 @@ struct SettingsView: View {
             } header: {
                 Text("隐私")
             } footer: {
-                Text("App 切到后台会自动锁定。这里的文件不会出现在「文件」App 里，也不会进入 iCloud 或电脑备份，删除 App 就会全部丢失。")
+                Text("从后台划掉 FileBox 或点「锁定」后才会上锁；切到后台再回来不用重新输入口令。这里的文件不会出现在「文件」App 里，也不会进入 iCloud 或电脑备份，删除 App 就会全部丢失。")
+            }
+
+            Section {
+                Button("清除浏览痕迹", role: .destructive) { confirmingClear = true }
+                    .disabled(browser.isClearing)
+                    .confirmationDialog("清除浏览痕迹？", isPresented: $confirmingClear, titleVisibility: .visible) {
+                        Button("清除浏览痕迹", role: .destructive) { browser.clearTraces(store: store) }
+                        Button("取消", role: .cancel) {}
+                    } message: {
+                        Text(browser.clearMessage)
+                    }
+            } header: {
+                Text("浏览器")
+            } footer: {
+                Text("网页、Cookie、登录状态和下载记录会一直保留，锁定或切到后台都不会清除。清除后浏览器回到起始页，已下载的文件仍在「下载」里。")
             }
 
             Section {

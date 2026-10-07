@@ -17,13 +17,17 @@ struct BrowserDialog: Identifiable {
     let kind: Kind
 }
 
-/// State and WebKit delegates of the private browser. It has one web view in a non-persistent data
-/// store, so cookies, history and caches disappear together with it. It lives as long as the 浏览器
-/// tab, so switching tabs keeps pages and downloads; the session ends when the app locks.
+/// State and WebKit delegates of the browser. It has one web view in WebKit's default (persistent)
+/// data store, so cookies, logins and site data are kept until 清除浏览痕迹. `BrowserSession` keeps
+/// it for the app's lifetime, so the page, its history and downloads survive switching tabs and
+/// locking; clearing replaces it with a new one.
 @MainActor
 final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
     let webView: WKWebView
     let downloads = BrowserDownloadManager()
+    /// Whether the start page puts the cursor in the address field. Not after 清除浏览痕迹, which
+    /// should not bring up the keyboard by itself.
+    let focusesAddressAtStart: Bool
 
     @Published private(set) var progress: Double = 0
     @Published private(set) var isLoading = false
@@ -39,12 +43,11 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
 
     private weak var store: FileStore?
     private let dataStore: WKWebsiteDataStore
-    private var lockObserver: AnyCancellable?
     private var userAgent: String?
     private var dialogReply: ((Bool, String?) -> Void)?
     private var lastCrashReload: Date?
-    /// Set when the session ends. WebKit raises an exception if a dialog's completion handler is
-    /// dropped unanswered, so dialogs that still arrive are answered right away.
+    /// Set when 清除浏览痕迹 retires this model. WebKit raises an exception if a dialog's completion
+    /// handler is dropped unanswered, so dialogs that still arrive are answered right away.
     private var isClosed = false
     /// Hosts whose blocked plain-HTTP address was already retried over HTTPS.
     private var httpsRetriedHosts: Set<String> = []
@@ -54,12 +57,12 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
     /// Link schemes WebKit can download from (not javascript:, mailto: and the like).
     private static let downloadableSchemes: Set<String> = ["http", "https", "data", "blob"]
     /// `.allow`, but without WebKit handing universal links (https links an installed app claims,
-    /// such as shop or video sites) to that app, which would leave and lock FileBox. This is WebKit's
-    /// private `_WKNavigationActionPolicyAllowWithoutTryingAppLink`, which Chrome uses for incognito tabs.
+    /// such as shop or video sites) to that app, which would leave FileBox. This is WebKit's private
+    /// `_WKNavigationActionPolicyAllowWithoutTryingAppLink`, which Chrome uses for incognito tabs.
     private static let allowWithoutAppLinks = WKNavigationActionPolicy(rawValue: WKNavigationActionPolicy.allow.rawValue + 2) ?? .allow
 
-    override init() {
-        let dataStore = WKWebsiteDataStore.nonPersistent()
+    init(focusesAddressAtStart: Bool = true) {
+        let dataStore = WKWebsiteDataStore.default()
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = dataStore
         configuration.allowsInlineMediaPlayback = true
@@ -71,6 +74,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
             in: .defaultClient
         ))
         self.dataStore = dataStore
+        self.focusesAddressAtStart = focusesAddressAtStart
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.allowsBackForwardNavigationGestures = true
         super.init()
@@ -84,50 +88,33 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         webView.publisher(for: \.title).assign(to: &$title)
     }
 
-    /// Connects the model to the app. It shuts down the moment the app locks, before SwiftUI removes
-    /// the tabs, so nothing private keeps running even if the model lingers for a while.
-    func attach(_ store: FileStore, lock: LockManager) {
+    /// Connects the model to the app (banners, saving downloads into the vault).
+    func attach(_ store: FileStore) {
         self.store = store
         downloads.store = store
-        guard lockObserver == nil, !isClosed else { return }
-        lockObserver = lock.$isUnlocked.sink { [weak self] unlocked in
-            if !unlocked { self?.shutdown() }
-        }
     }
 
-    /// Ends the private session for good: downloads stop, full-screen web video and Picture in
-    /// Picture close, the page is unloaded and the session's cookies and caches are deleted.
+    /// Locking keeps the page, but nothing of it may go on playing, or stay in full screen or
+    /// Picture in Picture over the decoy.
+    func pauseMedia() {
+        webView.pauseAllMediaPlayback(completionHandler: nil)
+        webView.closeAllMediaPresentations(completionHandler: nil)
+    }
+
+    /// Retires the model for 清除浏览痕迹: downloads stop, page media closes and the page is
+    /// unloaded. Deleting the website data is up to `BrowserSession`.
     func shutdown() {
         guard !isClosed else { return }
         isClosed = true
-        lockObserver = nil
         answerDialog(false)
-        Self.close(webView, downloads)
-    }
-
-    /// Covers the model going away without the app locking first; WebKit is main-thread only.
-    deinit {
-        let webView = self.webView
-        let downloads = self.downloads
-        Task { @MainActor in
-            BrowserModel.close(webView, downloads)
-        }
-    }
-
-    private static func close(_ webView: WKWebView, _ downloads: BrowserDownloadManager) {
         downloads.cancelAll()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
         webView.stopLoading()
-        webView.pauseAllMediaPlayback(completionHandler: nil)
-        webView.closeAllMediaPresentations(completionHandler: nil)
+        pauseMedia()
         if let blank = URL(string: "about:blank") {
             webView.load(URLRequest(url: blank))
         }
-        webView.configuration.websiteDataStore.removeData(
-            ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
-            modifiedSince: .distantPast
-        ) {}
     }
 
     // MARK: - Navigation
@@ -200,7 +187,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         decisionHandler(.cancel)
         // Pages often try to launch their own app by themselves; only mention it after a tap.
         if navigationAction.navigationType == .linkActivated {
-            store?.show("无痕浏览器不会打开其他 App（\(scheme):）")
+            store?.show("FileBox 的浏览器不会打开其他 App（\(scheme):）")
         }
     }
 
@@ -384,7 +371,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKUI
         }
     }
 
-    /// WebKit's default menu items that would leave the private browser or need tabs.
+    /// WebKit's default menu items that would leave the browser or need tabs.
     private static func isUnwantedDefault(_ element: UIMenuElement) -> Bool {
         guard let action = element as? UIAction else { return false }
         let id = action.identifier.rawValue
