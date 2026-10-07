@@ -430,7 +430,8 @@ struct ViewerChrome: View {
                 .padding(.vertical, 10)
                 .background(.thinMaterial, in: Capsule())
                 .padding(.horizontal, 24)
-                .padding(.bottom, 96)
+                // Above the audio transport row when there is one.
+                .padding(.bottom, currentItem?.kind == .audio ? 190 : 96)
                 .transition(.opacity)
                 .allowsHitTesting(false)
         }
