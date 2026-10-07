@@ -1190,7 +1190,9 @@ struct FileRow: View {
         .contentShape(Rectangle())
         .task(id: item) {
             guard item.kind == .video else { return }
-            duration = await FolderUIVideoLength.text(for: item)
+            let loaded = await FolderVideoDurations.text(for: item)
+            guard !Task.isCancelled else { return }
+            duration = loaded
         }
     }
 
@@ -1201,91 +1203,10 @@ struct FileRow: View {
             return "\(count) 项 · \(date)"
         }
         let size = ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
-        if let duration { return "\(size) · \(duration) · \(date)" }
+        // A length the grid or an earlier row already read shows in the first frame.
+        if let duration = duration ?? (item.kind == .video ? FolderVideoDurations.cachedText(for: item) : nil) {
+            return "\(size) · \(duration) · \(date)"
+        }
         return "\(size) · \(date)"
     }
 }
-
-/// Video lengths for list rows as display text, loaded once per file version.
-@MainActor
-private enum FolderUIVideoLength {
-    private static var cache: [String: String] = [:]
-
-    static func text(for item: FileItem) async -> String? {
-        let key = "\(item.url.path)|\(item.modified.timeIntervalSince1970)"
-        if let hit = cache[key] { return hit }
-        guard let duration = try? await AVURLAsset(url: item.url).load(.duration) else { return nil }
-        let seconds = duration.seconds
-        guard seconds.isFinite, seconds >= 0 else { return nil }
-        let total = Int(seconds.rounded())
-        let text = total >= 3600
-            ? String(format: "%d:%02d:%02d", total / 3600, total % 3600 / 60, total % 60)
-            : String(format: "%d:%02d", total / 60, total % 60)
-        cache[key] = text
-        return text
-    }
-}
-
-// MARK: - Until the file-data package is merged
-
-// FileStore and FileItem members that the file-data package adds. A type's own member always wins
-// over a protocol's default, so these defaults only run where that package is not merged yet.
-
-protocol FolderUIListingSource {
-    static func listItems(in folder: URL, sort: SortOrder) -> [FileItem]
-}
-
-extension FolderUIListingSource {
-    static func listItems(in folder: URL, sort: SortOrder) -> [FileItem] {
-        let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
-        guard let urls = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
-        else { return [] }
-        var result = urls.map { FileItem(url: $0) }
-        result.sort { a, b in
-            if a.isDirectory != b.isDirectory { return a.isDirectory }
-            switch sort {
-            case .date: return a.modified > b.modified
-            case .name: return a.name.localizedStandardCompare(b.name) == .orderedAscending
-            case .size: return a.size > b.size
-            }
-        }
-        return result
-    }
-}
-
-extension FileStore: FolderUIListingSource {}
-
-@MainActor
-protocol FolderUIStoreActions: AnyObject {
-    func duplicate(_ item: FileItem)
-    func importFiles(_ urls: [URL], into folder: URL, moving: Bool, progress: (@MainActor (Int, Int) -> Void)?) async
-}
-
-extension FolderUIStoreActions where Self: FileStore {
-    func duplicate(_ item: FileItem) {
-        do {
-            try Vault.place(item.url, in: item.url.deletingLastPathComponent(), move: false)
-            refresh()
-        } catch {
-            report(error)
-        }
-    }
-
-    func importFiles(_ urls: [URL], into folder: URL, moving: Bool, progress: (@MainActor (Int, Int) -> Void)?) async {
-        progress?(0, urls.count)
-        await importFiles(urls, into: folder, moving: moving)
-        progress?(urls.count, urls.count)
-    }
-}
-
-extension FileStore: FolderUIStoreActions {}
-
-protocol FolderUIItemFacts {
-    var childCount: Int? { get }
-}
-
-extension FolderUIItemFacts {
-    var childCount: Int? { nil }
-}
-
-extension FileItem: FolderUIItemFacts {}

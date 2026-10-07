@@ -5,7 +5,6 @@ struct RootView: View {
     @EnvironmentObject private var store: FileStore
     @EnvironmentObject private var lock: LockManager
     @EnvironmentObject private var viewer: ViewerCoordinator
-    @EnvironmentObject private var playback: PlaybackState
     @EnvironmentObject private var tabs: TabCoordinator
     @EnvironmentObject private var nav: FolderUINavigation
 
@@ -55,12 +54,14 @@ struct RootView: View {
             .animation(.spring, value: store.banner)
             .allowsHitTesting(false)
         }
+        // PlaybackState is handed on without being observed here: it changes with every play and
+        // pause, and re-rendering the root would rebuild the open viewer's pages each time.
         .fullScreenCover(item: $viewer.request) { request in
             MediaViewer(items: request.items, startIndex: request.startIndex)
                 .environmentObject(store)
                 .environmentObject(lock)
                 .environmentObject(viewer)
-                .environmentObject(playback)
+                .environmentObject(PlaybackState.shared)
                 .environmentObject(tabs)
         }
     }

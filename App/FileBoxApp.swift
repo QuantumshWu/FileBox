@@ -2,6 +2,8 @@ import SwiftUI
 
 @main
 struct FileBoxApp: App {
+    /// Answers the allowed orientations, so the viewer's 横屏 button can hold a video sideways.
+    @UIApplicationDelegateAdaptor(ViewerAppDelegate.self) private var appDelegate
     @StateObject private var store = FileStore()
     @StateObject private var lock = LockManager.shared
     @StateObject private var viewer = ViewerCoordinator()
