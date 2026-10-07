@@ -34,6 +34,8 @@ def main():
     checked = 0
     frames = 0
     last_event = ""
+    landscape = None
+    turning_until = -1.0
     for line in open(args.log, encoding="utf-8", errors="replace"):
         line = line.rstrip("\n")
         parts = line.split(" ", 3)
@@ -54,6 +56,14 @@ def main():
         # Turned sideways: the screen's height is the other side.
         win = re.search(r"win=" + RECT, line)
         screen_mid = float(win.group(4)) / 2 if win else height / 2
+        if win:
+            now = float(win.group(3)) > float(win.group(4))
+            if landscape is not None and now != landscape:
+                # While the interface turns, UIKit animates every view's drawn bounds from the old
+                # shape to the new one; only the laid-out values must be in place at once.
+                turning_until = stamp + 1.0
+                last_event = "turned " + ("sideways" if now else "upright")
+            landscape = now
         status = re.search(r"sb=(\w+)", line)
         safe = re.search(r"pvSafe=(\{[^}]*\})", line)
         for segment in line.split(" | "):
@@ -62,6 +72,8 @@ def main():
                 continue
             # Off-screen neighbours (paging) are left out by the probe; a page moving sideways is fine.
             for key in ("m", "p", "img", "imgP", "video"):
+                if key in ("p", "imgP") and stamp < turning_until:
+                    continue
                 match = re.search(r"(?:^| )" + key + "=" + RECT, segment)
                 if not match:
                     continue
