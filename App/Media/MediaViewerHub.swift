@@ -42,8 +42,6 @@ final class MediaViewerHub: ObservableObject {
     private var sessionActive = false
     /// Bumped by every activation, so a deferred switch-off that is no longer wanted does nothing.
     private var deactivationGeneration = 0
-    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
-    private var backgroundCheckID = UUID()
     private var appObservers: Set<AnyCancellable> = []
 
     var isViewerPresented: Bool { presentedToken != nil }
@@ -52,21 +50,12 @@ final class MediaViewerHub: ObservableObject {
 
     private init() {
         let center = NotificationCenter.default
+        // The viewer itself stays open in the background, on the same file and turned the same way.
         center.publisher(for: UIApplication.didEnterBackgroundNotification)
             .sink { [weak self] _ in
                 guard let self else { return }
-                // The locked screen (and the decoy) is never left turned sideways.
-                ViewerOrientation.restorePortrait()
                 // A suspended app would never run a deferred switch-off.
                 if self.audioHolders.isEmpty && self.sessionActive { self.deactivateAudioSession() }
-                // After the video's own sound-only fallback (3 s) has decided.
-                self.checkInBackground(after: 3.5)
-            }
-            .store(in: &appObservers)
-        center.publisher(for: UIApplication.willEnterForegroundNotification)
-            .sink { [weak self] _ in
-                self?.backgroundCheckID = UUID()
-                self?.endBackgroundTime()
             }
             .store(in: &appObservers)
         center.publisher(for: AVAudioSession.interruptionNotification)
@@ -93,7 +82,7 @@ final class MediaViewerHub: ObservableObject {
         presentedURLs = items.map(\.url)
         if self.coordinator !== coordinator {
             self.coordinator = coordinator
-            // Closing the viewer (button, or the app going to the background) clears the request.
+            // Closing the viewer (its button, a swipe, PiP's X) clears the request.
             requestObserver = coordinator.$request.sink { [weak self] request in
                 self?.requestChanged(request)
             }
@@ -166,31 +155,15 @@ final class MediaViewerHub: ObservableObject {
         publish()
     }
 
-    /// While the viewer is open and something plays or PiP is active or armed, backgrounding must
-    /// neither close the viewer nor cover it with the privacy shield (which would stop PiP from
-    /// starting). A closed viewer leaves nothing to keep: PiP floats on by itself.
+    /// While the viewer is open and something plays or PiP is active or armed, going to the
+    /// background must not cover it with the privacy shield, which would keep PiP from starting.
+    /// A closed viewer leaves nothing to keep: PiP floats on by itself.
     private func publish() {
         let state = PlaybackState.shared
         let pip = videoPiPActive || imagePiPActive
         let keeps = isViewerPresented && (pip || videoKeepsAlive || imageKeepsAlive)
         if state.keepsViewerInBackground != keeps { state.keepsViewerInBackground = keeps }
         if state.isPictureInPictureActive != pip { state.isPictureInPictureActive = pip }
-    }
-
-    /// The viewer stayed open when the app left the screen because PiP was armed or something
-    /// played. If after `seconds` nothing plays or floats any more (PiP did not start, or its window
-    /// was closed), the viewer closes and the privacy shield goes up, as for any other screen.
-    func checkInBackground(after seconds: Double) {
-        guard UIApplication.shared.applicationState == .background, isViewerPresented else { return }
-        beginBackgroundTime()
-        let id = UUID()
-        backgroundCheckID = id
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            guard let self, self.backgroundCheckID == id else { return }
-            self.closeIfIdleInBackground()
-            self.endBackgroundTime()
-        }
     }
 
     /// FileBox came back to the screen while something floats: end the floating window and show
@@ -200,43 +173,14 @@ final class MediaViewerHub: ObservableObject {
         MediaImagePiPController.shared.endPictureInPictureForReturn()
     }
 
-    /// PiP was closed with its X while the app is locked (it locks whenever it leaves the screen;
-    /// iOS may deliver this only once the user is back): close the viewer at once, without the
-    /// closing animation, so only the locked screen is ever seen.
-    func closeViewerAfterPictureInPicture() {
-        guard isViewerPresented else { return }
-        backgroundCheckID = UUID()
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) { coordinator?.close() }
-        if UIApplication.shared.applicationState != .active { PrivacyShield.shared.show() }
-    }
-
-    private func closeIfIdleInBackground() {
-        let playback = MediaPlaybackController.shared
-        let image = MediaImagePiPController.shared
-        guard UIApplication.shared.applicationState == .background, isViewerPresented,
-              !playback.isPlaying, !playback.isPictureInPictureEngaged, !image.isEngaged
-        else { return }
-        coordinator?.close()
-        PrivacyShield.shared.show()
-    }
-
-    /// Keeps the app running for the check above; without sound playing it would be suspended.
-    private func beginBackgroundTime() {
-        guard backgroundTask == .invalid else { return }
-        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "MediaViewerCheck") { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                self.endBackgroundTime()
-            }
-        }
-    }
-
-    private func endBackgroundTime() {
-        guard backgroundTask != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(backgroundTask)
-        backgroundTask = .invalid
+    /// PiP was closed with its X, whenever iOS delivers that (often only once the user is back in
+    /// the app): the viewer showing `urls`, the one PiP floated from, closes at once and without its
+    /// closing animation, so the page it was opened from is all that shows.
+    func closeViewerAfterPictureInPicture(of urls: [URL]) {
+        guard isViewerPresented, presentedURLs == urls else { return }
+        coordinator?.closeImmediately()
+        // In the background the shield stayed away for PiP; now it covers the app switcher.
+        if UIApplication.shared.applicationState == .background { PrivacyShield.shared.show() }
     }
 
     // MARK: - Audio session

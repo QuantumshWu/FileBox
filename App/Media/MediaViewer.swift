@@ -63,7 +63,9 @@ struct MediaViewer: View {
         ZStack {
             ViewerBackdrop(transition: transition)
             ViewerPagerFrame(transition: transition) {
-                pager
+                // Edge to edge, whatever the bars and the notch take; only the bars keep clear.
+                ViewerEdgeToEdge(content: pager)
+                    .ignoresSafeArea()
             }
             ViewerChrome(
                 items: items,
@@ -126,11 +128,13 @@ struct MediaViewer: View {
 
     // MARK: - Pages
 
+    /// Hosted by `ViewerEdgeToEdge`, outside this view's environment, so the dark appearance is
+    /// set again here.
     private var pager: some View {
         TabView(selection: $selection) {
             ForEach(items) { item in
                 page(for: item)
-                    // Edge to edge, whatever the bars and the notch take; only the bars keep clear.
+                    // There is no safe area in there; should one ever get through, it is ignored.
                     .ignoresSafeArea()
                     .padding(.horizontal, Self.pageGap / 2)
                     .tag(tags[item.url] ?? 0)
@@ -140,6 +144,7 @@ struct MediaViewer: View {
         // Pages one gap wider than the screen: a page still fills it, the gap shows while swiping.
         .padding(.horizontal, -Self.pageGap / 2)
         .ignoresSafeArea()
+        .environment(\.colorScheme, .dark)
     }
 
     @ViewBuilder
@@ -317,6 +322,9 @@ struct MediaViewer: View {
     }
 
     private func trimVideo(_ item: FileItem) {
+        // Like the image editor: a floating video goes back first, so closing that window can never
+        // take the editor away with the viewer.
+        playback.endPictureInPictureForViewer()
         playback.pause()
         ViewerOrientation.restorePortrait()
         chrome.coverUp = true

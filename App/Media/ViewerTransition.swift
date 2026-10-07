@@ -154,3 +154,59 @@ struct ViewerPagerFrame<Content: View>: View {
             .scaleEffect(transition.contentScale)
     }
 }
+
+/// Shows the pager edge to edge with no safe area at all, SwiftUI's or UIKit's. A page-style
+/// TabView doesn't reliably honour `ignoresSafeArea`: its pages were first laid out inside the safe
+/// area and jumped up once it changed under them (the status bar hiding as the viewer opens). With
+/// none, a page is in its final place from its first frame, and opening, paging, the bars showing
+/// or hiding and turning the phone never shift it.
+struct ViewerEdgeToEdge<Content: View>: UIViewControllerRepresentable {
+    let content: Content
+
+    func makeUIViewController(context: Context) -> ViewerEdgeToEdgeController<Content> {
+        ViewerEdgeToEdgeController(rootView: content)
+    }
+
+    func updateUIViewController(_ controller: ViewerEdgeToEdgeController<Content>, context: Context) {
+        controller.rootView = content
+    }
+
+    /// Always the whole space offered, never the pager's own idea of its size.
+    func sizeThatFits(_ proposal: ProposedViewSize, uiViewController: ViewerEdgeToEdgeController<Content>, context: Context) -> CGSize? {
+        proposal.replacingUnspecifiedDimensions()
+    }
+}
+
+final class ViewerEdgeToEdgeController<Content: View>: UIHostingController<Content> {
+    override init(rootView: Content) {
+        super.init(rootView: rootView)
+        // SwiftUI inside gets no safe area.
+        safeAreaRegions = []
+        overrideUserInterfaceStyle = .dark
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        // The viewer's backdrop supplies the black; the folder shows through a page dragged away.
+        view.backgroundColor = .clear
+    }
+
+    /// Cancels the safe area the viewer around passes down, so the UIKit views inside (the
+    /// pager's scroll view and its pages) get none either.
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        let added = additionalSafeAreaInsets
+        let insets = view.safeAreaInsets
+        let cancelling = UIEdgeInsets(
+            top: added.top - insets.top,
+            left: added.left - insets.left,
+            bottom: added.bottom - insets.bottom,
+            right: added.right - insets.right
+        )
+        if cancelling != added { additionalSafeAreaInsets = cancelling }
+    }
+}
