@@ -67,6 +67,21 @@ final class ViewerJumpUITests: XCTestCase {
         closeWithButton("grid-close-button")
         step("grid-open-video-portrait", settle: 4) { element("cell-c_portrait.mp4").tap() }
         step("grid-close-swipe-down", settle: 2.5) { app.swipeDown() }
+
+        // 6. A landscape video turned sideways with 横屏 and back with 竖屏 (checked by the probe log;
+        // the recording stays upright).
+        step("grid-open-video-landscape", settle: 4) { element("cell-d_landscape.mp4").tap() }
+        step("chrome-show-before-rotation", settle: 1) { tapViewer() }
+        let toLandscape = app.buttons["横屏"]
+        if toLandscape.waitForExistence(timeout: 3) {
+            step("landscape-button", settle: 4) { toLandscape.tap() }
+            let toPortrait = app.buttons["竖屏"]
+            if !toPortrait.waitForExistence(timeout: 1) { tapViewer() }
+            if toPortrait.waitForExistence(timeout: 3) {
+                step("portrait-button", settle: 4) { toPortrait.tap() }
+            }
+        }
+        closeWithButton("close-button-after-rotation")
         mark("done")
     }
 

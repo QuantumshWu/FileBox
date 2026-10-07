@@ -159,8 +159,10 @@ def probe_info(path, start):
     scale = None
     height = None
     events = []
+    sideways = []
     if not path or not os.path.exists(path):
-        return scale, height, events
+        return scale, height, events, sideways
+    landscape = False
     for line in load_lines(path):
         parts = line.split(" ", 3)
         if len(parts) < 4:
@@ -177,7 +179,16 @@ def probe_info(path, start):
                 events.append((float(parts[0]) - start, parts[3]))
             except ValueError:
                 pass
-    return scale, height, events
+        window = re.search(r"win=\[[-0-9.]+,[-0-9.]+,([0-9.]+),([0-9.]+)\]", line)
+        if window and parts[2].startswith("F"):
+            now = float(window.group(1)) > float(window.group(2))
+            if now != landscape:
+                landscape = now
+                if now:
+                    sideways.append([float(parts[0]) - start, None])
+                elif sideways:
+                    sideways[-1][1] = float(parts[0]) - start
+    return scale, height, events, sideways
 
 
 def step_kind(name):
@@ -210,7 +221,9 @@ def find_sessions(rows, gap=4):
 
 
 def deviation(row, mid):
-    return None if row.get("estimate_pt") is None else abs(row["estimate_pt"] - mid)
+    if row.get("estimate_pt") is None or row.get("sideways"):
+        return None
+    return abs(row["estimate_pt"] - mid)
 
 
 def analyse_session(session, mid, args, swiped=False):
@@ -265,7 +278,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
 
     start = float(load_lines(args.record_start)[0]) if args.record_start else 0.0
-    probe_scale, probe_height, probe_events = probe_info(args.probe, start)
+    probe_scale, probe_height, probe_events, sideways = probe_info(args.probe, start)
     scale = args.scale or probe_scale or 3.0
 
     if args.from_csv:
@@ -313,6 +326,9 @@ def main():
         if before:
             lags.append(session[0]["t"] - before[-1])
     lag = median([l for l in lags if 0 <= l < 5]) or 0.0
+    turned = [(a + lag - 0.5, (b if b is not None else 1e9) + lag + 1.0) for a, b in sideways]
+    for row in rows:
+        row["sideways"] = row["t"] is not None and any(a <= row["t"] <= b for a, b in turned)
     verdict_lines = [
         "",
         f"SESSIONS (largest distance of the pattern's centre from the screen centre {fmt(mid)}pt, in any frame;",
@@ -321,6 +337,7 @@ def main():
         "  #  file                 frames         t(s)            opening            open               closing            verdict",
     ]
     any_jump = False
+    fly_frames = set()
     for number, session in enumerate(sessions, 1):
         t0 = session[0]["t"]
         label = "?"
@@ -331,6 +348,7 @@ def main():
         nxt = sessions[number][0]["t"] if number < len(sessions) else t_end + 10
         swiped = any(t0 <= t + lag <= min(t_end + 1.0, nxt) for t in drags)
         phases, fly = analyse_session(session, mid, args, swiped)
+        fly_frames.update(row["index"] for row in fly)
         cells = []
         jump = False
         for phase in ("opening", "open", "closing"):
@@ -346,6 +364,8 @@ def main():
             if dev > args.tolerance:
                 jump = True
         verdict = "JUMP" if jump else "OK"
+        if any(row.get("sideways") for row in session):
+            verdict += " (sideways frames left to the probe check)"
         if fly:
             verdict += f" (swiped away from f{fly[0]['index']})"
         any_jump = any_jump or jump
@@ -369,6 +389,34 @@ def main():
                     pass
         begins = {name[:-6]: t for t, name in events if name.endswith(".begin")}
         steps = [(begins.get(name, t), t, name) for t, name in events if not name.endswith(".begin")]
+    step_lines = [
+        "",
+        "STEP SUMMARY (frames in each step's window in which the picture shows, not counting a page flying off",
+        "after a swipe; largest distance of the pattern's centre from the screen centre)",
+        "  step                             kind          frames  first   max|d|  verdict",
+    ]
+    for index, (t_begin, t_end, name) in enumerate(steps):
+        kind = step_kind(name)
+        if kind == "other":
+            continue
+        next_begin = steps[index + 1][0] if index + 1 < len(steps) else t_end + 10
+        lo = t_begin - args.before
+        hi = min(t_end + args.after + (t_end - t_begin), next_begin - 0.05)
+        shown = [row for row in rows if row["t"] is not None and lo <= row["t"] <= hi and row["seen"] >= 2
+                 and row["index"] not in fly_frames and row.get("estimate_pt") is not None
+                 and not row.get("sideways")]
+        worst = max((abs(row["estimate_pt"] - mid) for row in shown), default=None)
+        if not shown:
+            verdict = "no frames with the picture"
+        else:
+            verdict = "OK" if worst <= args.tolerance else "JUMP"
+        if kind == "close-swipe":
+            verdict += " (fly-off excluded)"
+        if kind == "rotate":
+            verdict = "sideways: see the probe check"
+        first = ("f" + str(shown[0]["index"])) if shown else "-"
+        step_lines.append(f"  {name:32s} {kind:12s} {len(shown):6d} {first:>6s} {fmt(worst):>8s}  {verdict}")
+    report += step_lines
     report.append("")
     report.append("STEPS (test steps moved by the lag above; positions in points from the top of the screen;")
     report.append("dC / dG = centre / green line minus the screen centre)")
@@ -411,7 +459,7 @@ def main():
 
     with open(os.path.join(args.out, "report.txt"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(report) + "\n")
-    print("\n".join(verdict_lines))
+    print("\n".join(verdict_lines + step_lines))
     return 0
 
 
