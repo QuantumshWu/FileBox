@@ -17,7 +17,7 @@ concurrency:
 jobs:
   repro:
     runs-on: macos-26
-    timeout-minutes: 75
+    timeout-minutes: 120
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -61,10 +61,20 @@ jobs:
         run: |
           STATUS=0
           while IFS=$'\t' read -r UDID NAME LABEL; do
-            bash tools/viewer_jump/run_device.sh "$UDID" "$LABEL" "repro-out/$LABEL" || STATUS=1
+            # stdin from /dev/null: xcodebuild and simctl would otherwise eat the rest of the list.
+            bash tools/viewer_jump/run_device.sh "$UDID" "$LABEL" "repro-out/$LABEL" < /dev/null || STATUS=1
             echo "$NAME" > "repro-out/$LABEL/device.txt"
           done < simulators.txt
           exit $STATUS
+
+      - name: Verdicts
+        if: always()
+        run: |
+          for f in repro-out/*/report.txt; do
+            echo "== $f ($(cat "$(dirname "$f")/device.txt" 2>/dev/null))"
+            sed -n '/^SESSIONS/,/OVERALL/p' "$f"
+            cat "$(dirname "$f")/probe_check.txt" 2>/dev/null
+          done
 
       - name: Upload results
         if: always()
@@ -80,6 +90,7 @@ jobs:
             repro-out/*/frame_times.txt
             repro-out/*/stream.txt
             repro-out/*/viewer-probe.log
+            repro-out/*/probe_check.txt
             repro-out/*/test.log
             repro-out/*/device.txt
             repro-out/*/frames/**

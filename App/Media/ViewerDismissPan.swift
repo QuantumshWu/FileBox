@@ -41,6 +41,10 @@ final class ViewerDismissPan: NSObject, UIGestureRecognizerDelegate {
         // In window coordinates: SwiftUI moves the view itself along with the finger.
         let translation = pan.translation(in: nil)
         let offset = CGSize(width: translation.x, height: translation.y)
+        #if DEBUG
+        if pan.state == .began { ViewerProbe.shared.event("dismiss drag began") }
+        if pan.state == .ended || pan.state == .cancelled { ViewerProbe.shared.event("dismiss drag ended") }
+        #endif
         switch pan.state {
         case .began:
             if let view = pan.view, view.bounds.width > 0, view.bounds.height > 0 {

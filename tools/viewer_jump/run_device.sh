@@ -65,7 +65,11 @@ if [ -s "$OUT/recording.mp4" ]; then
   echo "frames: $(ls "$WORK/frames" | wc -l) times: $(wc -l < "$OUT/frame_times.txt")"
   python3 "$ROOT/tools/viewer_jump/measure.py" \
     --frames "$WORK/frames" --times "$OUT/frame_times.txt" --events "$OUT/events.txt" \
-    --record-start "$OUT/record_start.txt" --out "$OUT" --copy-frames
+    --record-start "$OUT/record_start.txt" --probe "$OUT/viewer-probe.log" --out "$OUT" --copy-frames
+fi
+if [ -s "$OUT/viewer-probe.log" ]; then
+  python3 "$ROOT/tools/viewer_jump/probe_check.py" "$OUT/viewer-probe.log" --start "$OUT/record_start.txt" > "$OUT/probe_check.txt"
+  cat "$OUT/probe_check.txt"
 fi
 rm -rf "$WORK"
 exit $TEST_STATUS
