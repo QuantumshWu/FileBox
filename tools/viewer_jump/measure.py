@@ -39,7 +39,7 @@ import numpy as np
 from PIL import Image
 
 COLUMNS = (0.25, 0.5, 0.75)
-CSV_KEYS = ["index", "t", "file", "h", "seen", "top_pt", "bot_pt", "centre_pt", "green_pt"]
+CSV_KEYS = ["index", "t", "file", "h", "seen", "top_pt", "bot_pt", "centre_pt", "green_pt", "estimate_pt"]
 for _c in COLUMNS:
     CSV_KEYS += [f"red_top@{_c}", f"red_top_inner@{_c}", f"red_bot@{_c}", f"red_bot_inner@{_c}", f"green@{_c}"]
 
@@ -99,19 +99,33 @@ def median(values):
     return values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2
 
 
+# A picture in the viewer is never shorter than this (a 2:1 picture on a 375 pt wide screen is
+# 187 pt); the folder's thumbnails showing through the fading viewer always are.
+MIN_HEIGHT_PT = 140
+
+
 def summary_values(row, scale):
-    """Top edge, bottom edge, centre, green line (points) from whichever columns saw them."""
-    tops = [row.get(f"red_top@{c}") for c in COLUMNS]
-    bots = [row.get(f"red_bot@{c}") for c in COLUMNS]
-    greens = [row.get(f"green@{c}") for c in (0.25, 0.75)]
-    top = median(tops)
-    bot = median(bots)
-    green = median(greens)
-    seen = sum(t is not None for t in tops) + sum(g is not None for g in greens)
+    """Top edge, bottom edge, centre, green line and the combined centre estimate (points), from the
+    columns that saw a red border tall enough to be the viewer's picture (not a thumbnail)."""
+    tops, bots, centres, greens = [], [], [], []
+    for c in COLUMNS:
+        t, b = row.get(f"red_top@{c}"), row.get(f"red_bot@{c}")
+        if t is None or b is None or (b - t) / scale < MIN_HEIGHT_PT:
+            continue
+        tops.append(t)
+        bots.append(b)
+        # Each column's own middle: while paging, columns can see two different pictures.
+        centres.append((t + b) / 2)
+        g = row.get(f"green@{c}") if c != 0.5 else None
+        if g is not None and t < g < b:
+            greens.append(g)
     to_pt = lambda v: None if v is None else v / scale
-    # Each column's own middle: while paging, columns can see two different pictures.
-    centre = median([(t + b) / 2 for t, b in zip(tops, bots) if t is not None and b is not None])
-    return to_pt(top), to_pt(bot), to_pt(centre), to_pt(green), seen
+    seen = len(centres) + len(greens)
+    # The pattern's centre: the median of every estimate (each column's middle of the red border and
+    # each green line), so one column caught by a page sliding past never decides alone.
+    estimate = median(centres + greens)
+    return (to_pt(median(tops)), to_pt(median(bots)), to_pt(median(centres)), to_pt(median(greens)),
+            to_pt(estimate), seen)
 
 
 def read_csv(path):
@@ -196,26 +210,21 @@ def find_sessions(rows, gap=4):
 
 
 def deviation(row, mid):
-    values = [abs(row[key] - mid) for key in ("centre_pt", "green_pt") if row[key] is not None]
-    return max(values) if values else None
+    return None if row.get("estimate_pt") is None else abs(row["estimate_pt"] - mid)
 
 
-def analyse_session(session, mid, args):
+def analyse_session(session, mid, args, swiped=False):
     """Splits a session into opening, open and closing, and finds the largest shift in each."""
     t0 = session[0]["t"]
     t1 = session[-1]["t"]
     devs = [deviation(row, mid) for row in session]
-    # A page swiped away moves further and further from the centre until it is gone: the trailing
-    # run of frames whose deviation keeps growing past the tolerance is that fly-off.
+    # A page swiped away (the app logged a dismiss drag) follows the finger and flies off: that is
+    # everything after the last centred frame. A fading close ends where it was.
     fly_start = len(session)
-    i = len(session) - 1
-    while i > 0 and devs[i] is not None and devs[i] > args.tolerance:
-        prev = devs[i - 1]
-        if prev is None or prev > devs[i] + 0.5:
-            break
-        i -= 1
-    if i < len(session) - 1 and devs[len(session) - 1] is not None and devs[len(session) - 1] > 20:
-        fly_start = i + 1
+    last = next((d for d in reversed(devs) if d is not None), None)
+    if last is not None and last > args.tolerance and (swiped or last > 20):
+        centred = [k for k, d in enumerate(devs) if d is not None and d <= args.tolerance]
+        fly_start = centred[-1] + 1 if centred else 0
     phases = {"opening": [], "open": [], "closing": []}
     for k, row in enumerate(session[:fly_start]):
         if row["t"] - t0 <= args.opening:
@@ -278,8 +287,9 @@ def main():
             row["index"] = index + 1
             row["t"] = times[index] if index < len(times) else None
     for row in rows:
-        top, bot, centre, green, seen = summary_values(row, scale)
-        row.update({"top_pt": top, "bot_pt": bot, "centre_pt": centre, "green_pt": green, "seen": seen})
+        top, bot, centre, green, estimate, seen = summary_values(row, scale)
+        row.update({"top_pt": top, "bot_pt": bot, "centre_pt": centre, "green_pt": green, "estimate_pt": estimate,
+                    "seen": seen})
     if not args.from_csv:
         with open(os.path.join(args.out, "measurements.csv"), "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=CSV_KEYS, extrasaction="ignore")
@@ -296,6 +306,7 @@ def main():
     sessions = find_sessions(rows)
     opens = [(t, text) for t, text in probe_events if text.startswith("open ")]
     appeared = [t for t, text in probe_events if text == "viewer appeared"]
+    drags = [t for t, text in probe_events if text == "dismiss drag began"]
     lags = []
     for session in sessions:
         before = [t for t in appeared if t <= session[0]["t"]]
@@ -304,7 +315,7 @@ def main():
     lag = median([l for l in lags if 0 <= l < 5]) or 0.0
     verdict_lines = [
         "",
-        f"SESSIONS (largest distance of the pattern's centre or green line from the screen centre {fmt(mid)}pt;",
+        f"SESSIONS (largest distance of the pattern's centre from the screen centre {fmt(mid)}pt, in any frame;",
         f"a jump is more than {args.tolerance:.2f} pt; opening = first {args.opening:.1f}s, closing = last {args.closing:.1f}s;",
         f"the recording lags the app's clock by about {lag:.2f}s)",
         "  #  file                 frames         t(s)            opening            open               closing            verdict",
@@ -316,7 +327,10 @@ def main():
         candidates = [text[5:] for t, text in opens if t + lag <= t0 + 0.2]
         if candidates:
             label = candidates[-1]
-        phases, fly = analyse_session(session, mid, args)
+        t_end = session[-1]["t"]
+        nxt = sessions[number][0]["t"] if number < len(sessions) else t_end + 10
+        swiped = any(t0 <= t + lag <= min(t_end + 1.0, nxt) for t in drags)
+        phases, fly = analyse_session(session, mid, args, swiped)
         cells = []
         jump = False
         for phase in ("opening", "open", "closing"):
@@ -369,14 +383,15 @@ def main():
         if not window:
             report.append("  no frames")
             continue
-        report.append("  frame      t(s)  seen     top     bot  centre   green |     dC     dG")
+        report.append("  frame      t(s)  seen     top     bot  centre   green |     dC     dG  dEstimate")
         for row in window:
             dc = None if row["centre_pt"] is None or mid is None else row["centre_pt"] - mid
             dg = None if row["green_pt"] is None or mid is None else row["green_pt"] - mid
+            de = None if row.get("estimate_pt") is None or mid is None else row["estimate_pt"] - mid
             report.append(
-                "  %6d %8.3f %5d %7s %7s %7s %7s | %6s %6s" % (
+                "  %6d %8.3f %5d %7s %7s %7s %7s | %6s %6s %6s" % (
                     row["index"], row["t"], row["seen"], fmt(row["top_pt"]), fmt(row["bot_pt"]),
-                    fmt(row["centre_pt"]), fmt(row["green_pt"]), fmt(dc), fmt(dg),
+                    fmt(row["centre_pt"]), fmt(row["green_pt"]), fmt(dc), fmt(dg), fmt(de),
                 )
             )
         if args.copy_frames:

@@ -94,6 +94,58 @@ def main():
         kind = "dragged / swiped away (by design)" if by_design(e) else "OFF CENTRE"
         print(f"  {e['t0']:9.3f}-{e['t1']:9.3f}s F{e['first']}-F{e['last']} max {e['max']:+7.2f}pt "
               f"{','.join(sorted(e['what']))} sb={'/'.join(sorted(e['sb']))} safe={e['safe']}  {kind}  after: {e['event']}")
+    # The open and close fades: drawn opacity and scale (presentation values of the pager host) must
+    # move one way only, from the frame the viewer appears (or starts closing) until it is done.
+    width = None
+    phases = []
+    current = None
+    for line in open(args.log, encoding="utf-8", errors="replace"):
+        parts = line.rstrip(chr(10)).split(" ", 3)
+        if len(parts) < 4:
+            continue
+        stamp = float(parts[0]) - start
+        if parts[2] == "EVENT":
+            text = parts[3]
+            if text == "viewer appeared":
+                current = {"kind": "open", "t": stamp, "values": []}
+                phases.append(current)
+            elif text == "exit fade=true":
+                current = {"kind": "close", "t": stamp, "values": []}
+                phases.append(current)
+            elif text in ("viewer disappeared", "exit fade=false") or text.startswith("chrome") or text.startswith("selection"):
+                current = None
+            continue
+        if current is None or "edgeHost@" not in line:
+            continue
+        if current["kind"] == "open" and stamp - current["t"] > 1.0:
+            current = None
+            continue
+        win = re.search(r"win=" + RECT, line)
+        if win:
+            width = float(win.group(3))
+        seg = line.split("edgeHost@", 1)[1]
+        m = re.search(r" m=" + RECT, seg)
+        p = re.search(r" p=" + RECT, seg)
+        a = re.search(r" a=([0-9.]+)", seg)
+        if m and p and a and width:
+            current["values"].append((stamp, parts[2], float(m.group(3)) / width, float(p.group(3)) / width, float(a.group(1))))
+    bad = 0
+    print("")
+    print("FADES (pager host as drawn: opacity a, scale s; must only grow while opening, only shrink while closing)")
+    for phase in phases:
+        values = phase["values"]
+        sign = 1 if phase["kind"] == "open" else -1
+        reversals = []
+        for (t0, f0, m0, s0, a0), (t1, f1, m1, s1, a1) in zip(values, values[1:]):
+            if sign * (a1 - a0) < -0.02 or sign * (s1 - s0) < -0.002:
+                reversals.append(f"{f1}: a {a0:.2f}->{a1:.2f} s {s0:.4f}->{s1:.4f}")
+        split = sum(1 for v in values if abs(v[2] - v[3]) > 0.0005)
+        seq = " ".join(f"{v[4]:.2f}/{v[3]:.3f}" for v in values)
+        verdict = "OK" if not reversals else "REVERSES: " + "; ".join(reversals)
+        bad += bool(reversals)
+        print(f"  {phase['kind']:5s} at {phase['t']:9.3f}s  {len(values)} frames ({split} with laid-out != drawn)  {verdict}")
+        print(f"        a/s: {seq}")
+    print(f"FADES OVERALL: {'all one way' if not bad else str(bad) + ' fades reverse'}")
     off_centre = [e for e in episodes if not by_design(e)]
     print(f"OVERALL: {len(off_centre)} episodes off centre outside drags" if off_centre else "OVERALL: always centred outside drags")
     return 0
