@@ -20,6 +20,7 @@ enum Thumbnails {
     /// grid cells, 512 for big cells, anything larger (the viewer) in steps of 256.
     static func bucket(side: CGFloat, scale: CGFloat) -> Int {
         let pixels = side * scale
+        guard pixels.isFinite else { return 512 }
         if pixels <= 256 { return 256 }
         if pixels <= 512 { return 512 }
         return Int((pixels / 256).rounded(.up)) * 256
