@@ -4,10 +4,17 @@ struct SettingsView: View {
     @EnvironmentObject private var store: FileStore
     @EnvironmentObject private var lock: LockManager
 
+    /// Seconds a double tap on the left or right of a video skips.
+    @AppStorage("mediaDoubleTapStep") private var doubleTapStep = 10
+    @AppStorage("mediaResumePosition") private var resumePosition = true
+    /// "track": previous / next file; "skip": back / forward 15 seconds.
+    @AppStorage("mediaLockScreenButtons") private var lockScreenButtons = "track"
+
     @State private var newCode = ""
     @State private var confirmCode = ""
     @State private var codeMessage: String?
     @State private var usedBytes: Int64?
+    @State private var trashBytes: Int64?
 
     private var version: String {
         let info = Bundle.main.infoDictionary
@@ -46,14 +53,34 @@ struct SettingsView: View {
                 Text("App 切到后台会自动锁定。这里的文件不会出现在「文件」App 里，也不会进入 iCloud 或电脑备份，删除 App 就会全部丢失。")
             }
 
-            Section("存储") {
-                LabeledContent("已用空间") {
-                    if let usedBytes {
-                        Text(ByteCountFormatter.string(fromByteCount: usedBytes, countStyle: .file))
-                    } else {
-                        ProgressView()
+            Section {
+                Picker("双击快进/快退", selection: $doubleTapStep) {
+                    ForEach([5, 10, 15, 30], id: \.self) { seconds in
+                        Text("\(seconds) 秒").tag(seconds)
                     }
                 }
+                Toggle("记住播放位置", isOn: $resumePosition)
+                Picker("锁屏按钮", selection: $lockScreenButtons) {
+                    Text("上一个/下一个").tag("track")
+                    Text("快退/快进 15 秒").tag("skip")
+                }
+            } header: {
+                Text("播放")
+            } footer: {
+                Text("较长的视频和音频会从上次停下的地方继续播放。")
+            }
+            .onChange(of: lockScreenButtons) {
+                MediaPlaybackController.shared.lockScreenButtonsChanged()
+            }
+
+            Section("存储") {
+                LabeledContent("已用空间") {
+                    sizeText(usedBytes)
+                }
+                LabeledContent("回收站占用") {
+                    sizeText(trashBytes)
+                }
+                NavigationLink("回收站", value: Route.trash)
             }
 
             Section("关于") {
@@ -79,7 +106,28 @@ struct SettingsView: View {
         .navigationTitle("设置")
         .task {
             usedBytes = await Task.detached { Vault.totalSize() }.value
+            trashBytes = await Task.detached { SettingsView.trashSize() }.value
         }
+    }
+
+    @ViewBuilder
+    private func sizeText(_ bytes: Int64?) -> some View {
+        if let bytes {
+            Text(ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file))
+        } else {
+            ProgressView()
+        }
+    }
+
+    /// Everything waiting in the trash (its 7 days are not up yet).
+    nonisolated private static func trashSize() -> Int64 {
+        guard let enumerator = FileManager.default.enumerator(at: Vault.trashRoot, includingPropertiesForKeys: [.fileSizeKey])
+        else { return 0 }
+        var total: Int64 = 0
+        for case let url as URL in enumerator {
+            total += Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        return total
     }
 
     private func changeCode() {
