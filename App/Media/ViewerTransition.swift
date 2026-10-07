@@ -147,6 +147,13 @@ final class ViewerPresentationProbeView: UIView {
 }
 
 /// Fades and scales the pages as the viewer opens or closes, without rebuilding them.
+///
+/// It must be given the whole screen: the safe area is ignored around it, not by the pages inside.
+/// While a view is scaled below full size, SwiftUI does not extend it into the safe area, so pages
+/// that ignored the safe area themselves were laid out inside it while the viewer grew in (14 pt
+/// lower and smaller on a Dynamic Island iPhone), and moved up and grew to the whole screen at the
+/// first layout after the animation ended; closing with the button moved them back down. Laid out
+/// edge to edge outside the scale, they are only drawn smaller and never move.
 struct ViewerPagerFrame<Content: View>: View {
     @ObservedObject var transition: ViewerTransition
     @ViewBuilder let content: Content
@@ -158,11 +165,10 @@ struct ViewerPagerFrame<Content: View>: View {
     }
 }
 
-/// Shows the pager edge to edge with no safe area at all, SwiftUI's or UIKit's. A page-style
-/// TabView doesn't reliably honour `ignoresSafeArea`: its pages were first laid out inside the safe
-/// area and jumped up once it changed under them (the status bar hiding as the viewer opens). With
-/// none, a page is in its final place from its first frame, and opening, paging, the bars showing
-/// or hiding and turning the phone never shift it.
+/// Hosts the pager without a SwiftUI safe area, so nothing in a page can depend on it: the bars and
+/// the status bar showing or hiding (which changes the safe area on iPhones without a notch) or the
+/// phone turning never move a page. It fills whatever frame it is given; the viewer gives it the
+/// whole screen (see ViewerPagerFrame).
 struct ViewerEdgeToEdge<Content: View>: UIViewControllerRepresentable {
     let content: Content
 
@@ -199,20 +205,5 @@ final class ViewerEdgeToEdgeController<Content: View>: UIHostingController<Conte
         #if DEBUG
         ViewerProbe.shared.register(view, as: "edgeHost")
         #endif
-    }
-
-    /// Cancels the safe area the viewer around passes down, so the UIKit views inside (the
-    /// pager's scroll view and its pages) get none either.
-    override func viewSafeAreaInsetsDidChange() {
-        super.viewSafeAreaInsetsDidChange()
-        let added = additionalSafeAreaInsets
-        let insets = view.safeAreaInsets
-        let cancelling = UIEdgeInsets(
-            top: added.top - insets.top,
-            left: added.left - insets.left,
-            bottom: added.bottom - insets.bottom,
-            right: added.right - insets.right
-        )
-        if cancelling != added { additionalSafeAreaInsets = cancelling }
     }
 }

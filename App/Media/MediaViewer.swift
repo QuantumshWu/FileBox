@@ -63,10 +63,11 @@ struct MediaViewer: View {
         ZStack {
             ViewerBackdrop(transition: transition)
             ViewerPagerFrame(transition: transition) {
-                // Edge to edge, whatever the bars and the notch take; only the bars keep clear.
                 ViewerEdgeToEdge(content: pager)
-                    .ignoresSafeArea()
             }
+            // Edge to edge, whatever the bars and the notch take; only the bars keep clear. Outside
+            // the opening and closing scale, never inside it (see ViewerPagerFrame).
+            .ignoresSafeArea()
             ViewerChrome(
                 items: items,
                 selection: selection,
