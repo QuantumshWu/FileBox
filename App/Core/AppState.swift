@@ -23,10 +23,19 @@ final class TabCoordinator: ObservableObject {
 }
 
 struct ViewerRequest: Identifiable {
-    let id = UUID()
+    let id: UUID
     /// The media files (images, videos, audio) of one folder, in display order.
     let items: [FileItem]
     let startIndex: Int
+    /// False when the viewer should appear already settled (returning from Picture in Picture).
+    let animated: Bool
+
+    init(id: UUID = UUID(), items: [FileItem], startIndex: Int, animated: Bool = true) {
+        self.id = id
+        self.items = items
+        self.startIndex = startIndex
+        self.animated = animated
+    }
 }
 
 /// Opens the full-screen media viewer. It is presented by RootView above everything else, so a
@@ -35,13 +44,39 @@ struct ViewerRequest: Identifiable {
 final class ViewerCoordinator: ObservableObject {
     @Published var request: ViewerRequest?
 
-    func open(_ items: [FileItem], at index: Int) {
+    /// Presents the viewer without the system's slide-up; the viewer animates itself in.
+    func open(_ items: [FileItem], at index: Int, animated: Bool = true) {
         guard items.indices.contains(index) else { return }
-        request = ViewerRequest(items: items, startIndex: index)
+        withoutAnimation {
+            request = ViewerRequest(items: items, startIndex: index, animated: animated)
+        }
     }
 
+    /// Closes with the system's dismissal (the app going to the background, the hub).
     func close() {
         request = nil
+    }
+
+    /// Closes at once: the viewer has already animated its content away.
+    func closeImmediately() {
+        withoutAnimation { request = nil }
+    }
+
+    /// Takes a deleted file out of the open viewer, which stays on screen with the others.
+    func remove(_ url: URL) {
+        guard let current = request else { return }
+        let items = current.items.filter { $0.url != url }
+        guard items.count != current.items.count, !items.isEmpty else { return }
+        let start = min(max(0, current.startIndex), items.count - 1)
+        withoutAnimation {
+            request = ViewerRequest(id: current.id, items: items, startIndex: start, animated: false)
+        }
+    }
+
+    private func withoutAnimation(_ change: () -> Void) {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction, change)
     }
 }
 
