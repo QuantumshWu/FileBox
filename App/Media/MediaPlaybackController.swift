@@ -387,7 +387,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         if !isScrubbing {
             // First, so the pause below is known to be the scrubber's.
             isScrubbing = true
-            wasPlayingBeforeScrub = player.timeControlStatus != .paused
+            wasPlayingBeforeScrub = player.timeControlStatus != .paused || (awaitsResume && resumeAutoplay)
         }
         scrubFingerDown = true
         endBoost()
@@ -576,6 +576,8 @@ final class MediaPlaybackController: NSObject, ObservableObject {
             pauseForUs()
         }
         let item = AVPlayerItem(asset: PlayerAssetCache.asset(for: file))
+        // Natural voices at other speeds.
+        item.audioTimePitchAlgorithm = .timeDomain
         observe(item)
         pictureInPictureNeedsRefresh = true
         currentURL = file.url
