@@ -25,6 +25,9 @@ struct FolderView: View {
     @AppStorage("folderGridColumns") private var gridColumns = 4
     /// Magnification at the last column change of the current pinch.
     @State private var pinchBase: CGFloat = 1
+    /// The file at the top of the grid, kept up to date by the scroll view. Only handed on as a
+    /// binding, never read while rendering, so scrolling does not re-render the folder.
+    @State private var gridAnchor: URL?
 
     @State private var items: [FileItem] = []
     /// Derived from `items` whenever they load, so rendering never works them out again.
@@ -90,8 +93,6 @@ struct FolderView: View {
         var sort: SortOrder?
         /// The file the viewer shows (or showed last).
         var lastViewed: URL?
-        /// The file at the top of the grid; written by the scroll view while scrolling.
-        var gridAnchor: URL?
     }
 
     private struct ImportStatus {
@@ -157,7 +158,7 @@ struct FolderView: View {
         switch layout {
         case .grid:
             ScrollView { grid }
-                .scrollPosition(id: gridAnchor, anchor: .top)
+                .scrollPosition(id: $gridAnchor, anchor: .top)
                 .scrollDismissesKeyboard(.immediately)
                 .simultaneousGesture(pinch(proxy))
         case .list:
@@ -257,12 +258,6 @@ struct FolderView: View {
         .scrollTargetLayout()
     }
 
-    /// Written by the scroll view as it scrolls, without re-rendering the folder each time.
-    private var gridAnchor: Binding<URL?> {
-        let box = tracking
-        return Binding(get: { box.gridAnchor }, set: { box.gridAnchor = $0 })
-    }
-
     private var listRows: some View {
         ForEach(visibleItems) { item in
             deleteDialog(row(item), for: [item], isPresented: rowDeleteBinding(item))
@@ -328,10 +323,18 @@ struct FolderView: View {
                     return
                 }
                 pinchBase = value.magnification
-                let anchor = tracking.gridAnchor
+                let anchor = gridAnchor
                 withAnimation(.snappy) {
                     gridColumns = columns
-                    if let anchor { proxy.scrollTo(anchor, anchor: .top) }
+                }
+                guard let anchor else { return }
+                // Once the new columns are laid out, the same file goes back to the top.
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        withAnimation(.snappy) {
+                            proxy.scrollTo(anchor, anchor: .top)
+                        }
+                    }
                 }
             }
             .onEnded { _ in
@@ -579,6 +582,10 @@ struct FolderView: View {
     private func saveToPhotos(_ targets: [FileItem]) {
         let media = targets.filter { Self.savesToPhotos($0) }
         guard !media.isEmpty else { return }
+        // Videos and bigger batches take a moment; the result replaces this.
+        if media.count > 3 || media.contains(where: { $0.kind == .video }) {
+            store.show("正在存到「照片」…")
+        }
         Task {
             let message = await FolderUIPhotoSaver.save(media)
             store.show(message)
