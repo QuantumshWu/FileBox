@@ -1,6 +1,5 @@
 import AVFoundation
 import Combine
-import ImageIO
 import SwiftUI
 import UIKit
 
@@ -30,12 +29,19 @@ final class MediaViewerHub: ObservableObject {
     /// Files of the viewer on screen, nil while it is closed.
     private(set) var presentedURLs: [URL]?
     private var presentedToken: UUID?
+    /// The `ViewerRequest` the viewer on screen shows. A request with the same id is the same
+    /// viewer with a file taken out; any other request (or none) means it closed.
+    private var presentedRequestID: UUID?
 
     private var videoKeepsAlive = false
     private var videoPiPActive = false
     private var imageKeepsAlive = false
     private var imagePiPActive = false
     private var audioHolders: Set<AudioUse> = []
+    /// Whether this app last switched the audio session on (an interruption switches it off).
+    private var sessionActive = false
+    /// Bumped by every activation, so a deferred switch-off that is no longer wanted does nothing.
+    private var deactivationGeneration = 0
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var backgroundCheckID = UUID()
     private var appObservers: Set<AnyCancellable> = []
@@ -47,8 +53,15 @@ final class MediaViewerHub: ObservableObject {
     private init() {
         let center = NotificationCenter.default
         center.publisher(for: UIApplication.didEnterBackgroundNotification)
-            // After the video's own sound-only fallback (3 s) has decided.
-            .sink { [weak self] _ in self?.checkInBackground(after: 3.5) }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                // The locked screen (and the decoy) is never left turned sideways.
+                ViewerOrientation.restorePortrait()
+                // A suspended app would never run a deferred switch-off.
+                if self.audioHolders.isEmpty && self.sessionActive { self.deactivateAudioSession() }
+                // After the video's own sound-only fallback (3 s) has decided.
+                self.checkInBackground(after: 3.5)
+            }
             .store(in: &appObservers)
         center.publisher(for: UIApplication.willEnterForegroundNotification)
             .sink { [weak self] _ in
@@ -56,12 +69,27 @@ final class MediaViewerHub: ObservableObject {
                 self?.endBackgroundTime()
             }
             .store(in: &appObservers)
+        center.publisher(for: AVAudioSession.interruptionNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                      AVAudioSession.InterruptionType(rawValue: raw) == .began
+                else { return }
+                // The system switched the session off; the next activation switches it on again.
+                self?.sessionActive = false
+            }
+            .store(in: &appObservers)
+        center.publisher(for: AVAudioSession.mediaServicesWereResetNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.sessionActive = false }
+            .store(in: &appObservers)
     }
 
     // MARK: - Viewer
 
-    func viewerAppeared(token: UUID, items: [FileItem], coordinator: ViewerCoordinator) {
+    func viewerAppeared(token: UUID, requestID: UUID?, items: [FileItem], coordinator: ViewerCoordinator) {
         presentedToken = token
+        presentedRequestID = requestID
         presentedURLs = items.map(\.url)
         if self.coordinator !== coordinator {
             self.coordinator = coordinator
@@ -77,32 +105,40 @@ final class MediaViewerHub: ObservableObject {
     /// viewer (an editor, Quick Look) also makes it disappear, and that must not end playback.
     func viewerDisappeared(token: UUID) {
         guard presentedToken == token else { return }
-        if let request = coordinator?.request, request.items.map(\.url) == presentedURLs { return }
+        if let request = coordinator?.request, request.id == presentedRequestID { return }
         closePresentedViewer()
     }
 
     private func requestChanged(_ request: ViewerRequest?) {
-        guard presentedToken != nil, request?.items.map(\.url) != presentedURLs else { return }
+        guard presentedToken != nil else { return }
+        if let request, request.id == presentedRequestID {
+            // The same viewer with a deleted file taken out.
+            presentedURLs = request.items.map(\.url)
+            publish()
+            return
+        }
         closePresentedViewer()
     }
 
     private func closePresentedViewer() {
         presentedToken = nil
+        presentedRequestID = nil
         presentedURLs = nil
         publish()
+        ViewerOrientation.restorePortrait()
         MediaPlaybackController.shared.viewerClosed()
         MediaImagePiPController.shared.viewerClosed()
     }
 
     /// Moves the viewer to `items[index]`. If another folder (or nothing) is on screen, `reopen`
-    /// presents the viewer again.
+    /// presents the viewer again, already settled, so Picture in Picture can animate into it.
     func reveal(_ items: [FileItem], at index: Int, reopen: Bool) {
         guard items.indices.contains(index) else { return }
         let urls = items.map(\.url)
         if presentedURLs == urls {
             pageRequest = PageRequest(urls: urls, index: index)
         } else if reopen {
-            coordinator?.open(items, at: index)
+            coordinator?.open(items, at: index, animated: false)
         }
     }
 
@@ -205,21 +241,17 @@ final class MediaViewerHub: ObservableObject {
 
     // MARK: - Audio session
 
-    /// Video takes over the audio; an image in PiP plays along with other apps' music.
+    /// Video takes over the audio; an image in PiP plays along with other apps' music. Every call
+    /// stays on the main thread, and the session is only touched when something must change.
     @discardableResult
     func activateAudioSession(for use: AudioUse) -> Bool {
-        let session = AVAudioSession.sharedInstance()
-        let alreadyActive = !audioHolders.isEmpty
-        let needsVideoCategory = use == .video && !audioHolders.contains(.video)
+        deactivationGeneration += 1
         audioHolders.insert(use)
         do {
-            if needsVideoCategory {
-                try session.setCategory(.playback, mode: .moviePlayback, options: [])
-            } else if !alreadyActive {
-                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            }
-            if needsVideoCategory || !alreadyActive {
-                try session.setActive(true)
+            let changed = try applyCategory(video: audioHolders.contains(.video))
+            if !sessionActive || changed {
+                try AVAudioSession.sharedInstance().setActive(true)
+                sessionActive = true
             }
             return true
         } catch {
@@ -231,11 +263,31 @@ final class MediaViewerHub: ObservableObject {
     /// one (not mixing with other apps) and active, or iOS will not start PiP by itself.
     func ensureVideoAudioSession() {
         guard audioHolders.contains(.video) else { return }
-        let session = AVAudioSession.sharedInstance()
-        if session.category != .playback || session.mode != .moviePlayback || session.categoryOptions.contains(.mixWithOthers) {
-            try? session.setCategory(.playback, mode: .moviePlayback, options: [])
+        deactivationGeneration += 1
+        _ = try? applyCategory(video: true)
+        // Always re-asserted here: it runs once per leaving the app, and PiP depends on it.
+        if (try? AVAudioSession.sharedInstance().setActive(true)) != nil {
+            sessionActive = true
         }
-        try? session.setActive(true)
+    }
+
+    /// Sets the video (non-mixing) or the image (mixing) category unless it is already set.
+    /// Returns whether it changed.
+    @discardableResult
+    private func applyCategory(video: Bool) throws -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        let mode: AVAudioSession.Mode = video ? .moviePlayback : .default
+        let mixes = session.categoryOptions.contains(.mixWithOthers)
+        guard session.category != .playback || session.mode != mode || mixes == video else { return false }
+        try session.setCategory(.playback, mode: mode, options: video ? [] : [.mixWithOthers])
+        return true
+    }
+
+    /// Switches the session off and lets other apps' music resume.
+    private func deactivateAudioSession() {
+        deactivationGeneration += 1
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        sessionActive = false
     }
 
     /// For the PiP log, e.g. "Playback/MoviePlayback".
@@ -246,94 +298,28 @@ final class MediaViewerHub: ObservableObject {
         return category + "/" + mode + (session.categoryOptions.contains(.mixWithOthers) ? "+混音" : "")
     }
 
+    /// With no holder left the session goes off a second later, so moving between an image and a
+    /// video, or closing and reopening the viewer, doesn't switch it off and on again. In the
+    /// background it goes off at once: a suspended app would never get to it.
     func releaseAudioSession(for use: AudioUse) {
         guard audioHolders.remove(use) != nil else { return }
-        let session = AVAudioSession.sharedInstance()
         if audioHolders.isEmpty {
-            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            guard UIApplication.shared.applicationState == .active, !videoPiPActive, !imagePiPActive else {
+                deactivateAudioSession()
+                return
+            }
+            deactivationGeneration += 1
+            let generation = deactivationGeneration
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self, self.deactivationGeneration == generation, self.audioHolders.isEmpty,
+                      self.sessionActive, !self.videoPiPActive, !self.imagePiPActive
+                else { return }
+                self.deactivateAudioSession()
+            }
         } else if use == .video {
             // Only the image is left; it plays along with other apps' music again.
-            try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-        }
-    }
-}
-
-/// Decodes images at a bounded size, off the main thread, so huge photos don't exhaust memory.
-enum MediaImageLoader {
-    /// The last few decoded pages, so swiping back does not decode again.
-    private static let cache: NSCache<NSString, UIImage> = {
-        let cache = NSCache<NSString, UIImage>()
-        cache.totalCostLimit = 150 * 1024 * 1024
-        return cache
-    }()
-
-    private static let gate = MediaDecodeGate()
-
-    static func load(_ url: URL, maxPixel: CGFloat) async -> UIImage? {
-        let key = "\(Int(maxPixel))|\(url.path)" as NSString
-        if let hit = cache.object(forKey: key) { return hit }
-        let image: UIImage? = await limited {
-            MediaImageLoader.decode(url, maxPixel: maxPixel).map { UIImage(cgImage: $0) }
-        }
-        if let image, let cgImage = image.cgImage {
-            cache.setObject(image, forKey: key, cost: cgImage.bytesPerRow * cgImage.height)
-        }
-        return image
-    }
-
-    /// Runs `work` off the main thread, at most two at a time: decoding a big HEIC can take a few
-    /// hundred MB, and flicking through a folder must not start one per page. Returns nil without
-    /// running `work` if the calling task was cancelled while it waited (its page went away).
-    static func limited<T: Sendable>(_ work: @escaping @Sendable () -> T?) async -> T? {
-        await gate.enter()
-        let result: T?
-        if Task.isCancelled {
-            result = nil
-        } else {
-            result = await Task.detached(priority: .userInitiated) { work() }.value
-        }
-        await gate.leave()
-        return result
-    }
-
-    /// The image (orientation applied) with its longer side at most `maxPixel` pixels.
-    static func decode(_ url: URL, maxPixel: CGFloat) -> CGImage? {
-        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions),
-              CGImageSourceGetCount(source) > 0
-        else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: Int(maxPixel),
-        ]
-        return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-    }
-}
-
-/// A two-slot queue (first come, first served) for `MediaImageLoader.limited`.
-private actor MediaDecodeGate {
-    private let slots = 2
-    private var running = 0
-    private var waiting: [CheckedContinuation<Void, Never>] = []
-
-    func enter() async {
-        if running < slots {
-            running += 1
-            return
-        }
-        await withCheckedContinuation { continuation in
-            waiting.append(continuation)
-        }
-    }
-
-    /// Hands the slot straight to the next waiter, if any.
-    func leave() {
-        if waiting.isEmpty {
-            running -= 1
-        } else {
-            waiting.removeFirst().resume()
+            _ = try? applyCategory(video: false)
         }
     }
 }

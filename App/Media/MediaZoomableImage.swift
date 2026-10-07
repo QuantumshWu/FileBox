@@ -1,15 +1,17 @@
+import ImageIO
 import SwiftUI
 import UIKit
 
 /// An image that fits the page and can be pinched or double-tapped to zoom and panned while zoomed.
 /// At the zoomed image's edge a swipe carries on to the next page of the viewer. At the fitted size
-/// a swipe up or down drags the image to close the viewer.
+/// a swipe up or down drags the image to close the viewer. Zoomed in past the decoded size, a
+/// sharper version is read from `sourceURL`.
 struct MediaZoomableImage: UIViewRepresentable {
     let image: UIImage
+    /// The file, for reading more detail when zoomed in.
+    let sourceURL: URL?
     let onSingleTap: () -> Void
-    /// The finger's offset during a swipe to close; `nil` when it lets go without closing.
-    let onDismissDrag: (CGSize?) -> Void
-    let onDismiss: () -> Void
+    let onDismissEvent: (ViewerDismissEvent) -> Void
 
     func makeUIView(context: Context) -> MediaZoomScrollView {
         let view = MediaZoomScrollView()
@@ -25,29 +27,37 @@ struct MediaZoomableImage: UIViewRepresentable {
 
     private func configure(_ view: MediaZoomScrollView) {
         view.onSingleTap = onSingleTap
-        view.onDismissDrag = onDismissDrag
-        view.onDismiss = onDismiss
+        view.dismiss.onEvent = onDismissEvent
+        view.sourceURL = sourceURL
     }
 }
 
 final class MediaZoomScrollView: UIScrollView, UIScrollViewDelegate {
     var onSingleTap: (() -> Void)?
-    var onDismissDrag: ((CGSize?) -> Void)?
-    var onDismiss: (() -> Void)?
+    let dismiss = ViewerDismissPan()
+    /// The picture handed in (a thumbnail placeholder or the decoded image).
     private(set) var image: UIImage?
+    var sourceURL: URL? {
+        didSet { if sourceURL != oldValue { sourceChanged() } }
+    }
 
     private let imageView = UIImageView()
     private var laidOutSize: CGSize = .zero
-    private let dismissPan = UIPanGestureRecognizer()
-    private let dismissPanDelegate = MediaDismissPanDelegate()
+    /// The image's size on screen at the fitted zoom.
+    private var fittedSize: CGSize = .zero
+    /// The file's own pixel size (orientation applied), read in the background.
+    private var nativePixelSize: CGSize?
+    /// A sharper decode shown while zoomed in; never more than one at a time.
+    private var detailImage: UIImage?
+    private var detailTask: Task<Void, Never>?
+    private var detailPixels: CGFloat = 0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         delegate = self
-        backgroundColor = .black
+        backgroundColor = .clear
         showsHorizontalScrollIndicator = false
         showsVerticalScrollIndicator = false
-        decelerationRate = .fast
         contentInsetAdjustmentBehavior = .never
         bouncesZoom = true
         imageView.contentMode = .scaleAspectFit
@@ -60,19 +70,32 @@ final class MediaZoomScrollView: UIScrollView, UIScrollViewDelegate {
         singleTap.require(toFail: doubleTap)
         addGestureRecognizer(singleTap)
 
-        dismissPan.addTarget(self, action: #selector(handleDismissPan(_:)))
-        dismissPan.maximumNumberOfTouches = 1
-        dismissPanDelegate.scrollView = self
-        dismissPan.delegate = dismissPanDelegate
-        addGestureRecognizer(dismissPan)
+        dismiss.zoomView = self
+        dismiss.install(on: self)
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(memoryWarning),
+            name: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil
+        )
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
+    /// Shows `newImage`. A sharper version of the same picture (the thumbnail placeholder giving
+    /// way to the decoded image) keeps the zoom and position; anything else starts fitted.
     func display(_ newImage: UIImage) {
+        let previous = image
         image = newImage
+        if let previous, laidOutSize != .zero, Self.sameAspect(previous.size, newImage.size) {
+            if detailImage == nil { imageView.image = newImage }
+            updateMaximumZoom()
+            return
+        }
+        dropDetail()
         imageView.image = newImage
         laidOutSize = .zero
         setNeedsLayout()
@@ -88,18 +111,36 @@ final class MediaZoomScrollView: UIScrollView, UIScrollViewDelegate {
         centerImage()
     }
 
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil { dropDetail() }
+    }
+
     private func fitImage() {
         guard let image, image.size.width > 0, image.size.height > 0, bounds.width > 0, bounds.height > 0 else { return }
+        dropDetail()
         minimumZoomScale = 1
         zoomScale = 1
         let fit = min(bounds.width / image.size.width, bounds.height / image.size.height)
-        let fitted = CGSize(width: image.size.width * fit, height: image.size.height * fit)
-        imageView.frame = CGRect(origin: .zero, size: fitted)
-        contentSize = fitted
-        // Enough to see the pixels of a big photo, and at least 4× for small ones.
-        let pixelZoom = (image.size.width * image.scale) / max(1, fitted.width * max(1, traitCollection.displayScale))
-        maximumZoomScale = min(12, max(4, pixelZoom * 2))
+        fittedSize = CGSize(width: image.size.width * fit, height: image.size.height * fit)
+        imageView.frame = CGRect(origin: .zero, size: fittedSize)
+        contentSize = fittedSize
+        updateMaximumZoom()
         contentOffset = .zero
+    }
+
+    /// Enough to see the file's pixels (at least 4×), and enough for a double tap to fill the screen.
+    private func updateMaximumZoom() {
+        guard let image, fittedSize.width > 0, fittedSize.height > 0 else { return }
+        let pixelWidth = nativePixelSize?.width ?? image.size.width * image.scale
+        let pixelZoom = pixelWidth / max(1, fittedSize.width * max(1, traitCollection.displayScale))
+        maximumZoomScale = max(min(12, max(4, pixelZoom * 2)), fillScale * 1.5)
+    }
+
+    /// The zoom at which the picture covers the whole page.
+    private var fillScale: CGFloat {
+        guard fittedSize.width > 0, fittedSize.height > 0 else { return 1 }
+        return max(bounds.width / fittedSize.width, bounds.height / fittedSize.height)
     }
 
     private func centerImage() {
@@ -112,34 +153,20 @@ final class MediaZoomScrollView: UIScrollView, UIScrollViewDelegate {
         onSingleTap?()
     }
 
+    /// Fills the screen around the tapped point (at least 2×); a second double tap fits again.
     @objc private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
         if zoomScale > minimumZoomScale + 0.01 {
             setZoomScale(minimumZoomScale, animated: true)
             return
         }
-        let scale = min(maximumZoomScale, 2.5)
+        let scale = min(maximumZoomScale, max(2.0, fillScale))
         let point = gesture.location(in: imageView)
         let size = CGSize(width: bounds.width / scale, height: bounds.height / scale)
         let rect = CGRect(x: point.x - size.width / 2, y: point.y - size.height / 2, width: size.width, height: size.height)
         zoom(to: rect, animated: true)
-    }
-
-    /// Far or fast enough closes the viewer; otherwise the image goes back.
-    @objc private func handleDismissPan(_ pan: UIPanGestureRecognizer) {
-        let translation = pan.translation(in: nil)
-        switch pan.state {
-        case .began, .changed:
-            onDismissDrag?(CGSize(width: translation.x, height: translation.y))
-        case .ended:
-            let velocity = pan.velocity(in: nil).y
-            let flung = abs(velocity) > 800 && (velocity > 0) == (translation.y > 0)
-            if abs(translation.y) > 100 || flung {
-                onDismiss?()
-            } else {
-                onDismissDrag?(nil)
-            }
-        default:
-            onDismissDrag?(nil)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            self?.updateDetail()
         }
     }
 
@@ -149,26 +176,90 @@ final class MediaZoomScrollView: UIScrollView, UIScrollViewDelegate {
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
         centerImage()
-    }
-}
-
-/// Starts the swipe to close only for a mostly vertical drag of an image at its fitted size, and
-/// makes the scroll views' own pans (paging, panning a zoomed image) wait until it gives up.
-final class MediaDismissPanDelegate: NSObject, UIGestureRecognizerDelegate {
-    weak var scrollView: UIScrollView?
-
-    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        guard let scrollView, let pan = gestureRecognizer as? UIPanGestureRecognizer,
-              scrollView.zoomScale <= scrollView.minimumZoomScale + 0.01
-        else { return false }
-        let velocity = pan.velocity(in: scrollView)
-        return abs(velocity.y) > abs(velocity.x) * 1.5
+        if zoomScale <= minimumZoomScale + 0.01 { dropDetail() }
     }
 
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
-    ) -> Bool {
-        otherGestureRecognizer is UIPanGestureRecognizer && otherGestureRecognizer.view is UIScrollView
+    func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+        updateDetail()
+    }
+
+    // MARK: - Detail when zoomed in
+
+    private static func sameAspect(_ a: CGSize, _ b: CGSize) -> Bool {
+        guard a.width > 0, a.height > 0, b.width > 0, b.height > 0 else { return false }
+        return abs((a.width / a.height) / (b.width / b.height) - 1) < 0.01
+    }
+
+    private func sourceChanged() {
+        nativePixelSize = nil
+        dropDetail()
+        guard let url = sourceURL else { return }
+        Task { [weak self] in
+            let size = await Task.detached(priority: .utility) { MediaZoomScrollView.pixelSize(of: url) }.value
+            guard let self, self.sourceURL == url else { return }
+            self.nativePixelSize = size
+            self.updateMaximumZoom()
+        }
+    }
+
+    /// The picture on screen has fewer pixels than the zoom shows: decode the file again, bigger.
+    private func updateDetail() {
+        guard let image, let url = sourceURL, window != nil, fittedSize.width > 0 else { return }
+        guard zoomScale > minimumZoomScale + 0.01 else {
+            dropDetail()
+            return
+        }
+        let shown = detailImage ?? image
+        let shownWidth = shown.size.width * shown.scale
+        let neededWidth = zoomScale * fittedSize.width * max(1, traitCollection.displayScale)
+        guard neededWidth > shownWidth * 1.15, let native = nativePixelSize, native.width > shownWidth + 1 else { return }
+        let nativeLong = max(native.width, native.height)
+        let neededLong = neededWidth * nativeLong / native.width
+        let target = min(nativeLong, neededLong * 1.3, 6000)
+        let shownLong = max(shown.size.width, shown.size.height) * shown.scale
+        guard target > shownLong * 1.05, target > detailPixels else { return }
+        detailTask?.cancel()
+        detailPixels = target
+        detailTask = Task { [weak self] in
+            let decoded: UIImage? = await Task.detached(priority: .userInitiated) {
+                MediaImageLoader.decode(url, maxPixel: .init(target)).map { UIImage(cgImage: $0) }
+            }.value
+            guard let self, !Task.isCancelled, let sharper = decoded, self.sourceURL == url,
+                  self.zoomScale > self.minimumZoomScale + 0.01,
+                  MediaZoomScrollView.sameAspect(sharper.size, self.fittedSize)
+            else { return }
+            self.detailImage = sharper
+            self.imageView.image = sharper
+            self.detailTask = nil
+        }
+    }
+
+    /// Back to the decoded image (zoomed out, off screen, or low on memory).
+    private func dropDetail() {
+        detailTask?.cancel()
+        detailTask = nil
+        detailPixels = 0
+        guard detailImage != nil else { return }
+        detailImage = nil
+        imageView.image = image
+    }
+
+    @objc private func memoryWarning() {
+        dropDetail()
+    }
+
+    /// Width and height in pixels as shown (EXIF orientations 5–8 are turned sideways).
+    nonisolated static func pixelSize(of url: URL) -> CGSize? {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, options),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
+              width > 0, height > 0
+        else { return nil }
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        return (5...8).contains(orientation)
+            ? CGSize(width: height, height: width)
+            : CGSize(width: width, height: height)
     }
 }
