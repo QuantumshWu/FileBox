@@ -96,6 +96,9 @@ struct MediaViewer: View {
         .presentationBackground(Color.clear)
         .onAppear { appeared() }
         .onDisappear {
+            #if DEBUG
+            ViewerProbe.shared.event("viewer disappeared")
+            #endif
             MediaDiagnostics.log("关闭查看页面")
             hub.viewerDisappeared(token: token)
         }
@@ -180,6 +183,9 @@ struct MediaViewer: View {
     }
 
     private func appeared() {
+        #if DEBUG
+        ViewerProbe.shared.event("viewer appeared")
+        #endif
         MediaDiagnostics.log("打开查看页面")
         let request = viewer.request
         hub.viewerAppeared(token: token, requestID: request?.id, items: items, coordinator: viewer)
@@ -193,6 +199,9 @@ struct MediaViewer: View {
     }
 
     private func selectionChanged(from oldIndex: Int, to index: Int) {
+        #if DEBUG
+        ViewerProbe.shared.event("selection \(oldIndex) -> \(index)")
+        #endif
         if Date() < paging.rotationUntil {
             // Turning the phone can make the pager jump; stay on the page that was showing.
             if index != paging.settled {
@@ -299,6 +308,9 @@ struct MediaViewer: View {
 
     private func exitViewer(duration: Double, fadeContent: Bool) {
         guard !transition.isExiting else { return }
+        #if DEBUG
+        ViewerProbe.shared.event("exit fade=\(fadeContent)")
+        #endif
         // First, so the pause below doesn't bring the bars back.
         transition.isExiting = true
         if !playback.isPictureInPictureEngaged { playback.pause() }

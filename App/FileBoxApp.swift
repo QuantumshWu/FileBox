@@ -12,6 +12,12 @@ struct FileBoxApp: App {
     @StateObject private var browser = BrowserSession()
     @Environment(\.scenePhase) private var scenePhase
 
+    #if DEBUG
+    init() {
+        UITestSeed.launchIfRequested()
+    }
+    #endif
+
     var body: some Scene {
         WindowGroup {
             RootView()

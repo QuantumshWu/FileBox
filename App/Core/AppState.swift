@@ -50,6 +50,9 @@ final class ViewerCoordinator: ObservableObject {
     /// Presents the viewer without the system's slide-up; the viewer animates itself in.
     func open(_ items: [FileItem], at index: Int, animated: Bool = true) {
         guard items.indices.contains(index) else { return }
+        #if DEBUG
+        ViewerProbe.shared.event("open \(items[index].name)")
+        #endif
         withoutAnimation {
             request = ViewerRequest(items: items, startIndex: index, animated: animated)
         }

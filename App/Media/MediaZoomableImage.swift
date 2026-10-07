@@ -72,6 +72,9 @@ final class MediaZoomScrollView: UIScrollView, UIScrollViewDelegate {
 
         dismiss.zoomView = self
         dismiss.install(on: self)
+        #if DEBUG
+        ViewerProbe.shared.register(self, as: "zoom")
+        #endif
 
         NotificationCenter.default.addObserver(
             self,
@@ -88,6 +91,9 @@ final class MediaZoomScrollView: UIScrollView, UIScrollViewDelegate {
     /// Shows `newImage`. A sharper version of the same picture (the thumbnail placeholder giving
     /// way to the decoded image) keeps the zoom and position; anything else starts fitted.
     func display(_ newImage: UIImage) {
+        #if DEBUG
+        ViewerProbe.shared.event("zoom display \(newImage.size) scale=\(newImage.scale) prev=\(image.map { "\($0.size)" } ?? "nil")")
+        #endif
         let previous = image
         image = newImage
         if let previous, laidOutSize != .zero, Self.sameAspect(previous.size, newImage.size) {

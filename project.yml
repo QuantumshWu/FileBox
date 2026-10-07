@@ -116,7 +116,29 @@ targets:
       path: Support/FileBoxRecord.entitlements
       properties:
         com.apple.security.application-groups: [group.io.github.quantumshwu.filebox]
+  # Debug-only UI test for the repro workflow (.github/workflows/repro.yml). Not part of the FileBox
+  # scheme, so the release archive never builds it; it is never installed on a phone.
+  FileBoxUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [FileBoxUITests]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.quantumshwu.filebox.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: FileBox
+    dependencies:
+      - target: FileBox
 schemes:
+  FileBoxUITests:
+    build:
+      targets:
+        FileBox: [running, testing]
+        FileBoxUITests: [testing]
+    test:
+      config: Debug
+      targets:
+        - FileBoxUITests
   FileBox:
     build:
       targets:

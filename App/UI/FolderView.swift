@@ -386,6 +386,7 @@ struct FolderView: View {
                 rowLabel(item, isSelected: nil)
             }
             .buttonStyle(FolderRowButtonStyle())
+            .accessibilityIdentifier("row-" + item.name)
             .background(rowBackground(item))
             .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 12))
             .contextMenu { menu(for: item) }
@@ -414,6 +415,7 @@ struct FolderView: View {
                 face
             }
             .buttonStyle(style)
+            .accessibilityIdentifier("cell-" + item.name)
         } else {
             Button {
                 open(item)
@@ -421,6 +423,7 @@ struct FolderView: View {
                 face
             }
             .buttonStyle(style)
+            .accessibilityIdentifier("cell-" + item.name)
         }
     }
 

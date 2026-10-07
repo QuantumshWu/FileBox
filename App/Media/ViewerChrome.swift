@@ -61,6 +61,9 @@ final class ViewerChromeModel: ObservableObject {
 
     private func setVisible(_ value: Bool) {
         guard visible != value else { return }
+        #if DEBUG
+        ViewerProbe.shared.event("chrome visible=\(value)")
+        #endif
         withAnimation(.easeInOut(duration: 0.2)) {
             visible = value
         }
@@ -173,6 +176,7 @@ struct ViewerChrome: View {
         HStack(spacing: 8) {
             Button(action: onClose) { barIcon("xmark") }
                 .accessibilityLabel("关闭")
+                .accessibilityIdentifier("viewer-close")
             titleCapsule
                 .frame(maxWidth: .infinity)
             if let item = currentItem {

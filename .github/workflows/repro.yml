@@ -1,0 +1,87 @@
+# Reproduces viewer layout problems on simulators: builds the Debug app with the UI test target,
+# runs FileBoxUITests/ViewerJumpUITests on a Dynamic Island, a notch and (when the runtime has one)
+# a home-button iPhone while recording the screen, and measures the test pattern in every frame
+# (tools/viewer_jump). Uploads the recordings, the per-frame measurements, a report per test step,
+# the frames around each step and the app's layout probe log. Never touches the release build.
+name: Repro
+
+on:
+  push:
+    branches: ['repro/**']
+  workflow_dispatch:
+
+concurrency:
+  group: repro-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repro:
+    runs-on: macos-26
+    timeout-minutes: 75
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install tools
+        run: |
+          brew install xcodegen ffmpeg
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pillow numpy
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Pick simulators
+        run: |
+          xcrun simctl list runtimes
+          python3 tools/viewer_jump/pick_simulators.py | tee simulators.txt
+          test -s simulators.txt
+
+      - name: Build for testing
+        run: |
+          set -o pipefail
+          FIRST=$(head -1 simulators.txt | cut -f1)
+          xcodebuild build-for-testing \
+            -project FileBox.xcodeproj \
+            -scheme FileBoxUITests \
+            -configuration Debug \
+            -destination "id=$FIRST" \
+            -derivedDataPath DerivedData \
+            2>&1 | tee build.log | xcbeautify --renderer github-actions
+
+      - name: Show compile errors
+        if: failure()
+        run: grep -E "error:|fatal error" build.log | sort -u | head -80 || true
+
+      - name: Run on each simulator
+        run: |
+          STATUS=0
+          while IFS=$'\t' read -r UDID NAME LABEL; do
+            bash tools/viewer_jump/run_device.sh "$UDID" "$LABEL" "repro-out/$LABEL" || STATUS=1
+            echo "$NAME" > "repro-out/$LABEL/device.txt"
+          done < simulators.txt
+          exit $STATUS
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: viewer-repro
+          path: |
+            repro-out/*/recording.mp4
+            repro-out/*/report.txt
+            repro-out/*/measurements.csv
+            repro-out/*/events.txt
+            repro-out/*/record_start.txt
+            repro-out/*/frame_times.txt
+            repro-out/*/stream.txt
+            repro-out/*/viewer-probe.log
+            repro-out/*/test.log
+            repro-out/*/device.txt
+            repro-out/*/frames/**
+            build.log
+          if-no-files-found: warn

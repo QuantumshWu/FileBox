@@ -27,6 +27,13 @@ final class LockManager: ObservableObject {
         isUnlocked = false
     }
 
+    #if DEBUG
+    /// Debug builds only: the UI tests start unlocked (see `UITestSeed`).
+    func unlockForUITests() {
+        isUnlocked = true
+    }
+    #endif
+
     /// Returns false if the new passcode is empty.
     func changePasscode(to newValue: String) -> Bool {
         guard let clean = Self.normalized(newValue) else { return false }

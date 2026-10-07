@@ -124,6 +124,9 @@ final class ViewerPresentationProbeView: UIView {
     override func didMoveToWindow() {
         super.didMoveToWindow()
         guard window != nil else { return }
+        #if DEBUG
+        ViewerProbe.shared.event("presentation probe in window")
+        #endif
         var responder: UIResponder? = self
         while let current = responder {
             if let controller = current as? UIViewController {
@@ -193,6 +196,9 @@ final class ViewerEdgeToEdgeController<Content: View>: UIHostingController<Conte
         super.viewDidLoad()
         // The viewer's backdrop supplies the black; the folder shows through a page dragged away.
         view.backgroundColor = .clear
+        #if DEBUG
+        ViewerProbe.shared.register(view, as: "edgeHost")
+        #endif
     }
 
     /// Cancels the safe area the viewer around passes down, so the UIKit views inside (the

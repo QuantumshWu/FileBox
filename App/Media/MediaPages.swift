@@ -465,6 +465,9 @@ final class MediaPlayerHostController: UIViewController, UIGestureRecognizerDele
             if inWindow { self?.attachPlayer(force: true) }
         }
         view = host
+        #if DEBUG
+        ViewerProbe.shared.register(host, as: "playerHost")
+        #endif
     }
 
     override func viewDidLoad() {

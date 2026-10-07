@@ -892,6 +892,9 @@ final class MediaPlaybackController: NSObject, ObservableObject {
             guard !awaitsResume, item.status == .readyToPlay else { return }
         }
         displayReadyURL = url
+        #if DEBUG
+        ViewerProbe.shared.event("display ready \(url.lastPathComponent) fallback=\(fallback)")
+        #endif
     }
 
     // MARK: - Resume position
@@ -1409,6 +1412,9 @@ final class MediaPlayerSurfaceController: UIViewController {
         surface.backgroundColor = .clear
         surface.playerLayer.videoGravity = .resizeAspect
         view = surface
+        #if DEBUG
+        ViewerProbe.shared.register(surface, as: "surface")
+        #endif
     }
 }
 
