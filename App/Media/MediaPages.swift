@@ -54,7 +54,7 @@ struct MediaImagePage: View {
             }
         }
         .task(id: item.url) {
-            let loaded = await MediaImageLoader.load(item.url, maxPixel: Self.maxPixel)
+            let loaded = await MediaImageLoader.load(item, maxPixel: Self.maxPixel)
             guard !Task.isCancelled else { return }
             image = loaded
             failed = loaded == nil
