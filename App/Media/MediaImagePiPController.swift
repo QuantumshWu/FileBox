@@ -79,6 +79,9 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         center.publisher(for: UIApplication.willResignActiveNotification)
             .sink { [weak self] _ in self?.willResignActive() }
             .store(in: &observers)
+        center.publisher(for: UIApplication.willEnterForegroundNotification)
+            .sink { [weak self] _ in self?.catchUpOnClosedPictureInPicture() }
+            .store(in: &observers)
     }
 
     // MARK: - Viewer
@@ -116,13 +119,23 @@ final class MediaImagePiPController: NSObject, ObservableObject {
         updateArming()
     }
 
-    /// FileBox is back on screen while the image floats: it goes back into the viewer. A window
-    /// closed with its X while the app was away is no longer active here, and its stop closes the
-    /// viewer.
+    /// FileBox is back on screen while the image floats: it goes back into the viewer.
     func endPictureInPictureForReturn() {
+        catchUpOnClosedPictureInPicture()
         guard isActive, !stopKeepsViewer, let controller, controller.isPictureInPictureActive else { return }
         stopKeepsViewer = true
         controller.stopPictureInPicture()
+    }
+
+    /// The window was closed with its X while the app was away, and iOS may tell only some time
+    /// after the app is back: as soon as AVKit's own state shows it, the viewer closes, before it
+    /// is seen again. The late report then finds nothing left to do.
+    private func catchUpOnClosedPictureInPicture() {
+        guard isActive, !stopKeepsViewer, pendingRestore == nil, let controller,
+              !controller.isPictureInPictureActive
+        else { return }
+        MediaDiagnostics.log("图片小窗已在 App 外关闭")
+        pictureInPictureDidStop()
     }
 
     /// The manual PiP button.
@@ -498,6 +511,8 @@ final class MediaImagePiPController: NSObject, ObservableObject {
     }
 
     private func pictureInPictureDidStop() {
+        // Already handled (see `catchUpOnClosedPictureInPicture`).
+        guard isActive || isStarting || stopKeepsViewer else { return }
         let keepsViewer = stopKeepsViewer
         MediaDiagnostics.log(keepsViewer ? "图片小窗回到全屏" : "图片小窗已关闭")
         stopKeepsViewer = false

@@ -320,14 +320,25 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// FileBox is back on screen while the video floats: it goes back into the viewer and keeps
     /// playing there, so there is never a floating window and a full one at the same time.
     func endPictureInPictureForReturn() {
-        // A restore the user tapped is already bringing it back. A window closed with its X while
-        // the app was away is no longer active here, and its stop closes the viewer.
+        catchUpOnClosedPictureInPicture()
+        // A restore the user tapped is already bringing it back.
         guard !stopKeepsViewer, pendingRestore == nil,
               let controller = pictureInPicture, controller.isPictureInPictureActive
         else { return }
         MediaDiagnostics.log("回到 App，收起视频小窗")
         stopKeepsViewer = true
         controller.stopPictureInPicture()
+    }
+
+    /// The window was closed with its X while the app was away, and iOS may tell only some time
+    /// after the app is back: as soon as AVKit's own state shows it, the viewer closes, before it
+    /// is seen again. The late report then finds nothing left to do.
+    private func catchUpOnClosedPictureInPicture() {
+        guard isPictureInPictureActive, !stopKeepsViewer, pendingRestore == nil,
+              let controller = pictureInPicture, !controller.isPictureInPictureActive
+        else { return }
+        MediaDiagnostics.log("视频小窗已在 App 外关闭")
+        pictureInPictureDidStop()
     }
 
     /// The manual PiP button.
@@ -1080,6 +1091,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     private func willEnterForeground() {
+        catchUpOnClosedPictureInPicture()
         guard detachedForBackground else { return }
         playerViewController.player = player
         detachedForBackground = false
@@ -1259,6 +1271,8 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     private func pictureInPictureDidStop() {
+        // Already handled (see `catchUpOnClosedPictureInPicture`).
+        guard isPictureInPictureActive || isPictureInPictureStarting || stopKeepsViewer else { return }
         let keepsViewer = stopKeepsViewer
         MediaDiagnostics.log(keepsViewer ? "视频小窗回到全屏" : "视频小窗已关闭")
         stopKeepsViewer = false
