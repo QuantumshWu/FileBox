@@ -274,12 +274,28 @@ final class ViewerJumpUITests: XCTestCase {
 
     /// Swipes the page down to close the viewer, from the middle of the screen. Held sideways on
     /// the iPhone SE, swipeDown() started so high that it pulled down the Notification Center,
-    /// which then covered the app for the rest of the test.
+    /// which then covered the app for the rest of the test. The normalized offsets stay those of
+    /// the upright screen when the phone is held sideways (the same drag closed nothing then), so
+    /// down on the screen is along the upright screen's width.
     @MainActor
     private func swipePageDown() {
-        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4))
-        let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9))
-        start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .fast, thenHoldForDuration: 0)
+        let from: CGVector
+        let to: CGVector
+        switch XCUIDevice.shared.orientation {
+        case .landscapeLeft:
+            // Home button on the right: the screen's top is the upright screen's right side.
+            from = CGVector(dx: 0.6, dy: 0.5)
+            to = CGVector(dx: 0.12, dy: 0.5)
+        case .landscapeRight:
+            from = CGVector(dx: 0.4, dy: 0.5)
+            to = CGVector(dx: 0.88, dy: 0.5)
+        default:
+            from = CGVector(dx: 0.5, dy: 0.4)
+            to = CGVector(dx: 0.5, dy: 0.9)
+        }
+        let start = app.coordinate(withNormalizedOffset: from)
+        start.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: to),
+                    withVelocity: XCUIGestureVelocity(rawValue: 2400), thenHoldForDuration: 0)
     }
 
     /// Plays or pauses a video: a double tap in the middle third, below the centre buttons.

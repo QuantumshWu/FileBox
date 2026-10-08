@@ -172,6 +172,7 @@ def main():
     folder_moves = check_folder(args.log, start, args.folder_tolerance)
     off_page = check_pages(args.log, start)
     sideways = check_sideways(args.log, start, args.tolerance)
+    small_pages = check_page_frames(args.log, start)
     off_centre = [e for e in episodes if not by_design(e)]
     print(f"OVERALL: {len(off_centre)} episodes off centre outside drags" if off_centre else "OVERALL: always centred outside drags")
     print(f"FOLDER OVERALL: {folder_moves} moves while it shows through the viewer" if folder_moves
@@ -180,7 +181,89 @@ def main():
           else "PAGES OVERALL: the pager always rests on a page boundary")
     print(f"SIDEWAYS OVERALL: {sideways} episodes off the screen's centre sideways" if sideways
           else "SIDEWAYS OVERALL: always centred sideways while opening, closing and showing or hiding the bars")
+    print(f"PAGE FRAMES OVERALL: {small_pages} episodes of a page at rest not filling the screen" if small_pages
+          else "PAGE FRAMES OVERALL: a page at rest always fills the screen")
     return 0
+
+
+def check_page_frames(path, start, tolerance=0.5):
+    """A page at rest (the viewer at full size, the pager on a page boundary, nothing dragged, not
+    turning) fills the screen: its image scroll view (zoom m=), video host (playerHost m=) and video
+    surface (surface m=) all have the window's frame. One laid out inside the safe area (held
+    sideways, inside the screen's side insets) shows its picture smaller than it should be."""
+    episodes = []
+    last_event = ""
+    dragging = False
+    turning_until = -1.0
+    settle_until = -1.0
+    landscape = None
+    for line in open(path, encoding="utf-8", errors="replace"):
+        parts = line.rstrip(chr(10)).split(" ", 3)
+        if len(parts) < 4:
+            continue
+        try:
+            stamp = float(parts[0]) - start
+        except ValueError:
+            continue
+        if parts[2] == "EVENT":
+            text = parts[3]
+            if text.startswith("dismiss drag began") or text == "exit fade=false":
+                dragging = True
+            elif text.startswith("dismiss drag ended"):
+                # Let go without closing: the page springs back first.
+                dragging = False
+                settle_until = stamp + 0.8
+            elif text in ("viewer appeared", "viewer disappeared"):
+                dragging = False
+            last_event = text
+            continue
+        if not parts[2].startswith("F"):
+            continue
+        win = re.search(r"win=" + RECT, line)
+        edge = re.search(r"edgeHost@\S+ m=" + RECT, line)
+        pager = re.search(r" pager=" + RECT + r" pagerOff=\((-?[0-9.]+),", line)
+        if not win or not edge or not pager:
+            continue
+        W, H = float(win.group(3)), float(win.group(4))
+        now = W > H
+        if landscape is not None and now != landscape:
+            turning_until = stamp + 1.0
+        landscape = now
+        ex, ey, ew, eh = (float(edge.group(k)) for k in range(1, 5))
+        width, offset = float(pager.group(3)), float(pager.group(5))
+        at_rest = (abs(ex) <= tolerance and abs(ey) <= tolerance and abs(ew - W) <= tolerance and abs(eh - H) <= tolerance
+                   and width > 0 and abs(offset - round(offset / width) * width) <= tolerance
+                   and not dragging and stamp >= turning_until and stamp >= settle_until)
+        if not at_rest:
+            continue
+        bad = []
+        for segment in line.split(" | "):
+            name = segment.split("@", 1)[0] if "@" in segment else None
+            if name not in ("zoom", "playerHost", "surface"):
+                continue
+            m = re.search(r" m=" + RECT, segment)
+            if not m:
+                continue
+            x, y, w, h = (float(m.group(k)) for k in range(1, 5))
+            if min(x + w, W) - max(x, 0) < 2:
+                continue
+            if abs(x) > tolerance or abs(y) > tolerance or abs(w - W) > tolerance or abs(h - H) > tolerance:
+                bad.append(f"{name}=[{x:.1f},{y:.1f},{w:.1f},{h:.1f}]")
+        if not bad:
+            continue
+        frame = int(parts[2][1:])
+        if episodes and frame - episodes[-1]["last"] <= 3:
+            episodes[-1]["last"] = frame
+            episodes[-1]["t1"] = stamp
+            continue
+        episodes.append({"first": frame, "last": frame, "t0": stamp, "t1": stamp, "what": bad[0],
+                         "win": f"{W:.0f}x{H:.0f}", "event": last_event})
+    print("")
+    print("PAGE FRAMES (a page at rest whose image scroll view, video host or surface is not the window's frame)")
+    for e in episodes:
+        print(f"  {e['t0']:9.3f}-{e['t1']:9.3f}s F{e['first']}-F{e['last']} win {e['win']} {e['what']}  NOT FULL SCREEN"
+              f"  after: {e['event']}")
+    return len(episodes)
 
 
 def check_sideways(path, start, tolerance):
