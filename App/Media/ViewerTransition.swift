@@ -211,6 +211,16 @@ struct ViewerEdgeToEdge<Content: View>: UIViewControllerRepresentable {
     }
 }
 
+/// The pager's hosting controller.
+///
+/// UIKit still hands the screen's safe area to the UIKit views inside, the pager's own scroll view
+/// among them; a negative additional inset does not take it away (build-78 tried: the inset only
+/// grew more negative with every change while the safe area stayed as it was). So that scroll view
+/// is kept from setting itself in from the safe area. Held sideways it set itself in from both
+/// sides by the screen's side insets, and while the viewer grew in or shrank out the scale changed
+/// how far it reached into them: the inset changed on every frame and the page drifted 25 pt
+/// sideways as it faded in, stayed there and slid back at the next touch. After the phone turned
+/// with a video open, it left the page 10 pt above the screen's centre.
 final class ViewerEdgeToEdgeController<Content: View>: UIHostingController<Content> {
     override init(rootView: Content) {
         super.init(rootView: rootView)
@@ -232,18 +242,24 @@ final class ViewerEdgeToEdgeController<Content: View>: UIHostingController<Conte
         #endif
     }
 
-    /// Cancels the safe area the viewer around passes down, so the UIKit views inside (the
-    /// pager's scroll view and its pages) get none either.
-    override func viewSafeAreaInsetsDidChange() {
-        super.viewSafeAreaInsetsDidChange()
-        let added = additionalSafeAreaInsets
-        let insets = view.safeAreaInsets
-        let cancelling = UIEdgeInsets(
-            top: added.top - insets.top,
-            left: added.left - insets.left,
-            bottom: added.bottom - insets.bottom,
-            right: added.right - insets.right
-        )
-        if cancelling != added { additionalSafeAreaInsets = cancelling }
+    // SwiftUI builds the pager's scroll view while it lays out this view, so it is there by now,
+    // before anything of it is drawn.
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        Self.keepFromSafeArea(in: view)
+    }
+
+    /// The paging scroll view under `view` never sets itself in from the safe area. Pages are under
+    /// it, so the search stops there.
+    private static func keepFromSafeArea(in view: UIView) {
+        for sub in view.subviews {
+            if let scroll = sub as? UIScrollView, scroll.isPagingEnabled {
+                if scroll.contentInsetAdjustmentBehavior != .never {
+                    scroll.contentInsetAdjustmentBehavior = .never
+                }
+                continue
+            }
+            keepFromSafeArea(in: sub)
+        }
     }
 }
