@@ -190,29 +190,172 @@ private struct ViewerPagerFade: ViewModifier, Animatable {
     }
 }
 
-/// Hosts the pager without a SwiftUI safe area, so no page's layout depends on it: the bars and the
-/// status bar showing or hiding (which changes the safe area on iPhones without a notch) never move
-/// a page. It fills whatever frame it is given; the viewer gives it the whole screen (see
-/// ViewerPagerFrame).
+/// Hosts the pager without a safe area, SwiftUI's or UIKit's, so no page's layout depends on it. It
+/// fills whatever frame it is given; the viewer gives it the whole screen (see ViewerPagerFrame).
 struct ViewerEdgeToEdge<Content: View>: UIViewControllerRepresentable {
     let content: Content
 
-    func makeUIViewController(context: Context) -> ViewerEdgeToEdgeController<Content> {
-        ViewerEdgeToEdgeController(rootView: content)
+    func makeUIViewController(context: Context) -> UIViewController {
+        #if DEBUG
+        switch ViewerEdgeExperiment.variant {
+        case 0:
+            return ViewerEdgeToEdgeController(rootView: content, fixesPagerInsets: false)
+        case 2:
+            return ViewerEdgeToEdgeController(rootView: content, fixesPagerInsets: true)
+        case 3:
+            return ViewerEdgeToEdgeBox(rootView: content, fixesPagerInsets: true)
+        case 4:
+            return ViewerEdgeToEdgeBox(rootView: content, fixesPagerInsets: false, safeAreaFreeView: true)
+        default:
+            break
+        }
+        #endif
+        return ViewerEdgeToEdgeBox(rootView: content, fixesPagerInsets: false)
     }
 
-    func updateUIViewController(_ controller: ViewerEdgeToEdgeController<Content>, context: Context) {
-        controller.rootView = content
+    func updateUIViewController(_ controller: UIViewController, context: Context) {
+        if let box = controller as? ViewerEdgeToEdgeBox<Content> {
+            box.rootView = content
+        } else if let host = controller as? ViewerEdgeToEdgeController<Content> {
+            host.rootView = content
+        }
     }
 
     /// Always the whole space offered, never the pager's own idea of its size.
-    func sizeThatFits(_ proposal: ProposedViewSize, uiViewController: ViewerEdgeToEdgeController<Content>, context: Context) -> CGSize? {
+    func sizeThatFits(_ proposal: ProposedViewSize, uiViewController: UIViewController, context: Context) -> CGSize? {
         proposal.replacingUnspecifiedDimensions()
     }
 }
 
+/// Holds the pager's hosting controller as its child and takes away, as a negative additional inset,
+/// all of the safe area the viewer around passes down: the pager and its pages get none, in UIKit
+/// either.
+///
+/// UIKit hands the safe area of the screen (the status bar and the notch, the home indicator, and
+/// held sideways the sides) to every view under the viewer, the pager's own scroll view too, which
+/// UIKit sets in from the sides by it when the phone is sideways. While the viewer grows in or
+/// shrinks out, its scale changes how far it reaches into those edges, so that inset changed on
+/// every frame and the page moved sideways with it while it faded in, then slid back the next time
+/// the pager laid out. And after turning the phone, the pager centred its page between the top and
+/// the home indicator instead of on the screen. With no safe area inside, none of that can happen.
+final class ViewerEdgeToEdgeBox<Content: View>: UIViewController {
+    private let host: ViewerPagerHostingController<Content>
+
+    var rootView: Content {
+        get { host.rootView }
+        set { host.rootView = newValue }
+    }
+
+    private let safeAreaFreeView: Bool
+
+    init(rootView: Content, fixesPagerInsets: Bool, safeAreaFreeView: Bool = false) {
+        host = ViewerPagerHostingController(rootView: rootView, fixesPagerInsets: fixesPagerInsets)
+        self.safeAreaFreeView = safeAreaFreeView
+        super.init(nibName: nil, bundle: nil)
+        overrideUserInterfaceStyle = .dark
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        let view = safeAreaFreeView ? ViewerSafeAreaFreeView() : UIView()
+        // The viewer's backdrop supplies the black; the folder shows through a page dragged away.
+        view.backgroundColor = .clear
+        self.view = view
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        addChild(host)
+        host.view.frame = view.bounds
+        host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(host.view)
+        host.didMove(toParent: self)
+        cancelSafeArea()
+        #if DEBUG
+        ViewerProbe.shared.register(view, as: "edgeBox")
+        #endif
+    }
+
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        cancelSafeArea()
+    }
+
+    override func viewWillLayoutSubviews() {
+        super.viewWillLayoutSubviews()
+        cancelSafeArea()
+    }
+
+    private func cancelSafeArea() {
+        let outer = view.safeAreaInsets
+        let cancelling = UIEdgeInsets(top: -outer.top, left: -outer.left, bottom: -outer.bottom, right: -outer.right)
+        guard host.additionalSafeAreaInsets != cancelling else { return }
+        #if DEBUG
+        ViewerProbe.shared.event("edgeBox safe=\(outer) -> host added \(cancelling)")
+        #endif
+        host.additionalSafeAreaInsets = cancelling
+    }
+}
+
+/// A view that reports no safe area (variant 4 of the Debug experiment).
+final class ViewerSafeAreaFreeView: UIView {
+    override var safeAreaInsets: UIEdgeInsets { .zero }
+}
+
+/// The pager's hosting controller: SwiftUI inside gets no safe area either.
+final class ViewerPagerHostingController<Content: View>: UIHostingController<Content> {
+    private let fixesPagerInsets: Bool
+
+    init(rootView: Content, fixesPagerInsets: Bool) {
+        self.fixesPagerInsets = fixesPagerInsets
+        super.init(rootView: rootView)
+        safeAreaRegions = []
+        overrideUserInterfaceStyle = .dark
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .clear
+        #if DEBUG
+        ViewerProbe.shared.register(view, as: "edgeHost")
+        #endif
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        if fixesPagerInsets { ViewerPagerInsets.neverAdjust(in: view) }
+    }
+}
+
+/// The paging scroll view of the pager never sets itself in from the safe area.
+@MainActor
+enum ViewerPagerInsets {
+    static func neverAdjust(in view: UIView) {
+        for sub in view.subviews {
+            if let scroll = sub as? UIScrollView, scroll.isPagingEnabled {
+                if scroll.contentInsetAdjustmentBehavior != .never {
+                    scroll.contentInsetAdjustmentBehavior = .never
+                }
+                continue
+            }
+            neverAdjust(in: sub)
+        }
+    }
+}
+
+/// The pager's host as released in build-78 (variants 0 and 2 of the Debug experiment).
 final class ViewerEdgeToEdgeController<Content: View>: UIHostingController<Content> {
-    override init(rootView: Content) {
+    private let fixesPagerInsets: Bool
+
+    init(rootView: Content, fixesPagerInsets: Bool) {
+        self.fixesPagerInsets = fixesPagerInsets
         super.init(rootView: rootView)
         // SwiftUI inside gets no safe area.
         safeAreaRegions = []
@@ -232,6 +375,11 @@ final class ViewerEdgeToEdgeController<Content: View>: UIHostingController<Conte
         #endif
     }
 
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        if fixesPagerInsets { ViewerPagerInsets.neverAdjust(in: view) }
+    }
+
     /// Cancels the safe area the viewer around passes down, so the UIKit views inside (the
     /// pager's scroll view and its pages) get none either.
     override func viewSafeAreaInsetsDidChange() {
@@ -244,6 +392,21 @@ final class ViewerEdgeToEdgeController<Content: View>: UIHostingController<Conte
             bottom: added.bottom - insets.bottom,
             right: added.right - insets.right
         )
+        #if DEBUG
+        ViewerProbe.shared.event("edgeHost safe=\(insets) added=\(added) -> \(cancelling)")
+        #endif
         if cancelling != added { additionalSafeAreaInsets = cancelling }
     }
 }
+
+#if DEBUG
+/// Debug builds only: which way of hosting the pager the viewer uses (`-ViewerEdgeVariant N`, for
+/// the repro workflow's experiment): 0 as released in build-78, 1 the safe-area-free box, 2 and 3
+/// those two with the pager's scroll view kept from setting itself in from the safe area, 4 the box
+/// with a root view that reports no safe area instead of the negative inset.
+enum ViewerEdgeExperiment {
+    static var variant: Int {
+        UserDefaults.standard.object(forKey: "ViewerEdgeVariant") == nil ? 1 : UserDefaults.standard.integer(forKey: "ViewerEdgeVariant")
+    }
+}
+#endif
