@@ -17,6 +17,12 @@ import sys
 RECT = r"\[(-?[0-9.]+),(-?[0-9.]+),(-?[0-9.]+),(-?[0-9.]+)\]"
 
 
+def invisible(segment):
+    """A view drawn fully transparent (a page view left over from before a turn) is not seen."""
+    match = re.search(r" a=([0-9.]+)", segment)
+    return match is not None and float(match.group(1)) < 0.01
+
+
 def centre_y(match):
     y, h = float(match.group(2)), float(match.group(4))
     return y + h / 2
@@ -75,7 +81,7 @@ def main():
         safe = re.search(r"pvSafe=(\{[^}]*\})", line)
         for segment in line.split(" | "):
             name = segment.split("@", 1)[0] if "@" in segment else None
-            if name not in ("edgeHost", "zoom", "surface", "playerHost"):
+            if name not in ("edgeHost", "zoom", "surface", "playerHost") or invisible(segment):
                 continue
             # Off-screen neighbours (paging) are left out by the probe; a page moving sideways is fine.
             for key in ("m", "p", "img", "imgP", "video"):
@@ -239,7 +245,7 @@ def check_page_frames(path, start, tolerance=0.5):
         bad = []
         for segment in line.split(" | "):
             name = segment.split("@", 1)[0] if "@" in segment else None
-            if name not in ("zoom", "playerHost", "surface"):
+            if name not in ("zoom", "playerHost", "surface") or invisible(segment):
                 continue
             m = re.search(r" m=" + RECT, segment)
             if not m:
@@ -307,11 +313,20 @@ def check_sideways(path, start, tolerance):
         landscape = now
         if stamp > until:
             continue
+        if reason.startswith("chrome"):
+            # A swipe right after the bars showed or hid pages sideways by design.
+            pager = re.search(r" pager=" + RECT + r" pagerOff=\((-?[0-9.]+),", line)
+            edge = re.search(r"edgeHost@\S+ m=" + RECT, line)
+            if pager and edge and float(edge.group(3)) > 0:
+                page_width = float(pager.group(3)) / (float(edge.group(3)) / width)
+                offset = float(pager.group(5))
+                if page_width > 0 and abs(offset - round(offset / page_width) * page_width) > 0.5:
+                    continue
         worst = None
         for segment in line.split(" | "):
             name = segment.split("@", 1)[0] if "@" in segment else None
             keys = {"edgeHost": ("m", "p"), "zoom": ("img", "imgP"), "surface": ("video",)}.get(name)
-            if not keys:
+            if not keys or invisible(segment):
                 continue
             for key in keys:
                 if key in ("p", "imgP") and stamp < turning_until:
