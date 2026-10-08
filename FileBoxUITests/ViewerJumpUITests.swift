@@ -129,7 +129,7 @@ final class ViewerJumpUITests: XCTestCase {
         step("sideways-chrome-show", settle: 1.5) { tapViewer() }
         closeWithButton("sideways-close-button-image")
         step("sideways-open-video", settle: 4) { openFromFolder("cell-d_landscape.mp4") }
-        step("sideways-close-swipe-down-video", settle: 2.5) { app.swipeDown() }
+        step("sideways-close-swipe-down-video", settle: 2.5) { swipePageDown() }
         XCUIDevice.shared.orientation = .portrait
         mark("device-portrait")
         pause(3)
@@ -153,16 +153,16 @@ final class ViewerJumpUITests: XCTestCase {
             pause(2)
             let r = "r\(round)"
             step(r + "-open-image-portrait", settle: 2.5) { openFromFolder("row-a_portrait.png") }
-            step(r + "-close-swipe-down-portrait", settle: 2) { app.swipeDown() }
+            step(r + "-close-swipe-down-portrait", settle: 2) { swipePageDown() }
             XCUIDevice.shared.orientation = .landscapeLeft
             mark(r + "-device-landscape")
             pause(2.5)
             step(r + "-sideways-open-video", settle: 3) { openFromFolder("row-c_portrait.mp4") }
             step(r + "-sideways-chrome-show", settle: 1.5) { tapViewer() }
-            step(r + "-sideways-close-swipe-down-video", settle: 2) { app.swipeDown() }
+            step(r + "-sideways-close-swipe-down-video", settle: 2) { swipePageDown() }
             step(r + "-sideways-open-image", settle: 3) { openFromFolder("row-b_landscape.png") }
             step(r + "-sideways-page", settle: 2) { app.swipeLeft() }
-            step(r + "-sideways-close-swipe-down-paged", settle: 2) { app.swipeDown() }
+            step(r + "-sideways-close-swipe-down-paged", settle: 2) { swipePageDown() }
             XCUIDevice.shared.orientation = .portrait
             mark(r + "-device-portrait")
             pause(2.5)
@@ -266,10 +266,20 @@ final class ViewerJumpUITests: XCTestCase {
         let target = element(identifier)
         if !(target.waitForExistence(timeout: 5) && target.isHittable) {
             mark("viewer-still-open")
-            app.swipeDown()
+            swipePageDown()
             pause(2.5)
         }
         tapIfPossible(target)
+    }
+
+    /// Swipes the page down to close the viewer, from the middle of the screen. Held sideways on
+    /// the iPhone SE, swipeDown() started so high that it pulled down the Notification Center,
+    /// which then covered the app for the rest of the test.
+    @MainActor
+    private func swipePageDown() {
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.4))
+        let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9))
+        start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .fast, thenHoldForDuration: 0)
     }
 
     /// Plays or pauses a video: a double tap in the middle third, below the centre buttons.
@@ -308,23 +318,43 @@ final class ViewerJumpUITests: XCTestCase {
         return bar.exists && !bar.isHittable
     }
 
-    /// Taps a button of the viewer's bars, bringing the bars up first if it cannot be tapped.
+    /// Taps a button of the viewer's bars, bringing the bars up first. XCUITest sometimes reports a
+    /// button on the bars as not hittable although it shows (the 横屏 button on the iPhone 16e):
+    /// with the bars up, such a button is tapped where it is.
     @MainActor
     private func tapBarButton(_ target: XCUIElement) {
         showBars(for: target)
-        tapIfPossible(target)
+        if target.exists, target.isHittable {
+            target.tap()
+        } else if target.exists, barsAreUp(), !target.frame.isEmpty {
+            mark("coordinate-tap")
+            let frame = target.frame
+            app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: frame.midX, dy: frame.midY)).tap()
+        } else {
+            mark("skipped-tap")
+        }
     }
 
-    /// The bars hide by themselves and a tap shows or hides them: tap the page until `target` can
-    /// be tapped (at most three times, so bars that were up but not yet tappable come back).
+    /// The bars hide by themselves and a tap on the page shows or hides them: brings them up
+    /// (judged by the close button) until `target` can be tapped, at most three times.
     @MainActor
     private func showBars(for target: XCUIElement) {
         for attempt in 0..<3 {
             if target.waitForExistence(timeout: 2), target.isHittable { return }
+            if barsAreUp() {
+                pause(0.5)
+                continue
+            }
             mark("show-bars-\(attempt)")
             tapViewer()
             pause(0.9)
         }
+    }
+
+    @MainActor
+    private func barsAreUp() -> Bool {
+        let close = element("viewer-close")
+        return close.exists && close.isHittable
     }
 
     @MainActor
