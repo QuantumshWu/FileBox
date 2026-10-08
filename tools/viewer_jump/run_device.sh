@@ -35,12 +35,17 @@ done
 now > "$OUT/record_start.txt"
 cat "$OUT/record.log"
 
+# VIEWER_TEST: one or more test methods of ViewerJumpUITests, separated by spaces.
+ONLY=()
+for TEST in ${VIEWER_TEST:-testViewerOpenPageToggleClose}; do
+  ONLY+=(-only-testing:"FileBoxUITests/ViewerJumpUITests/$TEST")
+done
 xcodebuild test-without-building \
   -project FileBox.xcodeproj \
   -scheme FileBoxUITests \
   -destination "id=$UDID" \
   -derivedDataPath DerivedData \
-  -only-testing:FileBoxUITests/ViewerJumpUITests/testViewerOpenPageToggleClose \
+  "${ONLY[@]}" \
   -parallel-testing-enabled NO \
   -resultBundlePath "$OUT/result.xcresult" \
   > "$OUT/test.log" 2>&1
