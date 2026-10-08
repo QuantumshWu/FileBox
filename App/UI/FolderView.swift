@@ -500,6 +500,16 @@ struct FolderView: View {
         }
         tracking.lastViewed = url
         reveal(url, proxy: proxy)
+        // Scrolling can fold the large title into the bar, which then covers part of the list
+        // again (held sideways the row ended up 16 pt under it, and the folder scrolled that far as
+        // the viewer went away over it). Once that has settled, still behind the viewer, the file
+        // is brought into view once more, so closing has nothing left to scroll.
+        let tracking = tracking
+        Task {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard viewer.request != nil, tracking.lastViewed == url else { return }
+            reveal(url, proxy: proxy)
+        }
     }
 
     private func reveal(_ url: URL?, proxy: ScrollViewProxy) {
