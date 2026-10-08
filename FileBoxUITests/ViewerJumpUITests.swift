@@ -29,7 +29,7 @@ final class ViewerJumpUITests: XCTestCase {
         closeWithButton("close-button-1")
 
         // 2. Open again, then page through image, image, video, video and back.
-        step("open-image-portrait-2", settle: 3) { portrait.tap() }
+        step("open-image-portrait-2", settle: 3) { openFromFolder("row-a_portrait.png") }
         step("page-to-landscape-image", settle: 2.5) { app.swipeLeft() }
         step("page-to-portrait-video", settle: 3.5) { app.swipeLeft() }
         step("page-to-landscape-video", settle: 3.5) { app.swipeLeft() }
@@ -287,11 +287,25 @@ final class ViewerJumpUITests: XCTestCase {
         }
     }
 
+    /// Closes the viewer with its close button. A tap that lands as the bars fade out only toggles
+    /// them, so if the viewer is still open the close is tried once more.
     @MainActor
     private func closeWithButton(_ name: String) {
         let close = element("viewer-close")
-        showBars(for: close)
-        step(name, settle: 2.5) { tapIfPossible(close) }
+        for attempt in 0..<2 {
+            showBars(for: close)
+            step(attempt == 0 ? name : name + "-again", settle: 2.5) { tapIfPossible(close) }
+            if !viewerIsOpen() { return }
+            mark("viewer-still-open-after-close")
+        }
+    }
+
+    /// The viewer covers the tab bar while it is open.
+    @MainActor
+    private func viewerIsOpen() -> Bool {
+        if element("viewer-close").exists { return true }
+        let bar = app.tabBars.firstMatch
+        return bar.exists && !bar.isHittable
     }
 
     /// Taps a button of the viewer's bars, bringing the bars up first if it cannot be tapped.
