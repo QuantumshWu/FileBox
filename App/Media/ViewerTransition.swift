@@ -197,21 +197,129 @@ private struct ViewerPagerFade: ViewModifier, Animatable {
 struct ViewerEdgeToEdge<Content: View>: UIViewControllerRepresentable {
     let content: Content
 
-    func makeUIViewController(context: Context) -> ViewerEdgeToEdgeController<Content> {
-        ViewerEdgeToEdgeController(rootView: content)
+    func makeUIViewController(context: Context) -> UIViewController {
+        #if DEBUG
+        switch ViewerEdgeExperiment.variant {
+        case 1: return ViewerEdgeContainer(rootView: content, zeroView: false)
+        case 2: return ViewerEdgeContainer(rootView: content, zeroView: true)
+        case 3:
+            let controller = ViewerEdgeToEdgeController(rootView: content)
+            controller.neverAdjustsPager = true
+            return controller
+        default: break
+        }
+        #endif
+        return ViewerEdgeToEdgeController(rootView: content)
     }
 
-    func updateUIViewController(_ controller: ViewerEdgeToEdgeController<Content>, context: Context) {
-        controller.rootView = content
+    func updateUIViewController(_ controller: UIViewController, context: Context) {
+        if let controller = controller as? ViewerEdgeToEdgeController<Content> {
+            controller.rootView = content
+        }
+        #if DEBUG
+        if let container = controller as? ViewerEdgeContainer<Content> {
+            container.host.rootView = content
+        }
+        #endif
     }
 
     /// Always the whole space offered, never the pager's own idea of its size.
-    func sizeThatFits(_ proposal: ProposedViewSize, uiViewController: ViewerEdgeToEdgeController<Content>, context: Context) -> CGSize? {
+    func sizeThatFits(_ proposal: ProposedViewSize, uiViewController: UIViewController, context: Context) -> CGSize? {
         proposal.replacingUnspecifiedDimensions()
     }
 }
 
+#if DEBUG
+/// Debug builds only, for the repro workflow's experiment: which way of hosting the pager keeps
+/// the window's safe area away from the pager's UIKit views (`-ViewerEdgeVariant N`).
+enum ViewerEdgeExperiment {
+    static let variant: Int = {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-ViewerEdgeVariant"), index + 1 < arguments.count else { return 0 }
+        return Int(arguments[index + 1]) ?? 0
+    }()
+}
+
+/// Variant 1: a plain container cancelling the safe area with negative additional insets; variant
+/// 2: a container whose view reports no safe area. The hosting controller is its child.
+final class ViewerEdgeContainer<Content: View>: UIViewController {
+    let host: UIHostingController<Content>
+    private let zeroView: Bool
+
+    init(rootView: Content, zeroView: Bool) {
+        host = UIHostingController(rootView: rootView)
+        self.zeroView = zeroView
+        super.init(nibName: nil, bundle: nil)
+        host.safeAreaRegions = []
+        host.overrideUserInterfaceStyle = .dark
+        overrideUserInterfaceStyle = .dark
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func loadView() {
+        view = zeroView ? ViewerZeroSafeAreaView() : UIView()
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .clear
+        addChild(host)
+        host.view.backgroundColor = .clear
+        host.view.frame = view.bounds
+        host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(host.view)
+        host.didMove(toParent: self)
+        ViewerProbe.shared.register(host.view, as: "edgeHost")
+        ViewerProbe.shared.register(view, as: "edgeBox")
+        ViewerProbe.shared.event("edge variant \(ViewerEdgeExperiment.variant)")
+    }
+
+    override func viewSafeAreaInsetsDidChange() {
+        super.viewSafeAreaInsetsDidChange()
+        guard !zeroView else { return }
+        let added = additionalSafeAreaInsets
+        let insets = view.safeAreaInsets
+        let cancelling = UIEdgeInsets(
+            top: added.top - insets.top,
+            left: added.left - insets.left,
+            bottom: added.bottom - insets.bottom,
+            right: added.right - insets.right
+        )
+        if cancelling != added { additionalSafeAreaInsets = cancelling }
+    }
+}
+
+final class ViewerZeroSafeAreaView: UIView {
+    override var safeAreaInsets: UIEdgeInsets { .zero }
+}
+#endif
+
 final class ViewerEdgeToEdgeController<Content: View>: UIHostingController<Content> {
+    #if DEBUG
+    /// Variant 3 of the experiment: the pager's scroll view never adjusts its insets.
+    var neverAdjustsPager = false
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        guard neverAdjustsPager, let pager = Self.pagingScrollView(in: view),
+              pager.contentInsetAdjustmentBehavior != .never
+        else { return }
+        pager.contentInsetAdjustmentBehavior = .never
+        ViewerProbe.shared.event("edge variant 3: pager never adjusts")
+    }
+
+    private static func pagingScrollView(in view: UIView) -> UIScrollView? {
+        for sub in view.subviews {
+            if let scroll = sub as? UIScrollView, scroll.isPagingEnabled { return scroll }
+            if let found = pagingScrollView(in: sub) { return found }
+        }
+        return nil
+    }
+    #endif
+
     override init(rootView: Content) {
         super.init(rootView: rootView)
         // SwiftUI inside gets no safe area.
