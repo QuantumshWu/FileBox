@@ -487,17 +487,11 @@ struct FolderView: View {
     }
 
     /// The viewer moved on to another file: bring it into view behind the viewer (only as far as
-    /// needed), so closing the viewer lands on it. Not the file it opened on: that one was tapped
-    /// here, so it is in view already, and showing all of it (a row half under the tab bar) would
-    /// scroll the folder while it still shows through the viewer fading in.
+    /// needed), so closing the viewer lands on it.
     private func followViewer(_ note: Notification, proxy: ScrollViewProxy) {
-        guard let request = viewer.request,
+        guard viewer.request != nil,
               let url = note.userInfo?["url"] as? URL ?? note.object as? URL
         else { return }
-        if tracking.lastViewed == nil, request.animated, request.items.indices.contains(request.startIndex),
-           request.items[request.startIndex].url == url {
-            return
-        }
         tracking.lastViewed = url
         reveal(url, proxy: proxy)
     }

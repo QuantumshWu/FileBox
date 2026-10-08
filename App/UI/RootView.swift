@@ -36,8 +36,6 @@ struct RootView: View {
                 DecoyView()
             }
         }
-        // The folder stays still under the viewer when the viewer hides the status bar.
-        .background { StatusBarInsetKeeper().ignoresSafeArea() }
         // 锁定 (never leaving the app): a video or image floating in Picture in Picture closes, so
         // nothing of the vault stays over the decoy or can be brought back onto it.
         .onChange(of: lock.isUnlocked) { _, unlocked in
