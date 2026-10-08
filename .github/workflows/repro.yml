@@ -38,7 +38,10 @@ jobs:
       - name: Pick simulators
         run: |
           xcrun simctl list runtimes
-          python3 tools/viewer_jump/pick_simulators.py | tee simulators.txt
+          source tools/viewer_jump/config.env
+          python3 tools/viewer_jump/pick_simulators.py | tee all_simulators.txt
+          # Only the simulators config.env asks for, in its order.
+          for label in $DEVICES; do awk -F'\t' -v l="$label" '$3 == l' all_simulators.txt; done | tee simulators.txt
           test -s simulators.txt
 
       - name: Build for testing
@@ -60,6 +63,8 @@ jobs:
       - name: Run on each simulator
         run: |
           STATUS=0
+          source tools/viewer_jump/config.env
+          export VIEWER_TEST
           while IFS=$'\t' read -r UDID NAME LABEL; do
             # stdin from /dev/null: xcodebuild and simctl would otherwise eat the rest of the list.
             bash tools/viewer_jump/run_device.sh "$UDID" "$LABEL" "repro-out/$LABEL" < /dev/null || STATUS=1

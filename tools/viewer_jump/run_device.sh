@@ -40,7 +40,7 @@ xcodebuild test-without-building \
   -scheme FileBoxUITests \
   -destination "id=$UDID" \
   -derivedDataPath DerivedData \
-  -only-testing:FileBoxUITests/ViewerJumpUITests/testViewerOpenPageToggleClose \
+  -only-testing:"FileBoxUITests/ViewerJumpUITests/${VIEWER_TEST:-testViewerOpenPageToggleClose}" \
   -parallel-testing-enabled NO \
   -resultBundlePath "$OUT/result.xcresult" \
   > "$OUT/test.log" 2>&1

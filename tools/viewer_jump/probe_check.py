@@ -37,6 +37,10 @@ def main():
     last_event = ""
     landscape = None
     turning_until = -1.0
+    # What a page does depends on these; the others (decodes, the safe-area keeper...) say nothing
+    # about it.
+    major = ("open ", "viewer appeared", "viewer disappeared", "dismiss drag", "exit fade", "selection",
+             "chrome visible")
     for line in open(args.log, encoding="utf-8", errors="replace"):
         line = line.rstrip("\n")
         parts = line.split(" ", 3)
@@ -49,7 +53,8 @@ def main():
                 height = float(match.group(2))
             continue
         if parts[2] == "EVENT":
-            last_event = parts[3]
+            if parts[3].startswith(major):
+                last_event = parts[3]
             continue
         if height is None or "edgeHost@" not in line:
             continue
@@ -57,6 +62,7 @@ def main():
         # Turned sideways: the screen's height is the other side.
         win = re.search(r"win=" + RECT, line)
         screen_mid = float(win.group(4)) / 2 if win else height / 2
+        screen_h = float(win.group(4)) if win else height
         if win:
             now = float(win.group(3)) > float(win.group(4))
             if landscape is not None and now != landscape:
@@ -77,6 +83,10 @@ def main():
                     continue
                 match = re.search(r"(?:^| )" + key + "=" + RECT, segment)
                 if not match:
+                    continue
+                # Gone below or above the screen (the viewer leaving once faded out): not seen.
+                top, h = float(match.group(2)), float(match.group(4))
+                if min(top + h, screen_h) - max(top, 0) < 2:
                     continue
                 checked += 1
                 cy = centre_y(match)
@@ -160,11 +170,160 @@ def main():
         print(f"        a/s: {seq}")
     print(f"FADES OVERALL: {'all one way' if not bad else str(bad) + ' fades reverse'}")
     folder_moves = check_folder(args.log, start, args.folder_tolerance)
+    off_page = check_pages(args.log, start)
+    sideways = check_sideways(args.log, start, args.tolerance)
     off_centre = [e for e in episodes if not by_design(e)]
     print(f"OVERALL: {len(off_centre)} episodes off centre outside drags" if off_centre else "OVERALL: always centred outside drags")
     print(f"FOLDER OVERALL: {folder_moves} moves while it shows through the viewer" if folder_moves
           else "FOLDER OVERALL: never moves while it shows through the viewer")
+    print(f"PAGES OVERALL: {off_page} rests off a page boundary" if off_page
+          else "PAGES OVERALL: the pager always rests on a page boundary")
+    print(f"SIDEWAYS OVERALL: {sideways} episodes off the screen's centre sideways" if sideways
+          else "SIDEWAYS OVERALL: always centred sideways while opening, closing and showing or hiding the bars")
     return 0
+
+
+def check_sideways(path, start, tolerance):
+    """While the viewer opens (its first 1.2 s), closes with the button (until it is gone) and for a
+    second after the bars show or hide, nothing pages: the pager host, the picture (zoom ... img=,
+    imgP=) and the video (surface ... video=) must be centred across the screen too. Lists every
+    episode of frames off that centre by more than `tolerance` points, laid out or drawn."""
+    episodes = []
+    until = -1.0
+    reason = ""
+    turning_until = -1.0
+    landscape = None
+    for line in open(path, encoding="utf-8", errors="replace"):
+        parts = line.rstrip(chr(10)).split(" ", 3)
+        if len(parts) < 4:
+            continue
+        try:
+            stamp = float(parts[0]) - start
+        except ValueError:
+            continue
+        if parts[2] == "EVENT":
+            text = parts[3]
+            if text == "viewer appeared":
+                until, reason = stamp + 1.2, "opening"
+            elif text == "exit fade=true":
+                until, reason = float("inf"), "closing"
+            elif text.startswith("chrome visible"):
+                until, reason = stamp + 1.0, text
+            elif text.startswith(("selection", "dismiss drag", "exit fade=false", "viewer disappeared")):
+                until = -1.0
+            continue
+        if not parts[2].startswith("F"):
+            continue
+        win = re.search(r"win=" + RECT, line)
+        if not win:
+            continue
+        width = float(win.group(3))
+        now = width > float(win.group(4))
+        if landscape is not None and now != landscape:
+            turning_until = stamp + 1.0
+        landscape = now
+        if stamp > until:
+            continue
+        worst = None
+        for segment in line.split(" | "):
+            name = segment.split("@", 1)[0] if "@" in segment else None
+            keys = {"edgeHost": ("m", "p"), "zoom": ("img", "imgP"), "surface": ("video",)}.get(name)
+            if not keys:
+                continue
+            for key in keys:
+                if key in ("p", "imgP") and stamp < turning_until:
+                    continue
+                match = re.search(r"(?:^| )" + key + "=" + RECT, segment)
+                if not match:
+                    continue
+                x, w = float(match.group(1)), float(match.group(3))
+                # A neighbouring page beside the screen.
+                if min(x + w, width) - max(x, 0) < 2:
+                    continue
+                dx = x + w / 2 - width / 2
+                if abs(dx) > tolerance and (worst is None or abs(dx) > abs(worst[1])):
+                    worst = (f"{name}.{key}", dx)
+        if worst is None:
+            continue
+        frame = int(parts[2][1:])
+        if episodes and frame - episodes[-1]["last"] <= 3 and episodes[-1]["reason"] == reason:
+            episode = episodes[-1]
+        else:
+            episode = {"first": frame, "last": frame, "t0": stamp, "max": 0.0, "what": set(), "reason": reason}
+            episodes.append(episode)
+        episode["last"] = frame
+        episode["t1"] = stamp
+        episode["what"].add(worst[0])
+        if abs(worst[1]) > abs(episode["max"]):
+            episode["max"] = worst[1]
+    print("")
+    print(f"SIDEWAYS (off the screen's centre across it by more than {tolerance} pt while opening, closing with the button,"
+          " or showing / hiding the bars)")
+    for e in episodes:
+        print(f"  {e['t0']:9.3f}-{e['t1']:9.3f}s F{e['first']}-F{e['last']} max {e['max']:+7.2f}pt "
+              f"{','.join(sorted(e['what']))}  OFF CENTRE SIDEWAYS  while: {e['reason']}")
+    return len(episodes)
+
+
+def check_pages(path, start, tolerance=0.5, rest=0.3, frames=3):
+    """The pager's horizontal offset (edgeHost ... pagerOff=) must come to rest on a page boundary
+    (a multiple of the pager's unscaled width): one at rest anywhere else shows the page that far
+    off the screen's centre, sideways. Paging moves it on every frame, so only an offset that stays
+    put for `rest` seconds over `frames` probe frames counts (a main-thread stall in the middle of a
+    swipe logs one frame and then nothing)."""
+    episodes = []
+    current = None
+    last_event = ""
+    major = ("open ", "viewer appeared", "viewer disappeared", "dismiss drag", "exit fade", "selection",
+             "chrome visible")
+
+    def close(stamp):
+        if current is None:
+            return
+        miss = current["offset"] - round(current["offset"] / current["width"]) * current["width"]
+        if abs(miss) > tolerance and stamp - current["t0"] >= rest and current["count"] >= frames:
+            episodes.append((current["t0"], stamp, current["frame"], current["offset"], current["width"], miss,
+                             current["event"], current["count"]))
+
+    for line in open(path, encoding="utf-8", errors="replace"):
+        parts = line.rstrip("\n").split(" ", 3)
+        if len(parts) < 4:
+            continue
+        try:
+            stamp = float(parts[0]) - start
+        except ValueError:
+            continue
+        if parts[2] == "EVENT":
+            if parts[3].startswith(major):
+                last_event = parts[3]
+            continue
+        if not parts[2].startswith("F"):
+            continue
+        match = re.search(r" pager=" + RECT + r" pagerOff=\((-?[0-9.]+),", line)
+        win = re.search(r"win=" + RECT, line)
+        edge = re.search(r"edgeHost@\S+ m=" + RECT, line)
+        if not match or not win or not edge or float(edge.group(3)) <= 0:
+            close(stamp)
+            current = None
+            continue
+        # The pager's own width: its width on screen without the open / close scale.
+        scale = float(edge.group(3)) / float(win.group(3))
+        width, offset = float(match.group(3)) / scale, float(match.group(5))
+        if width <= 0:
+            continue
+        if current is None or abs(current["offset"] - offset) > 0.01 or abs(current["width"] - width) > 0.5:
+            close(stamp)
+            current = {"offset": offset, "width": width, "t0": stamp, "last": stamp, "frame": parts[2],
+                       "event": last_event, "count": 1}
+        else:
+            current["last"] = stamp
+            current["count"] += 1
+    print("")
+    print(f"PAGES (the pager resting off a page boundary for {rest}s or more, by more than {tolerance} pt)")
+    for t0, t1, frame, offset, width, miss, event, count in episodes:
+        print(f"  {t0:9.3f}-{t1:9.3f}s {frame} offset {offset:.2f} (page width {width:.2f}, {count} frames): "
+              f"{miss:+.2f}pt OFF PAGE  after: {event}")
+    return len(episodes)
 
 
 def folder_values(line):

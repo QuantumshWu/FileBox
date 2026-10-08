@@ -109,8 +109,15 @@ final class ViewerJumpUITests: XCTestCase {
         step("grid-open-video-portrait-2", settle: 3) { openFromFolder("cell-c_portrait.mp4") }
         step("page-to-landscape-video-2", settle: 3.5) { app.swipeLeft() }
         step("pause-before-rotation", settle: 2) { doubleTapVideoMiddle() }
-        step("landscape-button", settle: 3) { tapIfPossible(app.buttons["横屏"]) }
-        step("portrait-button", settle: 3) { tapIfPossible(app.buttons["竖屏"]) }
+        step("landscape-button", settle: 3) { tapBarButton(app.buttons["横屏"]) }
+        step("portrait-button", settle: 3) { tapBarButton(app.buttons["竖屏"]) }
+        // The phone itself turned while the viewer is open, and back.
+        XCUIDevice.shared.orientation = .landscapeLeft
+        mark("device-landscape-viewer-open")
+        pause(3)
+        XCUIDevice.shared.orientation = .portrait
+        mark("device-portrait-viewer-open")
+        pause(3)
         closeWithButton("close-button-after-rotation")
 
         // 7. Held sideways: the folder turns with the phone, and a picture and a video open and close
@@ -129,16 +136,64 @@ final class ViewerJumpUITests: XCTestCase {
         mark("done")
     }
 
+    /// The experiment of the repro workflow (tools/viewer_jump/config.env): each way of hosting the
+    /// pager (`-ViewerEdgeVariant`, Debug builds only) opened upright and held sideways, paged, and
+    /// turned with 横屏 / 竖屏.
+    @MainActor
+    func testEdgeVariants() throws {
+        continueAfterFailure = true
+        for variant in [0, 1, 2, 3, 4] {
+            launch(layout: "list", extra: ["-ViewerEdgeVariant", "\(variant)"])
+            let folder = element("row-UITest")
+            guard folder.waitForExistence(timeout: 120) else {
+                XCTFail("the seeded folder shows up")
+                continue
+            }
+            folder.tap()
+            XCTAssertTrue(element("row-c_portrait.mp4").waitForExistence(timeout: 30))
+            pause(2)
+            let v = "v\(variant)"
+            step(v + "-open-image-portrait", settle: 2.5) { openFromFolder("row-a_portrait.png") }
+            step(v + "-close-swipe-down-portrait", settle: 2) { app.swipeDown() }
+            XCUIDevice.shared.orientation = .landscapeLeft
+            mark(v + "-device-landscape")
+            pause(2.5)
+            step(v + "-sideways-open-video", settle: 3) { openFromFolder("row-c_portrait.mp4") }
+            step(v + "-sideways-chrome-show", settle: 1.5) { tapViewer() }
+            step(v + "-sideways-close-swipe-down-video", settle: 2) { app.swipeDown() }
+            step(v + "-sideways-open-image", settle: 3) { openFromFolder("row-b_landscape.png") }
+            step(v + "-sideways-page", settle: 2) { app.swipeLeft() }
+            step(v + "-sideways-close-swipe-down-paged", settle: 2) { app.swipeDown() }
+            XCUIDevice.shared.orientation = .portrait
+            mark(v + "-device-portrait")
+            pause(2.5)
+            step(v + "-open-video-landscape", settle: 3) { openFromFolder("row-d_landscape.mp4") }
+            step(v + "-pause", settle: 1.5) { doubleTapVideoMiddle() }
+            step(v + "-landscape-button", settle: 3) { tapBarButton(app.buttons["横屏"]) }
+            step(v + "-portrait-button", settle: 3) { tapBarButton(app.buttons["竖屏"]) }
+            XCUIDevice.shared.orientation = .landscapeLeft
+            mark(v + "-device-landscape-viewer-open")
+            pause(3)
+            step(v + "-sideways-chrome-toggle", settle: 1.5) { tapViewer() }
+            XCUIDevice.shared.orientation = .portrait
+            mark(v + "-device-portrait-viewer-open")
+            pause(3)
+            closeWithButton(v + "-close-button")
+            app.terminate()
+        }
+        mark("done")
+    }
+
     // MARK: - Steps
 
     @MainActor
-    private func launch(layout: String) {
+    private func launch(layout: String, extra: [String] = []) {
         app = XCUIApplication()
         // One video loops instead of the next file starting when it ends, so the test decides what
         // is on screen.
         app.launchArguments += [
             "-FileBoxUITestSeed", "-sortOrder", "name", "-folderLayoutV2", layout, "-mediaPlaybackMode", "repeatOne",
-        ]
+        ] + extra
         mark("launch-\(layout)")
         app.launch()
         mark("launched-\(layout)")
@@ -236,12 +291,27 @@ final class ViewerJumpUITests: XCTestCase {
     @MainActor
     private func closeWithButton(_ name: String) {
         let close = element("viewer-close")
-        if !close.waitForExistence(timeout: 3) {
-            // The bars were hidden after all: show them first.
-            tapViewer()
-            _ = close.waitForExistence(timeout: 3)
-        }
+        showBars(for: close)
         step(name, settle: 2.5) { tapIfPossible(close) }
+    }
+
+    /// Taps a button of the viewer's bars, bringing the bars up first if it cannot be tapped.
+    @MainActor
+    private func tapBarButton(_ target: XCUIElement) {
+        showBars(for: target)
+        tapIfPossible(target)
+    }
+
+    /// The bars hide by themselves and a tap shows or hides them: tap the page until `target` can
+    /// be tapped (at most three times, so bars that were up but not yet tappable come back).
+    @MainActor
+    private func showBars(for target: XCUIElement) {
+        for attempt in 0..<3 {
+            if target.waitForExistence(timeout: 2), target.isHittable { return }
+            mark("show-bars-\(attempt)")
+            tapViewer()
+            pause(0.9)
+        }
     }
 
     @MainActor

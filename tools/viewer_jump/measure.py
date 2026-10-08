@@ -352,8 +352,12 @@ def folder_shift(rows, index_of, ref_index, frame_index, scale, top_margin, bott
     shift, peak, at_zero = best_shift(frame, ref, mask)
     if shift is None:
         return None
-    clear = peak >= (0.6 if kind == "band" else 0.75)
-    return {"shift": shift, "peak": peak, "zero": at_zero, "clear": clear, "rows": int(mask.sum())}
+    # The folder must really show there: rows of one flat colour (the black of an opaque viewer)
+    # match anything.
+    contrast = min(float(frame[mask].std()), float(ref[mask].std())) if mask.any() else 0.0
+    clear = peak >= (0.6 if kind == "band" else 0.75) and contrast >= 2.0
+    return {"shift": shift, "peak": peak, "zero": at_zero, "clear": clear, "rows": int(mask.sum()),
+            "contrast": contrast}
 
 
 def main():
@@ -442,7 +446,9 @@ def main():
         if before:
             lags.append(session[0]["t"] - before[-1])
     lag = median([l for l in lags if 0 <= l < 5]) or 0.0
-    turned = [(a + lag - 0.5, (b if b is not None else 1e9) + lag + 1.0) for a, b in sideways]
+    # From a second before the window turned (the recording's lag varies by a few tenths of a second,
+    # and the turn starts on screen as the window turns) until a second after it is upright again.
+    turned = [(a + lag - 1.0, (b if b is not None else 1e9) + lag + 1.0) for a, b in sideways]
     for row in rows:
         row["sideways"] = row["t"] is not None and any(a <= row["t"] <= b for a, b in turned)
     verdict_lines = [
@@ -560,7 +566,9 @@ def main():
             if not window:
                 continue
             if kind == "open":
-                before = [row for row in rows if row["t"] is not None and t_begin - 1.0 <= row["t"] < t_begin - 0.05]
+                # The last frame before the tap: the recorder writes none while nothing moves, so
+                # it can be seconds old.
+                before = [row for row in rows if row["t"] is not None and t_begin - 60 <= row["t"] < t_begin - 0.05]
                 ref = before[-1] if before else None
             else:
                 ref = window[-1]
