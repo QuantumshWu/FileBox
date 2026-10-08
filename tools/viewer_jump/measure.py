@@ -525,6 +525,8 @@ def main():
                     pass
         begins = {name[:-6]: t for t, name in events if name.endswith(".begin")}
         steps = [(begins.get(name, t), t, name) for t, name in events if not name.endswith(".begin")]
+    # The test swiped away a viewer that a close before had left open: that opening starts from it.
+    leftovers = [t for t, name in events if name == "viewer-still-open"] if args.events else []
     step_lines = [
         "",
         "STEP SUMMARY (frames in each step's window in which the picture shows, not counting a page flying off",
@@ -580,9 +582,14 @@ def main():
             if not window:
                 continue
             if kind == "open":
-                # The last frame before the tap: the recorder writes none while nothing moves, so
-                # it can be seconds old.
-                before = [row for row in rows if row["t"] is not None and t_begin - 60 <= row["t"] < t_begin - 0.05]
+                if any(t_begin <= t <= t_end for t in leftovers):
+                    folder_lines.append(f"  {name:32s} {kind:12s} {'-':7s} {'-':>5s}  {'-':>10s}  {'-':7s} "
+                                        "not compared: a viewer left open was swiped away first")
+                    continue
+                # The last frame before the tap without the picture: the recorder writes none while
+                # nothing moves, so it can be seconds old.
+                before = [row for row in rows if row["t"] is not None and t_begin - 60 <= row["t"] < t_begin - 0.05
+                          and row.get("seen", 0) < 2]
                 ref = before[-1] if before else None
             else:
                 # The folder once the viewer is gone, before the test moves on (it may end the app).
