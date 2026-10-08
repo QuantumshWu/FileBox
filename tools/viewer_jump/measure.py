@@ -81,6 +81,14 @@ def column_metrics(col):
         out["red_bot"] = red_runs[-1][1]
         out["red_bot_inner"] = red_runs[-1][0]
     green_runs = [run for run in runs(green) if 2 <= run[1] - run[0] <= 60]
+    if not green_runs:
+        # A faint picture (the last frames of a fade, the folder showing through): the green line
+        # no longer passes the fixed thresholds, but still stands out from what is around it.
+        score = g - np.maximum(r, b)
+        peak = int(score.max()) if len(score) else 0
+        if peak >= 12:
+            faint = score >= max(8, peak // 2)
+            green_runs = [run for run in runs(faint) if 2 <= run[1] - run[0] <= 60]
     if green_runs:
         middle = len(col) / 2
         best = min(green_runs, key=lambda run: abs((run[0] + run[1]) / 2 - middle))
@@ -131,8 +139,12 @@ def summary_values(row, scale):
         bots.append(b)
         # Each column's own middle: while paging, columns can see two different pictures.
         centres.append((t + b) / 2)
+    # The green line of a column (not the middle one, where the video's buttons are) inside the
+    # picture's red border; that column need not see the border itself (a bar over it, or a faint
+    # picture whose border only some columns still find).
+    for c in COLUMNS:
         g = row.get(f"green@{c}") if c != 0.5 else None
-        if g is not None and t < g < b:
+        if g is not None and tops and min(tops) < g < max(bots):
             greens.append(g)
     edges = []
     for c in EDGE_COLUMNS:
@@ -445,7 +457,9 @@ def main():
         before = [t for t in appeared if t <= session[0]["t"]]
         if before:
             lags.append(session[0]["t"] - before[-1])
-    lag = median([l for l in lags if 0 <= l < 5]) or 0.0
+    # simctl's recording can start several seconds late; a second session in one viewer (after a
+    # turn) has no opening of its own, hence the cut.
+    lag = median([l for l in lags if 0 <= l < 20]) or 0.0
     # From a second before the window turned (the recording's lag varies by a few tenths of a second,
     # and the turn starts on screen as the window turns) until a second after it is upright again.
     turned = [(a + lag - 1.0, (b if b is not None else 1e9) + lag + 1.0) for a, b in sideways]
@@ -571,6 +585,9 @@ def main():
                 before = [row for row in rows if row["t"] is not None and t_begin - 60 <= row["t"] < t_begin - 0.05]
                 ref = before[-1] if before else None
             else:
+                # The folder once the viewer is gone, before the test moves on (it may end the app).
+                after = [row for row in window if row["t"] <= t_end + 1.2]
+                window = after or window
                 ref = window[-1]
             if ref is None or ref.get("sideways"):
                 continue
