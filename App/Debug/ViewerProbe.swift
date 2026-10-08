@@ -87,6 +87,9 @@ final class ViewerProbe: NSObject {
             var line = "\(entry.name)@\(short(view)) m=\(r(model))"
             if let shown = presentationFrame(view.layer, in: window) { line += " p=\(r(shown))" }
             line += " safe=\(e(view.safeAreaInsets)) a=\(f(alpha(of: view)))"
+            if let controller = view.next as? UIViewController, controller.additionalSafeAreaInsets != .zero {
+                line += " add=\(e(controller.additionalSafeAreaInsets))"
+            }
             if let scroll = view as? UIScrollView {
                 line += " off=\(pt(scroll.contentOffset)) inset=\(e(scroll.adjustedContentInset)) zoom=\(f(scroll.zoomScale))"
                 if let image = scroll.subviews.first(where: { $0 is UIImageView }) as? UIImageView {
