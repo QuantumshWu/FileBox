@@ -26,6 +26,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("log")
     parser.add_argument("--tolerance", type=float, default=0.5)
+    parser.add_argument("--folder-tolerance", type=float, default=0.5)
     parser.add_argument("--start", help="record_start.txt, to print times relative to the recording")
     args = parser.parse_args()
     start = float(open(args.start).read().strip()) if args.start else 0.0
@@ -158,9 +159,129 @@ def main():
         print(f"  {phase['kind']:5s} at {phase['t']:9.3f}s  {len(values)} frames ({split} with laid-out != drawn)  {verdict}")
         print(f"        a/s: {seq}")
     print(f"FADES OVERALL: {'all one way' if not bad else str(bad) + ' fades reverse'}")
+    folder_moves = check_folder(args.log, start, args.folder_tolerance)
     off_centre = [e for e in episodes if not by_design(e)]
     print(f"OVERALL: {len(off_centre)} episodes off centre outside drags" if off_centre else "OVERALL: always centred outside drags")
+    print(f"FOLDER OVERALL: {folder_moves} moves while it shows through the viewer" if folder_moves
+          else "FOLDER OVERALL: never moves while it shows through the viewer")
     return 0
+
+
+def folder_values(line):
+    """The folder's list content origin (laid out, drawn), navigation bar top (laid out, drawn),
+    the list's identity and the root controller's additional top inset, from one probe frame line."""
+    values = {}
+    for key in ("c0", "c0p"):
+        match = re.search(r" " + key + r"=(-?[0-9.]+)", line)
+        if match:
+            values[key] = float(match.group(1))
+    for key in ("nav", "navP"):
+        match = re.search(r" " + key + "=" + RECT, line)
+        if match:
+            values[key] = float(match.group(2))
+    match = re.search(r" list@(\w+)", line)
+    if match:
+        values["list"] = match.group(1)
+    match = re.search(r"root safe=\{([-0-9.]+),[^}]*\} add=\{([-0-9.]+),", line)
+    if match:
+        values["rootTop"] = float(match.group(1))
+        values["addTop"] = float(match.group(2))
+    match = re.search(r"win=" + RECT, line)
+    if match:
+        values["landscape"] = float(match.group(3)) > float(match.group(4))
+    return values
+
+
+def check_folder(path, start, tolerance):
+    """The folder underneath the viewer (App/Debug/ViewerProbe.swift folderState) while it can be
+    seen: from the tap until the viewer has faded in, while a page is dragged, and from the start of
+    a close until 1.5 s after the viewer is gone. Every probe frame's list content origin and
+    navigation bar top, laid out and drawn, against their values just before (the open, the drag,
+    the close). Behind the opaque viewer the folder may scroll to the page shown (so closing lands
+    on it); that is listed but not counted."""
+    lines = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        parts = line.rstrip("\n").split(" ", 3)
+        if len(parts) < 4:
+            continue
+        try:
+            stamp = float(parts[0]) - start
+        except ValueError:
+            continue
+        lines.append((stamp, parts[2], parts[3], line))
+    # Windows in which the folder can be seen, with their names.
+    windows = []
+    open_at = appeared = drag = exit_at = None
+    for stamp, kind, text, _ in lines:
+        if kind != "EVENT":
+            continue
+        if text.startswith("open "):
+            open_at = stamp
+            label = text[5:]
+        elif text == "viewer appeared" and open_at is not None:
+            appeared = stamp
+            windows.append(("opening " + label, open_at, appeared + 0.8))
+        elif text == "dismiss drag began":
+            drag = stamp
+        elif text.startswith("exit fade="):
+            exit_at = stamp
+            if drag is not None and stamp - drag < 5:
+                windows.append(("drag " + label, drag, stamp))
+            drag = None
+        elif text == "viewer disappeared" and exit_at is not None:
+            windows.append(("closing " + label, exit_at, stamp + 1.5))
+            exit_at = None
+            open_at = None
+    print("")
+    print(f"FOLDER UNDERNEATH (list content origin c0 / c0p and navigation bar top nav / navP, laid out / drawn, in points;")
+    print(f"while it shows through the viewer; a move is more than {tolerance} pt from its value when the window began)")
+    moves = 0
+    frames_seen = 0
+    for name, t0, t1 in windows:
+        reference = None
+        list_id = None
+        worst = (0.0, None, None)
+        extra = set()
+        sideways = False
+        count = 0
+        for stamp, kind, text, line in lines:
+            if not kind.startswith("F"):
+                continue
+            values = folder_values(line)
+            if stamp < t0:
+                if "c0" in values or "nav" in values:
+                    reference = values
+                continue
+            if stamp > t1:
+                break
+            if reference is None:
+                reference = values
+            count += 1
+            frames_seen += 1
+            if values.get("landscape") != reference.get("landscape"):
+                sideways = True
+            if "addTop" in values:
+                extra.add(values["addTop"])
+            if values.get("list") != reference.get("list"):
+                list_id = values.get("list")
+                continue
+            for key in ("c0", "c0p", "nav", "navP"):
+                if key in values and key in reference:
+                    d = values[key] - reference[key]
+                    if abs(d) > abs(worst[0]):
+                        worst = (d, key, kind)
+        moved = abs(worst[0]) > tolerance and not sideways
+        moves += moved
+        verdict = "MOVES" if moved else "OK"
+        if sideways:
+            verdict += " (the phone turned: the folder turns with it)"
+        if list_id:
+            verdict += " (another list)"
+        where = f"{worst[0]:+7.2f}pt {worst[1]} at {worst[2]}" if worst[1] else "   0.00pt"
+        extra_text = "/".join(f"{v:.0f}" for v in sorted(extra)) if extra else "-"
+        print(f"  {t0:9.3f}-{t1:9.3f}s  {name[:44]:44s} {count:4d} frames  max {where:28s} rootAddTop={extra_text:6s} {verdict}")
+    print(f"  {len(windows)} windows, {frames_seen} probe frames")
+    return moves
 
 
 if __name__ == "__main__":

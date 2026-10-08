@@ -73,6 +73,7 @@ jobs:
           for f in repro-out/*/report.txt; do
             echo "== $f ($(cat "$(dirname "$f")/device.txt" 2>/dev/null))"
             sed -n '/^SESSIONS/,/OVERALL/p' "$f"
+            sed -n '/^FOLDER UNDERNEATH/,/FOLDER OVERALL/p' "$f"
             cat "$(dirname "$f")/probe_check.txt" 2>/dev/null
           done
 
@@ -85,6 +86,7 @@ jobs:
             repro-out/*/recording.mp4
             repro-out/*/report.txt
             repro-out/*/measurements.csv
+            repro-out/*/profiles.npz
             repro-out/*/events.txt
             repro-out/*/record_start.txt
             repro-out/*/frame_times.txt

@@ -59,7 +59,9 @@ xcrun simctl shutdown "$UDID" || true
 
 if [ -s "$OUT/recording.mp4" ]; then
   ffprobe -v error -select_streams v:0 -show_entries stream=width,height,avg_frame_rate,nb_frames,duration -of default=nw=1 "$OUT/recording.mp4" | tee "$OUT/stream.txt"
-  ffprobe -v error -select_streams v:0 -show_entries frame=pts_time -of csv=p=0 "$OUT/recording.mp4" > "$OUT/frame_times.txt"
+  # The packets' pts, sorted: simctl repeats a pts now and then, and ffprobe's frame times then
+  # fall back to the dts, which run seconds apart from the pts.
+  ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 "$OUT/recording.mp4" | sort -g > "$OUT/frame_times.txt"
   mkdir -p "$WORK/frames"
   ffmpeg -v error -i "$OUT/recording.mp4" -fps_mode passthrough "$WORK/frames/f_%06d.png"
   echo "frames: $(ls "$WORK/frames" | wc -l) times: $(wc -l < "$OUT/frame_times.txt")"

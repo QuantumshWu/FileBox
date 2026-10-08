@@ -51,6 +51,37 @@ final class ViewerJumpUITests: XCTestCase {
         step("open-image-landscape", settle: 3) { openFromFolder("row-b_landscape.png") }
         step("close-swipe-down-3", settle: 2.5) { app.swipeDown() }
 
+        // 4b. A photo and a video stored the way the camera stores them (sideways, turned upright by
+        // their orientation): the list's thumbnail, the first frame and the full picture must agree.
+        step("open-camera-photo", settle: 3) { openFromFolder("row-e_camera.jpg") }
+        step("close-swipe-down-camera-photo", settle: 2.5) { app.swipeDown() }
+        step("open-camera-video", settle: 4) { openFromFolder("row-f_camera.mov") }
+        step("close-swipe-down-camera-video", settle: 2.5) { app.swipeDown() }
+
+        // 4c. Long folders of landscape files, so the folder shows above and below the picture while
+        // the viewer fades: the row half under the tab bar (the folder must not scroll to it while
+        // it can be seen), and paging past the bottom of the list (it may scroll only behind the
+        // viewer, and stays put while a page is swiped away).
+        goBack(expecting: "row-UITestLongImages")
+        openFolder("row-UITestLongImages", first: "row-img_01.png")
+        step("long-open-image-edge", settle: 3) { tapRowUnderTabBar(prefix: "row-img_") }
+        closeWithButton("long-close-button-image-edge")
+        step("long-open-image-edge-2", settle: 3) { tapRowUnderTabBar(prefix: "row-img_") }
+        step("long-close-swipe-down-image-edge", settle: 2.5) { app.swipeDown() }
+        step("long-open-image-top", settle: 3) { openFromFolder("row-img_05.png") }
+        for index in 1...12 {
+            step("page-long-\(index)", settle: 1.3) { app.swipeLeft() }
+        }
+        step("long-close-swipe-down-paged", settle: 2.5) { app.swipeDown() }
+        goBack(expecting: "row-UITestLongVideos")
+        openFolder("row-UITestLongVideos", first: "row-vid_01.mp4")
+        step("long-open-video-edge", settle: 4) { tapRowUnderTabBar(prefix: "row-vid_") }
+        step("long-close-swipe-down-video-edge", settle: 2.5) { app.swipeDown() }
+        step("long-open-video-edge-2", settle: 4) { tapRowUnderTabBar(prefix: "row-vid_") }
+        step("chrome-show-long-video", settle: 1.5) { tapViewer() }
+        step("pause-long-video", settle: 1.5) { doubleTapVideoMiddle() }
+        closeWithButton("long-close-button-video-edge")
+
         // 5. A fresh launch with the grid: the first open of each kind again.
         app.terminate()
         launch(layout: "grid")
@@ -81,6 +112,20 @@ final class ViewerJumpUITests: XCTestCase {
         step("landscape-button", settle: 3) { tapIfPossible(app.buttons["横屏"]) }
         step("portrait-button", settle: 3) { tapIfPossible(app.buttons["竖屏"]) }
         closeWithButton("close-button-after-rotation")
+
+        // 7. Held sideways: the folder turns with the phone, and a picture and a video open and close
+        // sideways (the recording stays upright, so the probe log checks these).
+        XCUIDevice.shared.orientation = .landscapeLeft
+        mark("device-landscape")
+        pause(3)
+        step("sideways-open-image", settle: 3) { openFromFolder("cell-b_landscape.png") }
+        step("sideways-chrome-show", settle: 1.5) { tapViewer() }
+        closeWithButton("sideways-close-button-image")
+        step("sideways-open-video", settle: 4) { openFromFolder("cell-d_landscape.mp4") }
+        step("sideways-close-swipe-down-video", settle: 2.5) { app.swipeDown() }
+        XCUIDevice.shared.orientation = .portrait
+        mark("device-portrait")
+        pause(3)
         mark("done")
     }
 
@@ -102,6 +147,56 @@ final class ViewerJumpUITests: XCTestCase {
     @MainActor
     private func element(_ identifier: String) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    /// Back to the folder above, by its back button (or the edge swipe if that is not there).
+    @MainActor
+    private func goBack(expecting identifier: String) {
+        mark("go-back")
+        let back = app.navigationBars.buttons.element(boundBy: 0)
+        if back.waitForExistence(timeout: 3), back.isHittable {
+            back.tap()
+        } else {
+            let edge = app.coordinate(withNormalizedOffset: CGVector(dx: 0.01, dy: 0.5))
+            edge.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)))
+        }
+        XCTAssertTrue(element(identifier).waitForExistence(timeout: 10), "back in the folder above")
+        pause(1.5)
+    }
+
+    @MainActor
+    private func openFolder(_ identifier: String, first: String) {
+        mark("open-folder-" + identifier)
+        tapIfPossible(element(identifier))
+        XCTAssertTrue(element(first).waitForExistence(timeout: 30), "the long folder shows")
+        // Thumbnails load.
+        pause(3)
+    }
+
+    /// Opens the file whose row the tab bar half covers: the first row that starts above the tab
+    /// bar's top and ends below it (else the lowest row that starts above it). Tapped in its
+    /// uncovered part.
+    @MainActor
+    private func tapRowUnderTabBar(prefix: String) {
+        let screen = app.windows.firstMatch.frame
+        let bar = app.tabBars.firstMatch
+        let barTop = bar.exists && bar.frame.height > 0 ? bar.frame.minY : screen.maxY - 83
+        let rows = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", prefix))
+            .allElementsBoundByIndex
+            .map { ($0, $0.frame) }
+            .filter { $0.1.height > 10 && $0.1.maxY > 0 }
+            .sorted { $0.1.minY < $1.1.minY }
+        let target = rows.first { $0.1.minY < barTop - 16 && $0.1.maxY > barTop + 2 }
+            ?? rows.last { $0.1.minY < barTop - 16 }
+        guard let target else {
+            mark("no-row-under-tab-bar")
+            return
+        }
+        let (row, frame) = target
+        mark(String(format: "row=%@/y=%.1f-%.1f/barTop=%.1f", row.identifier, frame.minY, frame.maxY, barTop))
+        let y = (frame.minY + min(frame.maxY, barTop)) / 2
+        app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: frame.midX, dy: y)).tap()
     }
 
     /// A single tap on the page, away from the video's centre buttons.

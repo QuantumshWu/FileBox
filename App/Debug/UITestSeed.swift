@@ -1,14 +1,22 @@
 #if DEBUG
 import AVFoundation
+import ImageIO
 import UIKit
 
 /// Debug builds only: launched with `-FileBoxUITestSeed` (the viewer UI test does this), the app
 /// unlocks itself and puts a folder of test media into the vault, so the test can go straight to
 /// the file list. The pictures are made for measuring positions on screen recordings: a thick red
 /// border, a green centre cross and a white 1-px line every 50 px on dark grey.
+///
+/// Folders: UITest (portrait and landscape pictures and videos, plus a photo and a video stored the
+/// way a camera stores them: sideways, with an orientation that turns them upright), and
+/// UITestLongImages and UITestLongVideos (enough landscape files that the list runs on under the
+/// tab bar).
 enum UITestSeed {
     static let argument = "-FileBoxUITestSeed"
     static let folderName = "UITest"
+    static let longImagesFolder = "UITestLongImages"
+    static let longVideosFolder = "UITestLongVideos"
 
     static var isActive: Bool {
         ProcessInfo.processInfo.arguments.contains(argument)
@@ -30,24 +38,53 @@ enum UITestSeed {
         }
     }
 
-    /// Writes the media into a scratch folder and moves it into the vault in one step, so the list
-    /// never shows a half-written file.
     private static func makeFolder() -> Bool {
-        let fm = FileManager.default
-        let target = Vault.root.appendingPathComponent(folderName, isDirectory: true)
-        let scratch = fm.temporaryDirectory.appendingPathComponent("uitest-seed-\(UUID().uuidString)", isDirectory: true)
-        do {
-            try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+        let main = folder(folderName, files: [
+            "a_portrait.png", "b_landscape.png", "c_portrait.mp4", "d_landscape.mp4", "e_camera.jpg", "f_camera.mov",
+        ]) { scratch in
             try png(width: 1200, height: 2400, label: "a portrait image").write(to: scratch.appendingPathComponent("a_portrait.png"))
             try png(width: 1200, height: 600, label: "b landscape image").write(to: scratch.appendingPathComponent("b_landscape.png"))
             try video(to: scratch.appendingPathComponent("c_portrait.mp4"), width: 720, height: 1280, label: "c portrait video")
             try video(to: scratch.appendingPathComponent("d_landscape.mp4"), width: 1280, height: 720, label: "d landscape video")
+            // As a camera stores them: the photo sideways with EXIF orientation 6, the video
+            // landscape with a quarter-turn transform. Both show upright, in portrait.
+            try cameraJPEG(width: 1200, height: 1600, label: "e camera photo").write(to: scratch.appendingPathComponent("e_camera.jpg"))
+            try video(to: scratch.appendingPathComponent("f_camera.mov"), width: 720, height: 1280, label: "f camera video",
+                      storedSideways: true, fileType: .mov)
+        }
+        let images = folder(longImagesFolder, files: (1...24).map { String(format: "img_%02d.png", $0) }) { scratch in
+            for index in 1...24 {
+                try png(width: 1200, height: 600, label: String(format: "long image %02d", index))
+                    .write(to: scratch.appendingPathComponent(String(format: "img_%02d.png", index)))
+            }
+        }
+        let videos = folder(longVideosFolder, files: (1...16).map { String(format: "vid_%02d.mp4", $0) }) { scratch in
+            for index in 1...16 {
+                try video(to: scratch.appendingPathComponent(String(format: "vid_%02d.mp4", index)), width: 640, height: 360,
+                          label: String(format: "long video %02d", index), seconds: 6)
+            }
+        }
+        return main && images && videos
+    }
+
+    /// Writes one folder's media into a scratch folder and moves it into the vault in one step, so
+    /// the list never shows a half-written file. A folder that is already complete (the test's
+    /// second launch) is left as it is, so nothing changes under a file that is open.
+    private static func folder(_ name: String, files: [String], fill: (URL) throws -> Void) -> Bool {
+        let fm = FileManager.default
+        let target = Vault.root.appendingPathComponent(name, isDirectory: true)
+        if files.allSatisfy({ fm.fileExists(atPath: target.appendingPathComponent($0).path) }) { return true }
+        let scratch = fm.temporaryDirectory.appendingPathComponent("uitest-seed-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+            try fill(scratch)
             // Fixed dates, so the thumbnail and poster caches always see the same files.
             let base = Date(timeIntervalSince1970: 1_700_000_000)
-            for (offset, name) in ["a_portrait.png", "b_landscape.png", "c_portrait.mp4", "d_landscape.mp4"].enumerated() {
+            let names = try fm.contentsOfDirectory(atPath: scratch.path).sorted()
+            for (offset, file) in names.enumerated() {
                 try fm.setAttributes(
                     [.modificationDate: base.addingTimeInterval(TimeInterval(-offset * 60))],
-                    ofItemAtPath: scratch.appendingPathComponent(name).path
+                    ofItemAtPath: scratch.appendingPathComponent(file).path
                 )
             }
             try fm.createDirectory(at: Vault.root, withIntermediateDirectories: true)
@@ -55,7 +92,7 @@ enum UITestSeed {
             try fm.moveItem(at: scratch, to: target)
             return true
         } catch {
-            NSLog("UITestSeed failed: \(error)")
+            NSLog("UITestSeed failed for \(name): \(error)")
             try? fm.removeItem(at: scratch)
             return false
         }
@@ -109,16 +146,63 @@ enum UITestSeed {
         return data
     }
 
-    /// Twenty seconds at 10 fps, H.264, the frame number drawn on each frame. Long enough that a
-    /// video never ends in the middle of a test step.
-    private static func video(to url: URL, width: Int, height: Int, label: String) throws {
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+    /// A JPEG of the pattern, `width` x `height` as shown, stored a quarter turn anticlockwise
+    /// (`height` x `width` pixels) with EXIF orientation 6, as an iPhone stores a portrait photo.
+    private static func cameraJPEG(width: Int, height: Int, label: String) throws -> Data {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let stored = CGSize(width: height, height: width)
+        let image = UIGraphicsImageRenderer(size: stored, format: format).image { context in
+            context.cgContext.concatenate(sidewaysTransform(shownWidth: CGFloat(width)))
+            drawPattern(context.cgContext, width: width, height: height, label: label, frame: nil)
+        }
+        guard let cgImage = image.cgImage else { throw SeedError.writer }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil) else {
+            throw SeedError.writer
+        }
+        CGImageDestinationAddImage(destination, cgImage, [
+            kCGImagePropertyOrientation: 6,
+            kCGImageDestinationLossyCompressionQuality: 0.95,
+        ] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw SeedError.writer }
+        return data as Data
+    }
+
+    /// Draws the upright picture (top-left origin, `shownWidth` wide) into a frame stored a quarter
+    /// turn anticlockwise; turned a quarter turn clockwise (EXIF orientation 6, or the video track's
+    /// transform below) it is upright again.
+    private static func sidewaysTransform(shownWidth: CGFloat) -> CGAffineTransform {
+        CGAffineTransform(a: 0, b: -1, c: 1, d: 0, tx: 0, ty: shownWidth)
+    }
+
+    /// `seconds` at 10 fps, H.264, the frame number drawn on each frame; twenty seconds unless said
+    /// otherwise, long enough that a video never ends in the middle of a test step. `shownWidth` x
+    /// `shownHeight` is the picture as shown; `storedSideways` stores it a quarter turn
+    /// anticlockwise with a transform that turns it back, as an iPhone records a portrait video.
+    private static func video(
+        to url: URL,
+        width shownWidth: Int,
+        height shownHeight: Int,
+        label: String,
+        seconds: Int = 20,
+        storedSideways: Bool = false,
+        fileType: AVFileType = .mp4
+    ) throws {
+        let width = storedSideways ? shownHeight : shownWidth
+        let height = storedSideways ? shownWidth : shownHeight
+        let writer = try AVAssetWriter(outputURL: url, fileType: fileType)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
         ])
         input.expectsMediaDataInRealTime = false
+        if storedSideways {
+            // The iPhone camera's portrait transform: a quarter turn clockwise.
+            input.transform = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: CGFloat(height), ty: 0)
+        }
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: width,
@@ -130,7 +214,7 @@ enum UITestSeed {
         writer.startSession(atSourceTime: .zero)
         let fps: Int32 = 10
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
-        for index in 0..<(20 * Int(fps)) {
+        for index in 0..<(seconds * Int(fps)) {
             while !input.isReadyForMoreMediaData { Thread.sleep(forTimeInterval: 0.005) }
             guard let pool = adaptor.pixelBufferPool else { throw SeedError.writer }
             var made: CVPixelBuffer?
@@ -149,7 +233,8 @@ enum UITestSeed {
                 // Top-left origin, like the image renderer.
                 context.translateBy(x: 0, y: CGFloat(height))
                 context.scaleBy(x: 1, y: -1)
-                drawPattern(context, width: width, height: height, label: label, frame: index)
+                if storedSideways { context.concatenate(sidewaysTransform(shownWidth: CGFloat(shownWidth))) }
+                drawPattern(context, width: shownWidth, height: shownHeight, label: label, frame: index)
             }
             CVPixelBufferUnlockBaseAddress(buffer, [])
             guard adaptor.append(buffer, withPresentationTime: CMTime(value: CMTimeValue(index), timescale: fps)) else {

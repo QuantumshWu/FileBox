@@ -15,6 +15,13 @@ centre line, in points. Then:
 * steps: for each step of the test, the frames around it with the positions and their difference
   from a reference (detail for reading; the recording lags the test's clock by about a second,
   which is estimated from the sessions and taken off).
+* the folder underneath: while the viewer fades in or out, or a page is swiped away, the folder
+  shows through it. For every opening and closing step, how far the folder is from where it is
+  without the viewer (before the tap for an opening, after the close for a closing), in each frame:
+  the vertical shift that best lines up the frame's rows of brightness with the reference frame's
+  (normalised correlation, so the black fading over it does not matter). "band" uses the rows the
+  picture does not cover, "thumbs" the list's thumbnail column through the picture (only while the
+  picture is still faint). A frame counts when the match is clear.
 
 Usage:
   measure.py --frames DIR --times frame_times.txt --events events.txt --record-start start.txt \\
@@ -22,7 +29,8 @@ Usage:
   measure.py --from-csv measurements.csv --events ... --record-start ... --probe ... --out OUTDIR
 
 DIR holds f_000001.png, f_000002.png, ... in order (ffmpeg -fps_mode passthrough), frame_times.txt
-the presentation time of each frame (ffprobe frame=pts_time), events.txt lines of
+the presentation time of each frame (the video packets' pts, sorted: simctl's recordings repeat a
+pts now and then, and ffmpeg's own frame times then fall back to the dts), events.txt lines of
 "<unix time> <name>" from the test log, start.txt the unix time the recording started, and
 viewer-probe.log the app's layout log (App/Debug/ViewerProbe.swift; gives the screen scale and the
 viewer's open and close events).
@@ -85,6 +93,10 @@ def measure_frame(path):
     array = np.asarray(image)
     height, width, _ = array.shape
     result = {"file": os.path.basename(path), "w": width, "h": height}
+    luma = array.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    # Brightness of each row (whole width, and the list's thumbnail column), for the folder's position.
+    result["_rows"] = luma.mean(axis=1)
+    result["_thumbs"] = luma[:, int(width * 0.04):int(width * 0.15)].mean(axis=1)
     for fraction in COLUMNS + EDGE_COLUMNS:
         x = min(width - 2, max(1, int(round(width * fraction))))
         # Three neighbouring columns, so one compression artefact never decides alone.
@@ -204,6 +216,20 @@ def probe_info(path, start):
     return scale, height, events, sideways
 
 
+def probe_status_bar(path):
+    """The status bar's height (pt) when it shows upright, from the probe log."""
+    best = None
+    if not path or not os.path.exists(path):
+        return best
+    for line in load_lines(path):
+        match = re.search(r"sbH=([0-9.]+) \| win=\[[-0-9.]+,[-0-9.]+,([0-9.]+),([0-9.]+)\]", line)
+        if match and float(match.group(2)) < float(match.group(3)):
+            value = float(match.group(1))
+            if value > 0 and (best is None or value > best):
+                best = value
+    return best
+
+
 def step_kind(name):
     if name.startswith("open") or "-open-" in name:
         return "open"
@@ -270,6 +296,66 @@ def analyse_session(session, mid, args, swiped=False):
     return result, fly
 
 
+def to_points(profile, scale):
+    """A per-pixel-row profile averaged into rows of one point."""
+    k = max(1, int(round(scale)))
+    n = len(profile) // k
+    return profile[:n * k].reshape(n, k).mean(axis=1)
+
+
+def best_shift(frame, ref, mask, max_shift=40):
+    """The shift s (points; positive = the frame's content is lower) that best matches frame[y] with
+    ref[y - s] over the rows in mask, its normalised correlation, and the correlation at s = 0."""
+    n = len(frame)
+    ys = np.nonzero(mask)[0]
+    scores = {}
+    for shift in range(-max_shift, max_shift + 1):
+        y = ys[(ys - shift >= 0) & (ys - shift < n) & mask[np.clip(ys - shift, 0, n - 1)]]
+        if len(y) < 40:
+            continue
+        a = frame[y] - frame[y].mean()
+        b = ref[y - shift] - ref[y - shift].mean()
+        denom = np.sqrt((a * a).sum() * (b * b).sum())
+        if denom <= 1e-6:
+            continue
+        scores[shift] = float((a * b).sum() / denom)
+    if not scores:
+        return None, None, None
+    best = max(scores, key=scores.get)
+    peak = scores[best]
+    refined = float(best)
+    if best - 1 in scores and best + 1 in scores:
+        l, c, r = scores[best - 1], peak, scores[best + 1]
+        curve = l - 2 * c + r
+        if curve < 0:
+            refined = best + 0.5 * (l - r) / curve
+    return refined, peak, scores.get(0)
+
+
+def folder_shift(rows, index_of, ref_index, frame_index, scale, top_margin, bottom_margin, picture, kind):
+    """Shift of the folder in one frame against the reference frame (see the module notes)."""
+    ref_row, row = rows[index_of[ref_index]], rows[index_of[frame_index]]
+    key = "_rows_pt" if kind == "band" else "_thumbs_pt"
+    if row.get(key) is None or ref_row.get(key) is None:
+        return None
+    frame, ref = row[key], ref_row[key]
+    n = min(len(frame), len(ref))
+    frame, ref = frame[:n], ref[:n]
+    mask = np.zeros(n, dtype=bool)
+    mask[int(top_margin):max(int(top_margin), n - int(bottom_margin))] = True
+    if kind == "band":
+        extents = list(picture)
+        if row.get("seen", 0) >= 2 and row.get("top_pt") is not None and row.get("bot_pt") is not None:
+            extents.append((row["top_pt"], row["bot_pt"]))
+        for top, bot in extents:
+            mask[max(0, int(top - 8)):min(n, int(bot + 9))] = False
+    shift, peak, at_zero = best_shift(frame, ref, mask)
+    if shift is None:
+        return None
+    clear = peak >= (0.6 if kind == "band" else 0.75)
+    return {"shift": shift, "peak": peak, "zero": at_zero, "clear": clear, "rows": int(mask.sum())}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--frames", help="directory of f_000001.png ... frames")
@@ -285,6 +371,7 @@ def main():
     parser.add_argument("--opening", type=float, default=1.0, help="seconds after the first frame counted as opening")
     parser.add_argument("--closing", type=float, default=0.5, help="seconds before the last frame counted as closing")
     parser.add_argument("--tolerance", type=float, default=1.0, help="largest shift (pt) that is not a jump")
+    parser.add_argument("--folder-tolerance", type=float, default=1.5, help="largest shift (pt) of the folder that is not a move")
     parser.add_argument("--copy-frames", action="store_true", help="copy each step's frames (half size JPEG)")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     args = parser.parse_args()
@@ -292,11 +379,19 @@ def main():
 
     start = float(load_lines(args.record_start)[0]) if args.record_start else 0.0
     probe_scale, probe_height, probe_events, sideways = probe_info(args.probe, start)
+    status_bar = probe_status_bar(args.probe)
     scale = args.scale or probe_scale or 3.0
 
     if args.from_csv:
         rows = read_csv(args.from_csv)
         args.copy_frames = False
+        saved_path = os.path.join(os.path.dirname(os.path.abspath(args.from_csv)), "profiles.npz")
+        if os.path.exists(saved_path):
+            saved = np.load(saved_path)
+            if len(saved["rows"]) == len(rows):
+                for row, band, thumbs in zip(rows, saved["rows"], saved["thumbs"]):
+                    row["_rows_pt"] = band.astype(np.float32)
+                    row["_thumbs_pt"] = thumbs.astype(np.float32)
     else:
         frames = sorted(glob.glob(os.path.join(args.frames or ".", "f_*.png")))
         if not frames:
@@ -312,6 +407,14 @@ def main():
         for index, row in enumerate(rows):
             row["index"] = index + 1
             row["t"] = times[index] if index < len(times) else None
+            row["_rows_pt"] = to_points(row.pop("_rows"), scale)
+            row["_thumbs_pt"] = to_points(row.pop("_thumbs"), scale)
+        # Kept for --from-csv runs: one point per row is enough for the folder's position.
+        np.savez_compressed(
+            os.path.join(args.out, "profiles.npz"),
+            rows=np.array([row["_rows_pt"] for row in rows], dtype=np.float16),
+            thumbs=np.array([row["_thumbs_pt"] for row in rows], dtype=np.float16),
+        )
     for row in rows:
         top, bot, centre, green, estimate, seen = summary_values(row, scale)
         row.update({"top_pt": top, "bot_pt": bot, "centre_pt": centre, "green_pt": green, "estimate_pt": estimate,
@@ -430,9 +533,73 @@ def main():
         first = ("f" + str(shown[0]["index"])) if shown else "-"
         step_lines.append(f"  {name:32s} {kind:12s} {len(shown):6d} {first:>6s} {fmt(worst):>8s}  {verdict}")
     report += step_lines
+
+    # The folder underneath, while it can be seen through the viewer.
+    index_of = {row["index"]: k for k, row in enumerate(rows)}
+    have_profiles = any(row.get("_rows_pt") is not None for row in rows)
+    folder_lines = [
+        "",
+        "FOLDER UNDERNEATH (vertical shift of the folder against where it is without the viewer, in frames",
+        "where it shows clearly through the viewer; band = rows outside the picture, thumbs = the list's",
+        f"thumbnail column; a move is more than {args.folder_tolerance:.2f} pt)",
+        "  step                             kind          ref     clear  max|shift|  at      verdict",
+    ]
+    folder_detail = {}
+    any_move = False
+    if have_profiles and mid is not None:
+        top_margin = (status_bar or 20.0) + 2
+        bottom_margin = 100
+        for index, (t_begin, t_end, name) in enumerate(steps):
+            kind = step_kind(name)
+            if kind not in ("open", "close-button", "close-swipe"):
+                continue
+            next_begin = steps[index + 1][0] if index + 1 < len(steps) else t_end + 10
+            lo = t_begin - 0.05
+            hi = min(t_end + args.after + (t_end - t_begin), next_begin - 0.05)
+            window = [row for row in rows if row["t"] is not None and lo <= row["t"] <= hi and not row.get("sideways")]
+            if not window:
+                continue
+            if kind == "open":
+                before = [row for row in rows if row["t"] is not None and t_begin - 1.0 <= row["t"] < t_begin - 0.05]
+                ref = before[-1] if before else None
+            else:
+                ref = window[-1]
+            if ref is None or ref.get("sideways"):
+                continue
+            # Where the picture is once open (it is smaller while it grows in).
+            settled = [(row["top_pt"], row["bot_pt"]) for row in window
+                       if row.get("seen", 0) >= 2 and row.get("top_pt") is not None and row.get("bot_pt") is not None]
+            picture = [(min(t for t, _ in settled), max(b for _, b in settled))] if settled and kind == "open" else []
+            results = []
+            for row in window:
+                if row is ref:
+                    continue
+                band = folder_shift(rows, index_of, ref["index"], row["index"], scale, top_margin, bottom_margin, picture, "band")
+                thumbs = folder_shift(rows, index_of, ref["index"], row["index"], scale, top_margin, bottom_margin, picture, "thumbs")
+                pick = band if band and band["clear"] else (thumbs if thumbs and thumbs["clear"] else None)
+                results.append((row, band, thumbs, pick))
+            folder_detail[name] = {r[0]["index"]: r for r in results}
+            clear = [r for r in results if r[3] is not None]
+            worst = max(clear, key=lambda r: abs(r[3]["shift"]), default=None)
+            if worst is None:
+                verdict = "folder not seen"
+                cell = "-"
+                at = "-"
+            else:
+                moved = abs(worst[3]["shift"]) > args.folder_tolerance
+                any_move = any_move or moved
+                verdict = "MOVES" if moved else "OK"
+                cell = f"{worst[3]['shift']:+.2f}"
+                at = f"f{worst[0]['index']}"
+            folder_lines.append(f"  {name:32s} {kind:12s} f{ref['index']:<6d} {len(clear):5d}  {cell:>10s}  {at:7s} {verdict}")
+    else:
+        folder_lines.append("  (no frame profiles)")
+    folder_lines.append(f"  FOLDER OVERALL: {'MOVES' if any_move else 'never moves while it shows'}")
+    report += folder_lines
+
     report.append("")
     report.append("STEPS (test steps moved by the lag above; positions in points from the top of the screen;")
-    report.append("dC / dG = centre / green line minus the screen centre)")
+    report.append("dC / dG = centre / green line minus the screen centre; folder = the folder's shift, see above)")
     for index, (t_begin, t_end, name) in enumerate(steps):
         kind = step_kind(name)
         next_begin = steps[index + 1][0] if index + 1 < len(steps) else t_end + 10
@@ -444,15 +611,21 @@ def main():
         if not window:
             report.append("  no frames")
             continue
-        report.append("  frame      t(s)  seen     top     bot  centre   green |     dC     dG  dEstimate")
+        report.append("  frame      t(s)  seen     top     bot  centre   green |     dC     dG  dEstimate | folder band (corr)  thumbs (corr)")
+        detail = folder_detail.get(name, {})
         for row in window:
             dc = None if row["centre_pt"] is None or mid is None else row["centre_pt"] - mid
             dg = None if row["green_pt"] is None or mid is None else row["green_pt"] - mid
             de = None if row.get("estimate_pt") is None or mid is None else row["estimate_pt"] - mid
+            folder = ""
+            if row["index"] in detail:
+                _, band, thumbs, _ = detail[row["index"]]
+                show = lambda m: "-" if m is None else f"{m['shift']:+6.2f} ({m['peak']:.2f}){'' if m['clear'] else '?'}"
+                folder = f" | {show(band):>18s} {show(thumbs):>18s}"
             report.append(
-                "  %6d %8.3f %5d %7s %7s %7s %7s | %6s %6s %6s" % (
+                "  %6d %8.3f %5d %7s %7s %7s %7s | %6s %6s %6s%s" % (
                     row["index"], row["t"], row["seen"], fmt(row["top_pt"]), fmt(row["bot_pt"]),
-                    fmt(row["centre_pt"]), fmt(row["green_pt"]), fmt(dc), fmt(dg), fmt(de),
+                    fmt(row["centre_pt"]), fmt(row["green_pt"]), fmt(dc), fmt(dg), fmt(de), folder,
                 )
             )
         if args.copy_frames:
@@ -472,7 +645,7 @@ def main():
 
     with open(os.path.join(args.out, "report.txt"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(report) + "\n")
-    print("\n".join(verdict_lines + step_lines))
+    print("\n".join(verdict_lines + step_lines + folder_lines))
     return 0
 
 
