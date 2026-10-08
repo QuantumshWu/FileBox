@@ -138,9 +138,12 @@ struct MediaViewer: View {
         TabView(selection: $selection) {
             ForEach(items) { item in
                 page(for: item)
-                    // There is no safe area in there; should one ever get through, it is ignored.
-                    .ignoresSafeArea()
                     .padding(.horizontal, Self.pageGap / 2)
+                    // Each page has all of its cell but the gap. UIKit still hands the cells the
+                    // screen's safe area (held sideways, its sides too, now that the pager's scroll
+                    // view no longer sets itself in from them); a page laid out inside it would be
+                    // narrower than the screen.
+                    .ignoresSafeArea()
                     .tag(tags[item.url] ?? 0)
             }
         }
