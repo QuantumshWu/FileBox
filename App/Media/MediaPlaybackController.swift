@@ -219,7 +219,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     func leavePlayablePage() {
         endBoost()
         guard !isPictureInPictureActive, !isPictureInPictureStarting else { return }
-        saveResumePosition()
+        saveResumePosition(preparesPoster: true)
         let waitedToPlay = awaitsResume && resumeAutoplay
         if player.timeControlStatus != .paused || waitedToPlay {
             resumeOnReturn = true
@@ -381,7 +381,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
 
     /// Stops playback and forgets the folder.
     func stop() {
-        saveResumePosition()
+        saveResumePosition(preparesPoster: true)
         resumeOnReturn = false
         endBoost()
         pauseForUs()
@@ -611,7 +611,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     private func load(_ index: Int, autoplay: Bool) {
         let file = sessionItems[index]
         // Where the outgoing file stands, before it leaves the player.
-        saveResumePosition()
+        saveResumePosition(preparesPoster: true)
         if !MediaViewerHub.shared.activateAudioSession(for: .video) {
             MediaViewerHub.shared.show("声音暂时无法播放")
         }
@@ -900,8 +900,9 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     // MARK: - Resume position
 
     /// Remembers where the file in the player stands: for this session (paging back continues
-    /// there) and, with 设置 → 记住播放位置 on, across launches.
-    private func saveResumePosition() {
+    /// there) and, with 设置 → 记住播放位置 on, across launches. When the file is being left,
+    /// `preparesPoster` reads that frame ahead, so coming back to it shows it at once.
+    private func saveResumePosition(preparesPoster: Bool = false) {
         guard let item = player.currentItem, item.status == .readyToPlay, !awaitsResume,
               let index = currentIndex, sessionItems.indices.contains(index)
         else { return }
@@ -912,6 +913,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         guard duration > 0, seconds.isFinite else { return }
         if PlayerResumeStore.isEligible(seconds: seconds, duration: duration) {
             sessionPositions[file.url] = seconds
+            if preparesPoster { ViewerPosterCache.prepare(file, at: seconds) }
         } else {
             sessionPositions[file.url] = nil
         }
@@ -920,6 +922,13 @@ final class MediaPlaybackController: NSObject, ObservableObject {
 
     private func resumePosition(for file: FileItem) -> Double? {
         sessionPositions[file.url] ?? PlayerResumeStore.shared.position(for: file)
+    }
+
+    /// Where playback of `file` starts when the viewer comes to it: the saved position when it
+    /// continues there, else nil (its first frame). The viewer's still picture of a video is that
+    /// frame, so the player never shows another one first.
+    func startPosition(for file: FileItem) -> Double? {
+        resumePosition(for: file)
     }
 
     /// The seek to the saved position landed (`seconds`), or was given up (nil).

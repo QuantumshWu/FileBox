@@ -19,6 +19,8 @@ final class PlayerResumeStore {
     }
 
     private var entries: [String: Entry]?
+    /// `key(for:)` per file path and size: the viewer asks for positions while it draws.
+    private var keys: [String: String] = [:]
     private var writeToken = UUID()
     private var hasUnsavedChanges = false
     private let queue = DispatchQueue(label: "FileBox.PlayerResumeStore", qos: .utility)
@@ -53,7 +55,9 @@ final class PlayerResumeStore {
         let itemKey = key(for: item)
         var all = load()
         if Self.isEligible(seconds: seconds, duration: duration) {
-            if let old = all[itemKey], abs(old.seconds - seconds) < 0.5 { return }
+            // Exactly where it was left, even just after the last save while playing: coming
+            // back shows that very frame (the viewer has read it ahead) and continues from it.
+            if let old = all[itemKey], old.seconds == seconds { return }
             all[itemKey] = Entry(seconds: seconds, duration: duration, date: Date())
             if all.count > Self.capacity {
                 let oldest = all.sorted { $0.value.date > $1.value.date }.dropFirst(Self.capacity).map(\.key)
@@ -120,7 +124,16 @@ final class PlayerResumeStore {
 
     /// The file's path inside the vault and its size, hashed.
     private func key(for item: FileItem) -> String {
-        var path = Self.normalizedPath(item.url)
+        let known = "\(item.url.path)|\(item.size)"
+        if let key = keys[known] { return key }
+        if keys.count > 2000 { keys.removeAll() }
+        let key = Self.hashedKey(for: item, root: rootPath)
+        keys[known] = key
+        return key
+    }
+
+    private static func hashedKey(for item: FileItem, root rootPath: String) -> String {
+        var path = normalizedPath(item.url)
         if path.hasPrefix(rootPath + "/") { path.removeFirst(rootPath.count) }
         let digest = SHA256.hash(data: Data("\(path)|\(item.size)".utf8))
         return digest.map { String(format: "%02x", $0) }.joined()

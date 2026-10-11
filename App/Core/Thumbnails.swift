@@ -6,7 +6,7 @@ import SwiftUI
 import UIKit
 
 /// Cached thumbnails. Photos are decoded directly with ImageIO (Quick Look's thumbnailer gives up on
-/// some JPEGs and returns only a file icon); videos show their first frame (`VideoFirstFrame`), the
+/// some JPEGs and returns only a file icon); videos show their first frame (`VideoFrameReader`), the
 /// one the viewer opens on, not Quick Look's own choice of frame; anything else gets Quick Look's
 /// thumbnail or file-type icon.
 ///
@@ -180,9 +180,9 @@ enum Thumbnails {
         }
     }
 
-    /// The first frame (see `VideoFirstFrame`), inside a square of `maxPixel` pixels.
+    /// The first frame (see `VideoFrameReader`), inside a square of `maxPixel` pixels.
     private static func videoFrame(of url: URL, maxPixel: CGFloat, job: VaultThumbJob, completion: @escaping (UIImage?) -> Void) {
-        let reader = VideoFirstFrame(asset: AVURLAsset(url: url), maximumSize: CGSize(width: maxPixel, height: maxPixel))
+        let reader = VideoFrameReader(asset: AVURLAsset(url: url), maximumSize: CGSize(width: maxPixel, height: maxPixel))
         // Before the work starts, so a cancel never goes to an earlier step's handler instead.
         job.onCancel { reader.cancel() }
         if job.isCancelled { return completion(nil) }

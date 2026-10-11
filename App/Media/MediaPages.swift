@@ -77,9 +77,10 @@ struct MediaImagePage: View {
 }
 
 /// One video or audio file. Only the page of the file in the player hosts the shared player view;
-/// the others show the first frame (or the audio layout) until the viewer moves to them. On the
-/// video, a double tap on the left or right skips back or forward, in the middle plays or pauses,
-/// and pressing and holding plays at 2×.
+/// the others show the frame playback will start on (or the audio layout) until the viewer moves
+/// to them: the first frame, or the saved position when the video continues where it was left.
+/// On the video, a double tap on the left or right skips back or forward, in the middle plays or
+/// pauses, and pressing and holding plays at 2×.
 struct MediaPlayablePage: View {
     let item: FileItem
     let transition: ViewerTransition
@@ -94,6 +95,8 @@ struct MediaPlayablePage: View {
     @AppStorage(ViewerSkipStep.storageKey) private var storedStep = ViewerSkipStep.defaultSeconds
     @State private var isPlayable: Bool?
     @State private var poster: UIImage?
+    /// Where `poster` was read: nil for the first frame.
+    @State private var posterTime: Double?
     @State private var drag = ViewerDrag()
     /// The player has shown this file's first frame since it became the playing one, so the poster
     /// never comes back over it (PiP returning, the app coming back).
@@ -105,11 +108,32 @@ struct MediaPlayablePage: View {
 
     private var isCurrent: Bool { playback.currentURL == item.url }
 
-    private var shownPoster: UIImage? {
-        poster ?? ViewerPosterCache.cached(for: item) ?? Thumbnails.cachedPlaceholder(for: item)
+    /// Where playback of this video starts: the saved position when it continues there, else nil
+    /// (the first frame).
+    private var startTime: Double? {
+        item.kind == .video ? playback.startPosition(for: item) : nil
     }
 
-    /// The first frame covers the player until the player has a picture of its own.
+    /// The frame playback starts on. The folder's thumbnail is the first frame, so it stands in
+    /// only for a video that starts from the beginning.
+    private var shownPoster: UIImage? {
+        let start = startTime
+        if let poster, posterTime == start { return poster }
+        if let cached = ViewerPosterCache.cached(for: item, at: start) { return cached }
+        return start == nil ? Thumbnails.cachedPlaceholder(for: item) : nil
+    }
+
+    /// Black where the video will be, while the frame it continues from is still being read: the
+    /// first frame must not show before it, neither as a picture nor from the player, which has
+    /// frame 0 up before it reaches the saved position.
+    private var blackout: some View {
+        let frame = ViewerPosterCache.cached(for: item) ?? Thumbnails.cachedPlaceholder(for: item)
+        return Color.black
+            .aspectRatio(frame.map { $0.size } ?? CGSize(width: 16, height: 9), contentMode: .fit)
+    }
+
+    /// The picture of where playback starts covers the player until the player has a picture of
+    /// its own.
     private var showsPoster: Bool {
         item.kind == .video && !revealed && playback.displayReadyURL != item.url
             && !playback.isPictureInPictureEngaged
@@ -158,11 +182,16 @@ struct MediaPlayablePage: View {
                 onDismissEvent: dismissEvent
             )
             ZStack {
-                if showsPoster, let poster = shownPoster {
-                    Image(uiImage: poster)
-                        .resizable()
-                        .scaledToFit()
-                        .transition(.opacity)
+                if showsPoster {
+                    if let poster = shownPoster {
+                        Image(uiImage: poster)
+                            .resizable()
+                            .scaledToFit()
+                            .transition(.opacity)
+                    } else if startTime != nil {
+                        blackout
+                            .transition(.opacity)
+                    }
                 }
             }
             .animation(.easeOut(duration: 0.15), value: showsPoster)
@@ -189,6 +218,8 @@ struct MediaPlayablePage: View {
             Image(uiImage: poster)
                 .resizable()
                 .scaledToFit()
+        } else if startTime != nil {
+            blackout
         } else {
             Image(systemName: "film")
                 .font(.system(size: 56))
@@ -217,23 +248,25 @@ struct MediaPlayablePage: View {
 
     private func load() async {
         let asset = PlayerAssetCache.asset(for: item)
+        let start = startTime
         async let playable = Self.loadPlayable(asset)
-        async let frame = posterFrame()
+        async let frame = posterFrame(at: start)
         let isOK = await playable
         guard !Task.isCancelled else { return }
         isPlayable = isOK
         let image = await frame
         guard !Task.isCancelled, isOK, let image else { return }
         poster = image
+        posterTime = start
     }
 
     private static func loadPlayable(_ asset: AVURLAsset) async -> Bool {
         (try? await asset.load(.isPlayable)) ?? false
     }
 
-    private func posterFrame() async -> UIImage? {
+    private func posterFrame(at start: Double?) async -> UIImage? {
         guard item.kind == .video else { return nil }
-        return await ViewerPosterCache.poster(for: item)
+        return await ViewerPosterCache.poster(for: item, at: start)
     }
 
     private func dismissEvent(_ event: ViewerDismissEvent) {
