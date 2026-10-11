@@ -23,6 +23,8 @@ final class VideoFirstFrame: @unchecked Sendable {
     /// Calls `completion` exactly once, on any thread; nil when there is no frame or after `cancel`.
     /// The reader stays alive until then.
     func start(_ completion: @escaping (CGImage?) -> Void) {
+        // Already given up on (a page swiped past at once): nothing is decoded.
+        if isCancelled { return completion(nil) }
         exact.generateCGImageAsynchronously(for: .zero) { image, _, _ in
             if let image { return completion(image) }
             if self.isCancelled { return completion(nil) }
