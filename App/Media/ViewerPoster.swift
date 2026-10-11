@@ -15,16 +15,17 @@ enum ViewerPosterCache {
         cache.object(forKey: key(for: item))
     }
 
-    /// The frame at 0 s (the one playback starts on), upright, at most the screen's pixel size.
+    /// The first frame (see `VideoFirstFrame`, the same as the folder's thumbnail), upright, at
+    /// most the screen's pixel size.
     static func poster(for item: FileItem) async -> UIImage? {
         if let hit = cached(for: item) { return hit }
-        let generator = AVAssetImageGenerator(asset: PlayerAssetCache.asset(for: item))
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = screenPixelSize
+        let reader = VideoFirstFrame(asset: PlayerAssetCache.asset(for: item), maximumSize: screenPixelSize)
         let frame: CGImage? = await withTaskCancellationHandler {
-            try? await generator.image(at: .zero).image
+            await withCheckedContinuation { continuation in
+                reader.start { continuation.resume(returning: $0) }
+            }
         } onCancel: {
-            generator.cancelAllCGImageGeneration()
+            reader.cancel()
         }
         guard let frame, !Task.isCancelled else { return nil }
         let image = UIImage(cgImage: frame)

@@ -6,9 +6,9 @@ import SwiftUI
 import UIKit
 
 /// Cached thumbnails. Photos are decoded directly with ImageIO (Quick Look's thumbnailer gives up on
-/// some JPEGs and returns only a file icon); videos show their first frame, read with AVFoundation,
-/// the same frame the viewer opens on (Quick Look's choice of frame is its own); anything else gets
-/// Quick Look's thumbnail or file-type icon.
+/// some JPEGs and returns only a file icon); videos show their first frame (`VideoFirstFrame`), the
+/// one the viewer opens on, not Quick Look's own choice of frame; anything else gets Quick Look's
+/// thumbnail or file-type icon.
 ///
 /// Thumbnails come in a few pixel sizes ("buckets", measured on the short side), so list rows,
 /// every grid size and previews share them and a pinch does not decode anything again. They stay in
@@ -172,24 +172,21 @@ enum Thumbnails {
             scale: scale,
             representationTypes: types
         )
+        // Before the work starts, so a cancel never goes to an earlier step's handler instead.
+        job.onCancel { QLThumbnailGenerator.shared.cancel(request) }
+        if job.isCancelled { return completion(nil, nil) }
         QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
             completion(representation?.uiImage, representation?.type)
         }
-        job.onCancel { QLThumbnailGenerator.shared.cancel(request) }
     }
 
-    /// The first frame, the one the viewer opens on and playback starts from (see
-    /// `ViewerPosterCache`), inside a square of `maxPixel` pixels.
+    /// The first frame (see `VideoFirstFrame`), inside a square of `maxPixel` pixels.
     private static func videoFrame(of url: URL, maxPixel: CGFloat, job: VaultThumbJob, completion: @escaping (UIImage?) -> Void) {
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: maxPixel, height: maxPixel)
-        generator.generateCGImageAsynchronously(for: .zero) { image, _, _ in
-            // Keeps the generator alive until it is done.
-            withExtendedLifetime(generator) {}
-            completion(image.map { UIImage(cgImage: $0) })
-        }
-        job.onCancel { generator.cancelAllCGImageGeneration() }
+        let reader = VideoFirstFrame(asset: AVURLAsset(url: url), maximumSize: CGSize(width: maxPixel, height: maxPixel))
+        // Before the work starts, so a cancel never goes to an earlier step's handler instead.
+        job.onCancel { reader.cancel() }
+        if job.isCancelled { return completion(nil) }
+        reader.start { image in completion(image.map { UIImage(cgImage: $0) }) }
     }
 }
 
