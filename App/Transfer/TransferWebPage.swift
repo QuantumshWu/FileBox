@@ -244,12 +244,19 @@ function requestThumb(box) {
   pumpThumbs();
 }
 
+function nearView(box) {
+  const rect = box.getBoundingClientRect();
+  return rect.bottom > -400 && rect.top < innerHeight + 400;
+}
+
 function pumpThumbs() {
   while (thumbRunning < THUMB_PARALLEL && thumbJobs.length) {
     const job = thumbJobs.pop();
-    // Scrolled away or left the folder: fetched again if it comes back.
-    if (!(waiting.get(job.key) || []).some(box => box.isConnected)) {
+    // Left the folder, or scrolled far away while waiting: fetched when it comes back into view.
+    const boxes = (waiting.get(job.key) || []).filter(box => box.isConnected);
+    if (!boxes.length || (watcher && !boxes.some(nearView))) {
       waiting.delete(job.key);
+      if (watcher) for (const box of boxes) watcher.observe(box);
       continue;
     }
     thumbRunning++;

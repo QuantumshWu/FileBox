@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import Network
 import UIKit
 
@@ -288,6 +289,8 @@ private final class TransferConnection: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var upload: Upload?
     private var download: Download?
+    /// Making the thumbnail this connection asked for; stopped when the connection closes.
+    private var thumbnailTask: Task<Void, Never>?
 
     init(_ connection: NWConnection, context: Context) {
         self.connection = connection
@@ -342,6 +345,8 @@ private final class TransferConnection: @unchecked Sendable {
         isClosed = true
         timer?.cancel()
         timer = nil
+        thumbnailTask?.cancel()
+        thumbnailTask = nil
         if let upload {
             self.upload = nil
             try? upload.handle.close()
@@ -677,19 +682,23 @@ private final class TransferConnection: @unchecked Sendable {
     /// file is: `?size=256` for list rows, `512` for the grid. The same thumbnails as in the app
     /// (a video's first frame). Never cached by the browser: the page keeps them in memory only.
     private func serveThumbnail(_ components: [String], request: TransferRequest) {
-        guard !components.isEmpty, let url = resolve(components) else {
+        guard !components.isEmpty, let url = resolve(components),
+              (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
+        else {
             respondError(404, "文件不存在，可能已经被删除")
             return
         }
         let item = FileItem(url: url)
-        guard !item.isDirectory, item.kind == .image || item.kind == .video else {
+        guard item.kind == .image || item.kind == .video else {
             respondError(404, "这个文件没有预览")
             return
         }
         let pixels: CGFloat = request.query["size"] == "512" ? 512 : 256
-        Task.detached(priority: .userInitiated) { [self] in
+        thumbnailTask = Task.detached(priority: .userInitiated) { [self] in
             let image = await Thumbnails.realImage(for: item, pixels: pixels)
-            let encoded = image.flatMap { Self.encodeThumbnail($0, isVideo: item.kind == .video) }
+            let encoded = Task.isCancelled ? nil : image.flatMap {
+                Self.encodeThumbnail($0, of: item, pixels: pixels)
+            }
             queue.async {
                 guard !self.isClosed else { return }
                 guard let encoded else {
@@ -701,11 +710,35 @@ private final class TransferConnection: @unchecked Sendable {
         }
     }
 
-    private static func encodeThumbnail(_ image: UIImage, isVideo: Bool) -> (data: Data, type: String)? {
-        let alpha = image.cgImage?.alphaInfo ?? CGImageAlphaInfo.none
-        let opaque = isVideo || alpha == CGImageAlphaInfo.none || alpha == .noneSkipFirst || alpha == .noneSkipLast
-        if opaque, let data = image.jpegData(compressionQuality: 0.8) { return (data, "image/jpeg") }
-        return image.pngData().map { ($0, "image/png") }
+    /// JPEG, or PNG for a picture whose file has transparency. A panorama's long side is brought
+    /// down to twice the size asked for.
+    private static func encodeThumbnail(_ image: UIImage, of item: FileItem, pixels: CGFloat) -> (data: Data, type: String)? {
+        let transparent = item.kind == .image && hasAlpha(item.url)
+        var picture = image
+        let long = max(image.size.width * image.scale, image.size.height * image.scale)
+        if long > pixels * 2 {
+            let factor = pixels * 2 / long
+            let size = CGSize(
+                width: (image.size.width * image.scale * factor).rounded(),
+                height: (image.size.height * image.scale * factor).rounded()
+            )
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.opaque = !transparent
+            picture = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+                image.draw(in: CGRect(origin: .zero, size: size))
+            }
+        }
+        if !transparent, let data = picture.jpegData(compressionQuality: 0.8) { return (data, "image/jpeg") }
+        return picture.pngData().map { ($0, "image/png") }
+    }
+
+    /// Whether the image file says it has an alpha channel (read from its header only).
+    private static func hasAlpha(_ url: URL) -> Bool {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        else { return false }
+        return (properties[kCGImagePropertyHasAlpha] as? Bool) ?? false
     }
 
     /// Streams the file in 1 MB chunks with at most `downloadDepth` of them queued on the network:

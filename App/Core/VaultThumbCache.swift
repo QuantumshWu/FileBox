@@ -92,11 +92,16 @@ final class VaultThumbCache: @unchecked Sendable {
         }
     }
 
-    /// Whether the thumbnail under `key` is a real picture (not a file-type icon); nil if none.
-    func isReal(forKey key: String) -> Bool? {
+    /// The thumbnail stored under `key` with whether it is a real picture, which then counts as
+    /// just used.
+    func result(forKey key: String) -> VaultThumbResult? {
         lock.lock()
         defer { lock.unlock() }
-        return entries[key]?.isReal
+        guard var entry = entries[key] else { return nil }
+        clock += 1
+        entry.lastUse = clock
+        entries[key] = entry
+        return VaultThumbResult(image: entry.image, isReal: entry.isReal)
     }
 
     func hasFailed(_ key: String) -> Bool {

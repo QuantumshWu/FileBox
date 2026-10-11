@@ -33,17 +33,22 @@ enum Thumbnails {
     }
 
     static func image(for item: FileItem, side: CGFloat = 44, scale: CGFloat) async -> UIImage? {
+        await thumbnail(for: item, side: side, scale: scale)?.image
+    }
+
+    /// The thumbnail with whether it is a real picture, from memory or made now.
+    private static func thumbnail(for item: FileItem, side: CGFloat, scale: CGFloat) async -> VaultThumbResult? {
         let size = bucket(side: side, scale: scale)
         let file = fileKey(item)
         let cacheKey = key(file, size)
-        if let hit = cache.image(forKey: cacheKey) { return hit }
+        if let hit = cache.result(forKey: cacheKey) { return hit }
         if cache.hasFailed(cacheKey) { return nil }
         let result = await scheduler.run { job in
             Thumbnails.make(item, bucket: size, scale: scale, job: job)
         }
         if let result {
             cache.insert(result, forKey: cacheKey, file: file, bucket: size)
-            return result.image
+            return result
         }
         // A cancelled request says nothing about the file.
         if !Task.isCancelled { cache.markFailed(cacheKey) }
@@ -54,10 +59,9 @@ enum Thumbnails {
     /// made and cached like the folder's thumbnails. The Wi-Fi transfer page shows these.
     static func realImage(for item: FileItem, pixels: CGFloat) async -> UIImage? {
         guard item.kind == .image || item.kind == .video,
-              let image = await image(for: item, side: pixels, scale: 1),
-              cache.isReal(forKey: key(for: item, side: pixels, scale: 1)) == true
+              let result = await thumbnail(for: item, side: pixels, scale: 1), result.isReal
         else { return nil }
-        return image
+        return result.image
     }
 
     /// The thumbnail for this size if it is in memory, else another size of the same file version,
