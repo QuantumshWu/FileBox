@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import UIKit
 
 /// What the transfer server reports to the screen. Delivered on the main queue.
 enum TransferServerEvent {
@@ -221,6 +222,8 @@ private final class TransferConnection: @unchecked Sendable {
             let size: Int64
             /// Milliseconds since 1970, as JavaScript dates use.
             let mtime: Int64
+            /// "image" or "video" when `/thumb/` has a picture of it; absent otherwise.
+            let media: String?
         }
 
         let path: String
@@ -429,6 +432,8 @@ private final class TransferConnection: @unchecked Sendable {
             list(request)
         case ("GET", "file"), ("HEAD", "file"):
             serveFile(Array(route.dropFirst()), request: request, headOnly: headOnly)
+        case ("GET", "thumb"):
+            serveThumbnail(Array(route.dropFirst()), request: request)
         case ("PUT", "upload"), ("POST", "upload"):
             beginUpload(request, body: body)
         case ("POST", "mkdir"):
@@ -550,11 +555,14 @@ private final class TransferConnection: @unchecked Sendable {
         let items = urls.map { url -> Listing.Entry in
             let values = try? url.resourceValues(forKeys: Set(keys))
             let modified = values?.contentModificationDate ?? Date(timeIntervalSince1970: 0)
+            let isDirectory = values?.isDirectory ?? false
+            let kind = FileItem(url: url, name: url.lastPathComponent, isDirectory: isDirectory, size: 0, modified: modified).kind
             return Listing.Entry(
                 name: url.lastPathComponent,
-                dir: values?.isDirectory ?? false,
+                dir: isDirectory,
                 size: Int64(values?.fileSize ?? 0),
-                mtime: Int64(modified.timeIntervalSince1970 * 1000)
+                mtime: Int64(modified.timeIntervalSince1970 * 1000),
+                media: kind == .image ? "image" : kind == .video ? "video" : nil
             )
         }
         respondJSON(200, Listing(path: relativePath(of: folder), free: freeSpace(), items: items))
@@ -663,6 +671,41 @@ private final class TransferConnection: @unchecked Sendable {
             context.emit(.transferStarted(id: id, name: name, isUpload: false, total: length))
         }
         send(head) { [weak self] in self?.sendChunks() }
+    }
+
+    /// A small JPEG (PNG when it has transparency) of a photo or video, so the page shows what each
+    /// file is: `?size=256` for list rows, `512` for the grid. The same thumbnails as in the app
+    /// (a video's first frame). Never cached by the browser: the page keeps them in memory only.
+    private func serveThumbnail(_ components: [String], request: TransferRequest) {
+        guard !components.isEmpty, let url = resolve(components) else {
+            respondError(404, "文件不存在，可能已经被删除")
+            return
+        }
+        let item = FileItem(url: url)
+        guard !item.isDirectory, item.kind == .image || item.kind == .video else {
+            respondError(404, "这个文件没有预览")
+            return
+        }
+        let pixels: CGFloat = request.query["size"] == "512" ? 512 : 256
+        Task.detached(priority: .userInitiated) { [self] in
+            let image = await Thumbnails.realImage(for: item, pixels: pixels)
+            let encoded = image.flatMap { Self.encodeThumbnail($0, isVideo: item.kind == .video) }
+            queue.async {
+                guard !self.isClosed else { return }
+                guard let encoded else {
+                    self.respondError(404, "这个文件没有预览")
+                    return
+                }
+                self.respond(200, type: encoded.type, body: encoded.data, headers: [("Cache-Control", "no-store")])
+            }
+        }
+    }
+
+    private static func encodeThumbnail(_ image: UIImage, isVideo: Bool) -> (data: Data, type: String)? {
+        let alpha = image.cgImage?.alphaInfo ?? CGImageAlphaInfo.none
+        let opaque = isVideo || alpha == CGImageAlphaInfo.none || alpha == .noneSkipFirst || alpha == .noneSkipLast
+        if opaque, let data = image.jpegData(compressionQuality: 0.8) { return (data, "image/jpeg") }
+        return image.pngData().map { ($0, "image/png") }
     }
 
     /// Streams the file in 1 MB chunks with at most `downloadDepth` of them queued on the network:

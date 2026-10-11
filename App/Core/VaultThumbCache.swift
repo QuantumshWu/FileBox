@@ -92,6 +92,13 @@ final class VaultThumbCache: @unchecked Sendable {
         }
     }
 
+    /// Whether the thumbnail under `key` is a real picture (not a file-type icon); nil if none.
+    func isReal(forKey key: String) -> Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries[key]?.isReal
+    }
+
     func hasFailed(_ key: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }

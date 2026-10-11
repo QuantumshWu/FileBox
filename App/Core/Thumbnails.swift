@@ -50,6 +50,16 @@ enum Thumbnails {
         return nil
     }
 
+    /// A real picture of a photo or video (never a file-type icon) inside a square of `pixels`,
+    /// made and cached like the folder's thumbnails. The Wi-Fi transfer page shows these.
+    static func realImage(for item: FileItem, pixels: CGFloat) async -> UIImage? {
+        guard item.kind == .image || item.kind == .video,
+              let image = await image(for: item, side: pixels, scale: 1),
+              cache.isReal(forKey: key(for: item, side: pixels, scale: 1)) == true
+        else { return nil }
+        return image
+    }
+
     /// The thumbnail for this size if it is in memory, else another size of the same file version,
     /// else nil. Instant, so the first frame of a cell can already show it.
     static func cached(for item: FileItem, side: CGFloat, scale: CGFloat) -> UIImage? {

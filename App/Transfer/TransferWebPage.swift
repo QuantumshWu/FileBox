@@ -2,13 +2,14 @@ import Foundation
 
 /// The self-contained pages (inline CSS and JS) that a computer's browser loads from `/`. An
 /// allowed browser gets the file page, which uses `/api/list?dir=`, `/file/<path>[?dl=1]`,
-/// `PUT /upload?dir=&name=[&sub=]` and `POST /mkdir?dir=&name=`. Any other browser gets the waiting
+/// `/thumb/<path>?size=256|512` (photos and videos), `PUT /upload?dir=&name=[&sub=]` and
+/// `POST /mkdir?dir=&name=`. Any other browser gets the waiting
 /// page, which polls `/api/access` (`POST` asks again after a denial) until the phone answers.
 enum TransferWebPage {
     static let data = Data(html.utf8)
     static let waitingData = Data(waitingHTML.utf8)
 
-    static let contentSecurityPolicy = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    static let contentSecurityPolicy = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
     private static let html = #"""
 <!doctype html>
@@ -55,7 +56,19 @@ th.sorted.asc::after{content:" ▴"}
 td.name{white-space:normal;word-break:break-all;width:100%}
 td.name a{color:inherit;text-decoration:none}
 td.name a:hover{color:var(--accent);text-decoration:underline}
-.icon{display:inline-block;width:1.7em}
+.namecell{display:flex;align-items:center;gap:12px}
+.thumb{position:relative;flex:none;display:flex;align-items:center;justify-content:center;width:52px;height:52px;border-radius:8px;background:var(--hover);overflow:hidden;font-size:24px;line-height:1;color:inherit;text-decoration:none}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb.video.has::after{content:"\25B6";position:absolute;right:5px;bottom:4px;font-size:11px;color:#fff;text-shadow:0 0 3px rgba(0,0,0,.9)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px;padding:14px}
+.tile{display:flex;flex-direction:column;gap:6px;min-width:0}
+.tile .thumb{width:100%;height:auto;aspect-ratio:1;border-radius:10px;font-size:48px}
+.tile .thumb.video.has::after{font-size:14px;right:8px;bottom:6px}
+.tname{font-size:13px;line-height:1.35;word-break:break-all;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;color:inherit;text-decoration:none}
+a.tname:hover{color:var(--accent)}
+.tmeta{display:flex;gap:8px;justify-content:space-between;font-size:12px;color:var(--muted)}
+.tmeta a{color:var(--accent);text-decoration:none}
+select{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;padding:6px 8px}
 td.size,td.date{color:var(--muted);font-size:13px}
 td.act a{color:var(--accent);text-decoration:none}
 td.act a:hover{text-decoration:underline}
@@ -89,6 +102,13 @@ footer{color:var(--muted);font-size:12px;text-align:center;padding:0 16px 24px}
 <button id="folderBtn">上传文件夹</button>
 <button id="mkdirBtn">新建文件夹</button>
 <button id="refreshBtn">刷新</button>
+<button id="viewBtn">大图</button>
+<select id="sortSel" title="排序" hidden>
+<option value="date-desc">按修改时间（新的在前）</option>
+<option value="date-asc">按修改时间（旧的在前）</option>
+<option value="name-asc">按名称</option>
+<option value="size-desc">按大小（大的在前）</option>
+</select>
 </div>
 <p class="hint">也可以把文件或文件夹直接拖到这个页面，上传到当前文件夹。传输时请让手机上的 FileBox 停在「Wi-Fi 传输」页面、屏幕常亮。</p>
 <input type="file" id="fileInput" multiple hidden>
@@ -103,6 +123,7 @@ footer{color:var(--muted);font-size:12px;text-align:center;padding:0 16px 24px}
 <thead><tr><th data-sort="name">名称</th><th data-sort="size">大小</th><th data-sort="date" class="date">修改时间</th><th></th></tr></thead>
 <tbody id="rows"></tbody>
 </table>
+<div id="grid" class="grid" hidden></div>
 <div id="empty" class="empty" hidden>这个文件夹是空的，可以把文件拖到这里上传</div>
 </div>
 </main>
@@ -123,6 +144,8 @@ let sortKey = 'date';
 let sortAsc = false;
 let reloadTimer = 0;
 let dragDepth = 0;
+let view = 'list';
+try { if (localStorage.getItem('fileboxView') === 'grid') view = 'grid'; } catch (e) {}
 let running = 0;
 const tasks = [];
 
@@ -167,6 +190,98 @@ function icon(entry) {
   if (/^(zip|rar|7z|tar|gz)$/.test(ext)) return '🗜️';
   if (ext === 'pdf') return '📕';
   return '📄';
+}
+
+// Thumbnails of photos and videos, made on the phone. Fetched only when their row comes into
+// view, a few at a time, newest request first, and kept in this page's memory (never in the
+// browser's cache), so sorting or coming back to a folder shows them at once.
+const THUMB_PARALLEL = 4;
+const thumbs = new Map();   // key -> blob URL, or '' for a file without a preview
+const waiting = new Map();  // key -> boxes waiting for it
+const thumbJobs = [];
+let thumbRunning = 0;
+const watcher = 'IntersectionObserver' in window
+  ? new IntersectionObserver(records => {
+      for (const record of records) {
+        if (!record.isIntersecting) continue;
+        watcher.unobserve(record.target);
+        requestThumb(record.target);
+      }
+    }, { rootMargin: '400px' })
+  : null;
+
+function thumbBox(entry, path, href, big) {
+  const props = { class: 'thumb' + (entry.media === 'video' ? ' video' : ''), href, text: icon(entry) };
+  if (!entry.dir) { props.target = '_blank'; props.rel = 'noopener'; props.title = entry.name; }
+  const box = el('a', props);
+  if (!entry.media) return box;
+  const size = big ? 512 : 256;
+  box.dataset.key = path + '|' + entry.mtime + '|' + size;
+  box.dataset.src = base + 'thumb/' + enc(path) + '?size=' + size + '&v=' + entry.mtime;
+  const known = thumbs.get(box.dataset.key);
+  if (known) showThumb(box, known);
+  else if (known === undefined) {
+    if (watcher) watcher.observe(box); else requestThumb(box);
+  }
+  return box;
+}
+
+function showThumb(box, url) {
+  box.replaceChildren(el('img', { src: url, alt: '' }));
+  box.classList.add('has');
+}
+
+function requestThumb(box) {
+  const key = box.dataset.key;
+  if (thumbs.has(key)) {
+    if (thumbs.get(key)) showThumb(box, thumbs.get(key));
+    return;
+  }
+  const boxes = waiting.get(key);
+  if (boxes) { boxes.push(box); return; }
+  waiting.set(key, [box]);
+  thumbJobs.push({ key, src: box.dataset.src });
+  pumpThumbs();
+}
+
+function pumpThumbs() {
+  while (thumbRunning < THUMB_PARALLEL && thumbJobs.length) {
+    const job = thumbJobs.pop();
+    // Scrolled away or left the folder: fetched again if it comes back.
+    if (!(waiting.get(job.key) || []).some(box => box.isConnected)) {
+      waiting.delete(job.key);
+      continue;
+    }
+    thumbRunning++;
+    fetchThumb(job).finally(() => {
+      thumbRunning--;
+      pumpThumbs();
+    });
+  }
+}
+
+async function fetchThumb(job) {
+  let url = null;
+  let settled = true;
+  try {
+    const res = await fetch(job.src, { cache: 'no-store' });
+    if (res.status === 403) {
+      location.reload();
+      return;
+    }
+    if (res.ok) url = URL.createObjectURL(await res.blob());
+    else if (res.status !== 404) settled = false;
+  } catch (e) {
+    settled = false;
+  }
+  const boxes = waiting.get(job.key) || [];
+  waiting.delete(job.key);
+  if (url) {
+    thumbs.set(job.key, url);
+    for (const box of boxes) if (box.isConnected) showThumb(box, url);
+  } else if (settled) {
+    thumbs.set(job.key, '');
+  }
 }
 
 function showMessage(text) {
@@ -251,23 +366,39 @@ function render() {
     th.classList.toggle('asc', th.dataset.sort === sortKey && sortAsc);
   }
 
+  $('viewBtn').textContent = view === 'grid' ? '列表' : '大图';
+  $('sortSel').hidden = view !== 'grid';
+  $('sortSel').value = sortKey + '-' + (sortAsc ? 'asc' : 'desc');
+
   const rows = $('rows');
+  const grid = $('grid');
   rows.replaceChildren();
+  grid.replaceChildren();
   const list = entries.slice().sort(compare);
-  $('table').hidden = list.length === 0;
+  $('table').hidden = list.length === 0 || view === 'grid';
+  grid.hidden = list.length === 0 || view !== 'grid';
   $('empty').hidden = list.length > 0 || !$('message').hidden;
   for (const entry of list) {
     const path = join(dir, entry.name);
     const fileURL = base + 'file/' + enc(path);
+    const href = entry.dir ? hrefFor(path) : fileURL;
     const link = entry.dir
-      ? el('a', { href: hrefFor(path), text: entry.name })
-      : el('a', { href: fileURL, target: '_blank', rel: 'noopener', title: '在新标签页打开', text: entry.name });
+      ? el('a', { href, text: entry.name })
+      : el('a', { href, target: '_blank', rel: 'noopener', title: '在新标签页打开', text: entry.name });
     const action = entry.dir ? null : el('a', { href: fileURL + '?dl=1', download: entry.name, text: '下载' });
-    rows.append(el('tr', null,
-      el('td', { class: 'name' }, el('span', { class: 'icon', text: icon(entry) }), link),
-      el('td', { class: 'size', text: entry.dir ? '' : fmtSize(entry.size) }),
-      el('td', { class: 'date', text: fmtDate(entry.mtime) }),
-      el('td', { class: 'act' }, action)));
+    if (view === 'grid') {
+      link.className = 'tname';
+      grid.append(el('div', { class: 'tile' },
+        thumbBox(entry, path, href, true),
+        link,
+        el('div', { class: 'tmeta' }, el('span', { text: entry.dir ? '' : fmtSize(entry.size) }), action)));
+    } else {
+      rows.append(el('tr', null,
+        el('td', { class: 'name' }, el('div', { class: 'namecell' }, thumbBox(entry, path, href, false), link)),
+        el('td', { class: 'size', text: entry.dir ? '' : fmtSize(entry.size) }),
+        el('td', { class: 'date', text: fmtDate(entry.mtime) }),
+        el('td', { class: 'act' }, action)));
+    }
   }
 }
 
@@ -285,6 +416,17 @@ for (const th of document.querySelectorAll('th[data-sort]')) {
 }
 
 $('refreshBtn').addEventListener('click', () => load());
+$('viewBtn').addEventListener('click', () => {
+  view = view === 'grid' ? 'list' : 'grid';
+  try { localStorage.setItem('fileboxView', view); } catch (e) {}
+  render();
+});
+$('sortSel').addEventListener('change', event => {
+  const [key, order] = event.target.value.split('-');
+  sortKey = key;
+  sortAsc = order === 'asc';
+  render();
+});
 $('uploadBtn').addEventListener('click', () => $('fileInput').click());
 $('folderBtn').addEventListener('click', () => $('folderInput').click());
 
