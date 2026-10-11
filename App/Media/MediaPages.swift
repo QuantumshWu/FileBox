@@ -97,6 +97,8 @@ struct MediaPlayablePage: View {
     @State private var poster: UIImage?
     /// Where `poster` was read: nil for the first frame.
     @State private var posterTime: Double?
+    /// The video's shape on screen, read from the file, for `blackout`.
+    @State private var videoShape: CGSize?
     @State private var drag = ViewerDrag()
     /// The player has shown this file's first frame since it became the playing one, so the poster
     /// never comes back over it (PiP returning, the app coming back).
@@ -123,13 +125,28 @@ struct MediaPlayablePage: View {
         return start == nil ? Thumbnails.cachedPlaceholder(for: item) : nil
     }
 
+    /// The snapshot of this video as the player left it for another file, while the frame it
+    /// continues from is still being read.
+    private var departedView: UIView? {
+        guard let departed = playback.departedFrame, departed.url == item.url,
+              departed.seconds == startTime
+        else { return nil }
+        return departed.view
+    }
+
     /// Black where the video will be, while the frame it continues from is still being read: the
     /// first frame must not show before it, neither as a picture nor from the player, which has
-    /// frame 0 up before it reaches the saved position.
+    /// frame 0 up before it reaches the saved position. The whole page while the shape is unknown.
+    @ViewBuilder
     private var blackout: some View {
+        let playerSize = isCurrent && playback.presentationSize.width > 0 && playback.presentationSize.height > 0
+            ? playback.presentationSize : nil
         let frame = ViewerPosterCache.cached(for: item) ?? Thumbnails.cachedPlaceholder(for: item)
-        return Color.black
-            .aspectRatio(frame.map { $0.size } ?? CGSize(width: 16, height: 9), contentMode: .fit)
+        if let shape = videoShape ?? playerSize ?? frame?.size {
+            Color.black.aspectRatio(shape, contentMode: .fit)
+        } else {
+            Color.black
+        }
     }
 
     /// The picture of where playback starts covers the player until the player has a picture of
@@ -188,6 +205,9 @@ struct MediaPlayablePage: View {
                             .resizable()
                             .scaledToFit()
                             .transition(.opacity)
+                    } else if let departedView {
+                        ViewerDepartedFrame(view: departedView)
+                            .transition(.opacity)
                     } else if startTime != nil {
                         blackout
                             .transition(.opacity)
@@ -218,6 +238,8 @@ struct MediaPlayablePage: View {
             Image(uiImage: poster)
                 .resizable()
                 .scaledToFit()
+        } else if let departedView {
+            ViewerDepartedFrame(view: departedView)
         } else if startTime != nil {
             blackout
         } else {
@@ -249,19 +271,36 @@ struct MediaPlayablePage: View {
     private func load() async {
         let asset = PlayerAssetCache.asset(for: item)
         let start = startTime
+        // Back on the file in the player (from PiP, or paging back): the player has its picture.
+        let needsPoster = playback.displayReadyURL != item.url
         async let playable = Self.loadPlayable(asset)
-        async let frame = posterFrame(at: start)
+        async let shape = start == nil ? nil : Self.loadShape(asset)
+        async let frame = needsPoster ? posterFrame(at: start) : nil
         let isOK = await playable
         guard !Task.isCancelled else { return }
         isPlayable = isOK
+        if let loaded = await shape, !Task.isCancelled { videoShape = loaded }
         let image = await frame
         guard !Task.isCancelled, isOK, let image else { return }
-        poster = image
-        posterTime = start
+        // Over the black area it fades in, as the player's picture does.
+        withAnimation(.easeOut(duration: 0.15)) {
+            poster = image
+            posterTime = start
+        }
     }
 
     private static func loadPlayable(_ asset: AVURLAsset) async -> Bool {
         (try? await asset.load(.isPlayable)) ?? false
+    }
+
+    /// The size of the picture as shown, turned upright.
+    private static func loadShape(_ asset: AVURLAsset) async -> CGSize? {
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let loaded = try? await track.load(.naturalSize, .preferredTransform)
+        else { return nil }
+        let shown = loaded.0.applying(loaded.1)
+        let size = CGSize(width: abs(shown.width), height: abs(shown.height))
+        return size.width > 0 && size.height > 0 ? size : nil
     }
 
     private func posterFrame(at start: Double?) async -> UIImage? {
@@ -634,4 +673,40 @@ struct MediaImagePiPLayerHost: UIViewRepresentable {
     }
 
     func updateUIView(_ view: MediaImagePiPHostView, context: Context) {}
+}
+
+/// Shows a snapshot of the player's view (`MediaPlaybackController.DepartedFrame`) at its own size,
+/// centred: the page is the size the player's view had.
+private struct ViewerDepartedFrame: UIViewRepresentable {
+    let view: UIView
+
+    func makeUIView(context: Context) -> ViewerDepartedFrameView {
+        let container = ViewerDepartedFrameView()
+        container.isUserInteractionEnabled = false
+        container.show(view)
+        return container
+    }
+
+    func updateUIView(_ container: ViewerDepartedFrameView, context: Context) {
+        container.show(view)
+    }
+}
+
+private final class ViewerDepartedFrameView: UIView {
+    private weak var shown: UIView?
+
+    func show(_ view: UIView) {
+        guard shown !== view || view.superview !== self else { return }
+        // Only if it is still here: another page may have taken it since.
+        if let shown, shown.superview === self { shown.removeFromSuperview() }
+        addSubview(view)
+        shown = view
+        setNeedsLayout()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let shown, shown.superview === self else { return }
+        shown.center = CGPoint(x: bounds.midX, y: bounds.midY)
+    }
 }

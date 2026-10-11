@@ -100,6 +100,16 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     @Published private(set) var isBuffering = false
     /// Size of the video picture; `.zero` until known, and for audio.
     @Published private(set) var presentationSize: CGSize = .zero
+    /// What the screen showed of the video the player last left for another file (see
+    /// `captureDepartingFrame`).
+    @Published private(set) var departedFrame: DepartedFrame?
+
+    /// A snapshot of the player's view as it left a video, at `seconds`, its saved position.
+    struct DepartedFrame {
+        let url: URL
+        let seconds: Double
+        let view: UIView
+    }
     /// Playback speed of every file, kept across launches (see `PlayerSpeed`).
     @Published var speed: Float {
         didSet { speedChanged(from: oldValue) }
@@ -379,9 +389,11 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         controller.stopPictureInPicture()
     }
 
-    /// Stops playback and forgets the folder.
-    func stop() {
-        saveResumePosition(preparesPoster: true)
+    /// Stops playback and forgets the folder. `readsAhead`: the file may be opened again, so the
+    /// frame it would continue from is read now (not for a file being deleted).
+    func stop(readsAhead: Bool = true) {
+        // Opened again later, it continues from the saved position only with 记住播放位置 on.
+        saveResumePosition(preparesPoster: readsAhead && PlayerResumeStore.shared.isEnabled)
         resumeOnReturn = false
         endBoost()
         pauseForUs()
@@ -405,6 +417,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         album = nil
         failedURLs = []
         sessionPositions = [:]
+        departedFrame = nil
         automaticAdvance = false
         holdsForBackground = false
         offPlayablePage = false
@@ -612,6 +625,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         let file = sessionItems[index]
         // Where the outgoing file stands, before it leaves the player.
         saveResumePosition(preparesPoster: true)
+        captureDepartingFrame()
         if !MediaViewerHub.shared.activateAudioSession(for: .video) {
             MediaViewerHub.shared.show("声音暂时无法播放")
         }
@@ -878,6 +892,12 @@ final class MediaPlaybackController: NSObject, ObservableObject {
             // Never leave the picture covered for long, whatever the signals did.
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             guard let self, self.displayToken == token, self.currentURL == url else { return }
+            if self.awaitsResume {
+                // Still on its way to the saved position (a long gap between keyframes): the
+                // player has frame 0 up, which must not show first. `settleResume` uncovers it.
+                try? await Task.sleep(nanoseconds: 4_500_000_000)
+                guard self.displayToken == token, self.currentURL == url else { return }
+            }
             self.markDisplayReady(fallback: true)
         }
     }
@@ -918,6 +938,22 @@ final class MediaPlaybackController: NSObject, ObservableObject {
             sessionPositions[file.url] = nil
         }
         PlayerResumeStore.shared.save(seconds, duration: duration, for: file)
+    }
+
+    /// The pager hands a swipe to the next file about halfway through, so the page of the video
+    /// being left can still be sliding off the screen. It keeps showing what the player showed
+    /// (a snapshot, taken before the player moves on) until the frame read ahead is ready, instead
+    /// of going black or showing another frame.
+    private func captureDepartingFrame() {
+        departedFrame = nil
+        guard let url = currentURL, displayReadyURL == url, let index = currentIndex,
+              sessionItems.indices.contains(index), sessionItems[index].url == url,
+              sessionItems[index].kind == .video, let seconds = sessionPositions[url],
+              !isPictureInPictureActive, playerViewController.view.window != nil,
+              let snapshot = playerViewController.view.snapshotView(afterScreenUpdates: false)
+        else { return }
+        snapshot.isUserInteractionEnabled = false
+        departedFrame = DepartedFrame(url: url, seconds: seconds, view: snapshot)
     }
 
     private func resumePosition(for file: FileItem) -> Double? {
@@ -1002,7 +1038,9 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     }
 
     private func periodicSave() {
-        guard isPlaying else { return }
+        // Not before the picture is up: until then the viewer covers the player with the frame at
+        // the position it continues from, which a newer position would no longer match.
+        guard isPlaying, displayReadyURL == currentURL else { return }
         saveResumePosition()
     }
 

@@ -275,6 +275,10 @@ struct MediaViewer: View {
             return kind == .video || kind == .audio ? items[i] : nil
         }
         if !playable.isEmpty { PlayerAssetCache.warm(playable) }
+        // A neighbour that continues from a saved position slides in showing that frame.
+        for item in playable where item.kind == .video {
+            if let start = playback.startPosition(for: item) { ViewerPosterCache.prepare(item, at: start) }
+        }
     }
 
     /// A new video page starts with just the picture; moving between images keeps what the last
@@ -355,7 +359,7 @@ struct MediaViewer: View {
 
     /// Moves the file to the trash and shows the next one (the one before, if it was the last).
     private func delete(_ item: FileItem) {
-        if playback.currentURL == item.url { playback.stop() }
+        if playback.currentURL == item.url { playback.stop(readsAhead: false) }
         if item.kind == .image, imagePiP.isEngaged { imagePiP.leaveImagePage() }
         store.delete([item])
         guard items.count > 1, let index = items.firstIndex(where: { $0.url == item.url }) else {

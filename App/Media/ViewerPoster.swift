@@ -7,21 +7,61 @@ import UIKit
 /// cache.
 @MainActor
 enum ViewerPosterCache {
-    private static let cache: NSCache<NSString, UIImage> = {
+    private static let firstFrames: NSCache<NSString, UIImage> = {
         let cache = NSCache<NSString, UIImage>()
         cache.totalCostLimit = 60 * 1024 * 1024
         return cache
     }()
 
+    /// One frame per file: where it was last left. A newer position replaces the older one.
+    private static let resumeFrames: NSCache<NSString, ResumeFrame> = {
+        let cache = NSCache<NSString, ResumeFrame>()
+        cache.totalCostLimit = 40 * 1024 * 1024
+        return cache
+    }()
+
+    /// Frames being read ahead (`prepare`), so the page waits for that read instead of making its own.
+    private static var preparing: [NSString: Task<UIImage?, Never>] = [:]
+
+    private final class ResumeFrame {
+        let seconds: Double
+        let image: UIImage
+
+        init(seconds: Double, image: UIImage) {
+            self.seconds = seconds
+            self.image = image
+        }
+    }
+
     /// `seconds` nil: the first frame.
     static func cached(for item: FileItem, at seconds: Double? = nil) -> UIImage? {
-        cache.object(forKey: key(for: item, at: seconds))
+        let file = fileKey(for: item)
+        guard let seconds else { return firstFrames.object(forKey: file) }
+        guard let frame = resumeFrames.object(forKey: file), frame.seconds == seconds else { return nil }
+        return frame.image
     }
 
     /// The frame at `seconds` (nil: the first frame, the same as the folder's thumbnail; see
     /// `VideoFrameReader`), upright, at most the screen's pixel size.
     static func poster(for item: FileItem, at seconds: Double? = nil) async -> UIImage? {
         if let hit = cached(for: item, at: seconds) { return hit }
+        if let pending = preparing[readKey(for: item, at: seconds)] { return await pending.value }
+        return await read(item, at: seconds)
+    }
+
+    /// Reads the frame at `seconds` ahead of time: the video was just left there, so opening it
+    /// again shows that frame at once.
+    static func prepare(_ item: FileItem, at seconds: Double) {
+        let key = readKey(for: item, at: seconds)
+        guard item.kind == .video, cached(for: item, at: seconds) == nil, preparing[key] == nil else { return }
+        preparing[key] = Task {
+            let image = await read(item, at: seconds)
+            preparing[key] = nil
+            return image
+        }
+    }
+
+    private static func read(_ item: FileItem, at seconds: Double?) async -> UIImage? {
         let reader = VideoFrameReader(asset: PlayerAssetCache.asset(for: item), at: seconds, maximumSize: screenPixelSize)
         let frame: CGImage? = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -32,21 +72,22 @@ enum ViewerPosterCache {
         }
         guard let frame, !Task.isCancelled else { return nil }
         let image = UIImage(cgImage: frame)
-        cache.setObject(image, forKey: key(for: item, at: seconds), cost: frame.bytesPerRow * frame.height)
+        let cost = frame.bytesPerRow * frame.height
+        if let seconds {
+            resumeFrames.setObject(ResumeFrame(seconds: seconds, image: image), forKey: fileKey(for: item), cost: cost)
+        } else {
+            firstFrames.setObject(image, forKey: fileKey(for: item), cost: cost)
+        }
         return image
     }
 
-    /// Reads the frame at `seconds` ahead of time: the video was just left there, so opening it
-    /// again shows that frame at once.
-    static func prepare(_ item: FileItem, at seconds: Double) {
-        guard item.kind == .video, cached(for: item, at: seconds) == nil else { return }
-        Task { _ = await poster(for: item, at: seconds) }
+    private static func fileKey(for item: FileItem) -> NSString {
+        "\(item.url.path)|\(item.modified.timeIntervalSince1970)" as NSString
     }
 
-    private static func key(for item: FileItem, at seconds: Double?) -> NSString {
-        let file = "\(item.url.path)|\(item.modified.timeIntervalSince1970)"
-        guard let seconds else { return file as NSString }
-        return "\(file)|\(seconds)" as NSString
+    private static func readKey(for item: FileItem, at seconds: Double?) -> NSString {
+        let file = fileKey(for: item) as String
+        return (seconds.map { "\(file)|\($0)" } ?? file) as NSString
     }
 
     /// The screen in pixels, upright: a landscape video fits its width, a portrait one its height.
