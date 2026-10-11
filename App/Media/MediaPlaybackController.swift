@@ -100,9 +100,9 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     @Published private(set) var isBuffering = false
     /// Size of the video picture; `.zero` until known, and for audio.
     @Published private(set) var presentationSize: CGSize = .zero
-    /// What the screen showed of the video the player last left for another file (see
-    /// `captureDepartingFrame`).
-    @Published private(set) var departedFrame: DepartedFrame?
+    /// What the screen showed of the videos the player last left for another file, newest first
+    /// (see `captureDepartingFrame`). Two, so a swipe back and forth keeps both pages' pictures.
+    @Published private(set) var departedFrames: [DepartedFrame] = []
 
     /// A snapshot of the player's view as it left a video, at `seconds`, its saved position.
     struct DepartedFrame {
@@ -417,7 +417,7 @@ final class MediaPlaybackController: NSObject, ObservableObject {
         album = nil
         failedURLs = []
         sessionPositions = [:]
-        departedFrame = nil
+        departedFrames = []
         automaticAdvance = false
         holdsForBackground = false
         offPlayablePage = false
@@ -945,7 +945,6 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// (a snapshot, taken before the player moves on) until the frame read ahead is ready, instead
     /// of going black or showing another frame.
     private func captureDepartingFrame() {
-        departedFrame = nil
         guard let url = currentURL, displayReadyURL == url, let index = currentIndex,
               sessionItems.indices.contains(index), sessionItems[index].url == url,
               sessionItems[index].kind == .video, let seconds = sessionPositions[url],
@@ -953,7 +952,9 @@ final class MediaPlaybackController: NSObject, ObservableObject {
               let snapshot = playerViewController.view.snapshotView(afterScreenUpdates: false)
         else { return }
         snapshot.isUserInteractionEnabled = false
-        departedFrame = DepartedFrame(url: url, seconds: seconds, view: snapshot)
+        // An older snapshot of the same file is of another position; pages ignore stale ones.
+        let older = departedFrames.filter { $0.url != url }.prefix(1)
+        departedFrames = [DepartedFrame(url: url, seconds: seconds, view: snapshot)] + older
     }
 
     private func resumePosition(for file: FileItem) -> Double? {

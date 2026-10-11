@@ -128,10 +128,8 @@ struct MediaPlayablePage: View {
     /// The snapshot of this video as the player left it for another file, while the frame it
     /// continues from is still being read.
     private var departedView: UIView? {
-        guard let departed = playback.departedFrame, departed.url == item.url,
-              departed.seconds == startTime
-        else { return nil }
-        return departed.view
+        let start = startTime
+        return playback.departedFrames.first { $0.url == item.url && $0.seconds == start }?.view
     }
 
     /// Black where the video will be, while the frame it continues from is still being read: the
@@ -234,12 +232,13 @@ struct MediaPlayablePage: View {
     private var placeholder: some View {
         if item.kind == .audio {
             ViewerAudioPlaceholder(title: (item.name as NSString).deletingPathExtension)
+        } else if let departedView {
+            // First: the page may still be sliding off, and the snapshot is what it just showed.
+            ViewerDepartedFrame(view: departedView)
         } else if let poster = shownPoster {
             Image(uiImage: poster)
                 .resizable()
                 .scaledToFit()
-        } else if let departedView {
-            ViewerDepartedFrame(view: departedView)
         } else if startTime != nil {
             blackout
         } else {
@@ -675,8 +674,8 @@ struct MediaImagePiPLayerHost: UIViewRepresentable {
     func updateUIView(_ view: MediaImagePiPHostView, context: Context) {}
 }
 
-/// Shows a snapshot of the player's view (`MediaPlaybackController.DepartedFrame`) at its own size,
-/// centred: the page is the size the player's view had.
+/// Shows a snapshot of the player's view (`MediaPlaybackController.DepartedFrame`), centred. The
+/// page is the size the player's view had; after the phone turns, it is scaled to fit.
 private struct ViewerDepartedFrame: UIViewRepresentable {
     let view: UIView
 
@@ -707,6 +706,11 @@ private final class ViewerDepartedFrameView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         guard let shown, shown.superview === self else { return }
+        let size = shown.bounds.size
+        if size.width > 0, size.height > 0, bounds.width > 0, bounds.height > 0 {
+            let scale = min(1, bounds.width / size.width, bounds.height / size.height)
+            shown.transform = CGAffineTransform(scaleX: scale, y: scale)
+        }
         shown.center = CGPoint(x: bounds.midX, y: bounds.midY)
     }
 }
