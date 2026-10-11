@@ -6,8 +6,9 @@ import SwiftUI
 import UIKit
 
 /// Cached thumbnails. Photos are decoded directly with ImageIO (Quick Look's thumbnailer gives up on
-/// some JPEGs and returns only a file icon); videos fall back to a frame from AVFoundation; anything
-/// else gets Quick Look's thumbnail or file-type icon.
+/// some JPEGs and returns only a file icon); videos show their first frame, read with AVFoundation,
+/// the same frame the viewer opens on (Quick Look's choice of frame is its own); anything else gets
+/// Quick Look's thumbnail or file-type icon.
 ///
 /// Thumbnails come in a few pixel sizes ("buckets", measured on the short side), so list rows,
 /// every grid size and previews share them and a pinch does not decode anything again. They stay in
@@ -109,11 +110,13 @@ enum Thumbnails {
             }
             quickLookAll()
         case .video:
-            Thumbnails.quickLook(url, box: box, scale: scale, types: .thumbnail, job: job) { image, _ in
-                if let image { return job.finish(VaultThumbResult(image: image, isReal: true)) }
+            if job.isCancelled { return job.finish(nil) }
+            Thumbnails.videoFrame(of: url, maxPixel: box, job: job) { frame in
+                if let frame { return job.finish(VaultThumbResult(image: frame, isReal: true)) }
                 if job.isCancelled { return job.finish(nil) }
-                Thumbnails.videoFrame(of: url, maxPixel: box, job: job) { frame in
-                    if let frame { return job.finish(VaultThumbResult(image: frame, isReal: true)) }
+                // A format AVFoundation cannot read.
+                Thumbnails.quickLook(url, box: box, scale: scale, types: .thumbnail, job: job) { image, _ in
+                    if let image { return job.finish(VaultThumbResult(image: image, isReal: true)) }
                     if job.isCancelled { return job.finish(nil) }
                     quickLookAll()
                 }
@@ -175,12 +178,13 @@ enum Thumbnails {
         job.onCancel { QLThumbnailGenerator.shared.cancel(request) }
     }
 
-    /// The frame at one second, inside a square of `maxPixel` pixels.
+    /// The first frame, the one the viewer opens on and playback starts from (see
+    /// `ViewerPosterCache`), inside a square of `maxPixel` pixels.
     private static func videoFrame(of url: URL, maxPixel: CGFloat, job: VaultThumbJob, completion: @escaping (UIImage?) -> Void) {
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: maxPixel, height: maxPixel)
-        generator.generateCGImageAsynchronously(for: CMTime(seconds: 1, preferredTimescale: 600)) { image, _, _ in
+        generator.generateCGImageAsynchronously(for: .zero) { image, _, _ in
             // Keeps the generator alive until it is done.
             withExtendedLifetime(generator) {}
             completion(image.map { UIImage(cgImage: $0) })
