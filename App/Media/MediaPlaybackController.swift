@@ -945,10 +945,14 @@ final class MediaPlaybackController: NSObject, ObservableObject {
     /// (a snapshot, taken before the player moves on) until the frame read ahead is ready, instead
     /// of going black or showing another frame.
     private func captureDepartingFrame() {
+        // Only when the screen shows the player's picture at that position: not in the background
+        // (lock-screen next), not floating or about to float, not mid-seek.
         guard let url = currentURL, displayReadyURL == url, let index = currentIndex,
               sessionItems.indices.contains(index), sessionItems[index].url == url,
               sessionItems[index].kind == .video, let seconds = sessionPositions[url],
-              !isPictureInPictureActive, playerViewController.view.window != nil,
+              seekTarget == nil, !isPictureInPictureEngaged, !detachedForBackground,
+              UIApplication.shared.applicationState == .active,
+              playerViewController.view.window != nil,
               let snapshot = playerViewController.view.snapshotView(afterScreenUpdates: false)
         else { return }
         snapshot.isUserInteractionEnabled = false

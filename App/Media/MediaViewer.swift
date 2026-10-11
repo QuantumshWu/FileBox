@@ -276,7 +276,8 @@ struct MediaViewer: View {
         }
         if !playable.isEmpty { PlayerAssetCache.warm(playable) }
         // A neighbour that continues from a saved position slides in showing that frame.
-        for item in playable where item.kind == .video {
+        // Not the file in the player (floating in PiP): its position is still moving.
+        for item in playable where item.kind == .video && item.url != playback.currentURL {
             if let start = playback.startPosition(for: item) { ViewerPosterCache.prepare(item, at: start) }
         }
     }

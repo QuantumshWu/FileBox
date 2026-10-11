@@ -13,10 +13,11 @@ enum ViewerPosterCache {
         return cache
     }()
 
-    /// One frame per file: where it was last left. A newer position replaces the older one.
+    /// One frame per file: where it was last left. A newer position replaces the older one. Room
+    /// for the page in the player, the file just left and both neighbours, at up to 12 MB each.
     private static let resumeFrames: NSCache<NSString, ResumeFrame> = {
         let cache = NSCache<NSString, ResumeFrame>()
-        cache.totalCostLimit = 40 * 1024 * 1024
+        cache.totalCostLimit = 80 * 1024 * 1024
         return cache
     }()
 
@@ -78,6 +79,8 @@ enum ViewerPosterCache {
         } else {
             firstFrames.setObject(image, forKey: fileKey(for: item), cost: cost)
         }
+        // Pages showing black while it was read ahead show it now.
+        ViewerPosterUpdates.shared.revision &+= 1
         return image
     }
 
@@ -99,4 +102,14 @@ enum ViewerPosterCache {
         let bounds = screen.nativeBounds.size
         return CGSize(width: min(bounds.width, bounds.height), height: max(bounds.width, bounds.height))
     }
+}
+
+/// Changes whenever `ViewerPosterCache` gets a new frame, so the viewer's pages redraw with it.
+@MainActor
+final class ViewerPosterUpdates: ObservableObject {
+    static let shared = ViewerPosterUpdates()
+
+    @Published var revision = 0
+
+    private init() {}
 }

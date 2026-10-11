@@ -92,6 +92,8 @@ struct MediaPlayablePage: View {
     let onQuickLook: (URL) -> Void
 
     @ObservedObject private var playback = MediaPlaybackController.shared
+    /// Redraws when a frame read ahead arrives (the cache itself is not observed).
+    @ObservedObject private var posterUpdates = ViewerPosterUpdates.shared
     @AppStorage(ViewerSkipStep.storageKey) private var storedStep = ViewerSkipStep.defaultSeconds
     @State private var isPlayable: Bool?
     @State private var poster: UIImage?
